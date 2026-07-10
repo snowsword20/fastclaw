@@ -620,6 +620,36 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		case <-ctx.Done():
 			slog.Warn("outbound enqueue cancelled", "agent", task.AgentID, "chat", task.Message.ChatID)
 		}
+		// Cron → WeChat delivery fallback. iLink silently drops a bot's
+		// outbound when it carries no valid context_token (returns ret=0
+		// but doesn't deliver) — and after a bot rebind the token cache
+		// is empty until the user messages the bot again, so a cron-fired
+		// reminder can vanish without a trace. Push a copy of the reply
+		// through the web channel too: it shows in the dashboard (the IM
+		// conversation is listed there, session_key = the WeChat openid)
+		// whenever the user has that chat open, and otherwise no-ops.
+		// The web channel is always registered ("web:" key) and never
+		// traverses Redis, so this never blocks on an IM adapter. Bounded
+		// enqueue so a full bus can't stall the task.
+		if task.Message.Source == bus.SourceCron && task.Message.Channel == "wechat" {
+			noticeText := outText
+			if strings.TrimSpace(noticeText) == "" {
+				noticeText = reply
+			}
+			notice := bus.OutboundMessage{
+				Channel: "web",
+				AgentID: task.AgentID,
+				ChatID:  task.Message.ChatID,
+				Text: "⚠️ 此提醒已通过定时任务触发，但微信 bot 可能因重绑后未收到你的消息而无法送达微信。" +
+					"若你长期未在微信收到，请向 bot 发一条消息以恢复推送。\n\n---\n" + noticeText,
+			}
+			select {
+			case mb.Outbound <- notice:
+			default:
+				slog.Debug("cron wechat web-fallback: bus full, skipping",
+					"agent", task.AgentID, "chat", task.Message.ChatID)
+			}
+		}
 		return reply, nil
 	})
 	g.taskQueue = tq

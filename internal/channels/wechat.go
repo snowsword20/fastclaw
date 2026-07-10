@@ -569,12 +569,31 @@ func (w *WeChat) sendTextOnly(chatID, plain string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), wechatSendTimeout)
 	defer cancel()
 	var resp wechatSendResponse
-	if err := w.doPost(ctx, "/ilink/bot/sendmessage", body, &resp); err != nil {
+	rawBody, err := w.doPost(ctx, "/ilink/bot/sendmessage", body, &resp)
+	if err != nil {
+		// Network / HTTP-layer failure. Log with the account + chat so the
+		// cron-vs-interactive path is distinguishable in the log.
+		slog.Warn("wechat sendmessage failed",
+			"account", w.accountID, "chat", chatID,
+			"has_token", contextToken != "", "error", err)
 		return fmt.Errorf("wechat send: %w", err)
 	}
+	// Log the parsed ret + raw body. The raw body matters because iLink can
+	// return ret=0 (claiming success) while silently not delivering — an
+	// empty/minimal body such as `{}` is the tell. Surfacing it here turns a
+	// "微信没收到 but log says success" blind spot into something visible.
 	if resp.Ret != 0 {
+		slog.Warn("wechat sendmessage non-zero ret",
+			"account", w.accountID, "chat", chatID,
+			"has_token", contextToken != "",
+			"ret", resp.Ret, "errmsg", resp.ErrMsg,
+			"raw_body", string(rawBody))
 		return fmt.Errorf("wechat send: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
+	slog.Info("wechat sendmessage ok",
+		"account", w.accountID, "chat", chatID,
+		"has_token", contextToken != "",
+		"ret", resp.Ret, "raw_body", string(rawBody))
 	return nil
 }
 
@@ -605,7 +624,7 @@ func (w *WeChat) SendTyping(chatID string) error {
 		ContextToken: contextToken,
 	}
 	var cfgResp wechatGetConfigResponse
-	if err := w.doPost(ctx, "/ilink/bot/getconfig", cfgBody, &cfgResp); err != nil {
+	if _, err := w.doPost(ctx, "/ilink/bot/getconfig", cfgBody, &cfgResp); err != nil {
 		slog.Warn("wechat getconfig failed", "account", w.accountID, "chat", chatID, "error", err)
 		return fmt.Errorf("wechat getconfig: %w", err)
 	}
@@ -626,7 +645,7 @@ func (w *WeChat) SendTyping(chatID string) error {
 		Status:       wechatTypingStatusTyping,
 	}
 	var typingResp wechatSendTypingResponse
-	if err := w.doPost(ctx, "/ilink/bot/sendtyping", typingBody, &typingResp); err != nil {
+	if _, err := w.doPost(ctx, "/ilink/bot/sendtyping", typingBody, &typingResp); err != nil {
 		slog.Warn("wechat sendtyping failed", "account", w.accountID, "chat", chatID, "error", err)
 		return fmt.Errorf("wechat sendtyping: %w", err)
 	}
@@ -654,20 +673,25 @@ func (w *WeChat) getUpdates(ctx context.Context, buf string) (*wechatGetUpdatesR
 	ctx, cancel := context.WithTimeout(ctx, wechatLongPollTimeout+5*time.Second)
 	defer cancel()
 	var resp wechatGetUpdatesResponse
-	if err := w.doPost(ctx, "/ilink/bot/getupdates", body, &resp); err != nil {
+	if _, err := w.doPost(ctx, "/ilink/bot/getupdates", body, &resp); err != nil {
 		return nil, err
 	}
 	return &resp, nil
 }
 
-func (w *WeChat) doPost(ctx context.Context, path string, body, result any) error {
+// doPost POSTs `body` to `path`, unmarshals the reply into `result`, and
+// also returns the raw response body. The raw body lets callers that need
+// to diagnose silent delivery failures (e.g. sendTextOnly logging an iLink
+// reply of `{}` vs an explicit `{"ret":0}`) see exactly what the server
+// sent, instead of only the struct fields we happen to parse.
+func (w *WeChat) doPost(ctx context.Context, path string, body, result any) ([]byte, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return nil, fmt.Errorf("marshal: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.baseURL+path, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("AuthorizationType", "ilink_bot_token")
@@ -676,17 +700,20 @@ func (w *WeChat) doPost(ctx context.Context, path string, body, result any) erro
 
 	resp, err := w.httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read: %w", err)
+		return nil, fmt.Errorf("read: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+		return respBody, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
-	return json.Unmarshal(respBody, result)
+	if err := json.Unmarshal(respBody, result); err != nil {
+		return respBody, err
+	}
+	return respBody, nil
 }
 
 func (w *WeChat) calcBackoff() time.Duration {
@@ -1008,7 +1035,7 @@ func (w *WeChat) sendMedia(chatID string, item bus.MediaItem) error {
 		BaseInfo: wechatBaseInfo{},
 	}
 	var resp wechatSendResponse
-	if err := w.doPost(ctx, "/ilink/bot/sendmessage", body, &resp); err != nil {
+	if _, err := w.doPost(ctx, "/ilink/bot/sendmessage", body, &resp); err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
 	if resp.Ret != 0 {
@@ -1085,7 +1112,7 @@ func (w *WeChat) uploadToCDN(ctx context.Context, toUserID string, data []byte, 
 		BaseInfo:    wechatBaseInfo{},
 	}
 	var upResp wechatGetUploadURLResponse
-	if err := w.doPost(ctx, "/ilink/bot/getuploadurl", upReq, &upResp); err != nil {
+	if _, err := w.doPost(ctx, "/ilink/bot/getuploadurl", upReq, &upResp); err != nil {
 		return nil, fmt.Errorf("getuploadurl: %w", err)
 	}
 	if upResp.Ret != 0 {
