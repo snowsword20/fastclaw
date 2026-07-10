@@ -4060,6 +4060,21 @@ func (d *DBStore) ListCronJobsByAgent(ctx context.Context, agentID string) ([]Cr
 	return scanCronJobs(rows)
 }
 
+// ListCronJobsByAgentChannel narrows ListCronJobsByAgent to a single
+// channel type. Used by the rebind migration to enumerate rows that may
+// carry a stale account_id after the bot under that channel was rebound.
+func (d *DBStore) ListCronJobsByAgentChannel(ctx context.Context, agentID, channel string) ([]CronJobRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT `+cronSelectCols+` FROM cron_jobs WHERE agent_id = %s AND channel = %s ORDER BY created_at`,
+			d.ph(1), d.ph(2)),
+		agentID, channel)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanCronJobs(rows)
+}
+
 func (d *DBStore) GetCronJob(ctx context.Context, jobID string) (*CronJobRecord, error) {
 	row := d.db.QueryRowContext(ctx,
 		fmt.Sprintf(`SELECT `+cronSelectCols+` FROM cron_jobs WHERE id = %s`, d.ph(1)), jobID)
@@ -4174,6 +4189,26 @@ func (d *DBStore) UpdateCronJobRun(ctx context.Context, jobID string, lastRun, n
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE cron_jobs SET last_run=?, next_run=?, failure_count=0, locked_by=NULL, locked_at=NULL WHERE id=?`,
 		lastRun, nextRun, jobID)
+	return err
+}
+
+// UpdateCronJobAccountByID rewrites a single job's account_id and clears
+// the failure counter + lock. Used to self-heal rows whose frozen
+// account_id went stale after a channel rebind (the bot connection moved
+// to a new account_id, but the cron row still points at the old one).
+// Resetting failure_count gives the re-keyed row a clean slate rather
+// than letting it inherit pre-rebind miss counts that could trip the
+// auto-delete threshold.
+func (d *DBStore) UpdateCronJobAccountByID(ctx context.Context, jobID, newAccountID string) error {
+	if d.dialect == "postgres" {
+		_, err := d.db.ExecContext(ctx,
+			`UPDATE cron_jobs SET account_id=$1, failure_count=0, locked_by=NULL, locked_at=NULL WHERE id=$2`,
+			newAccountID, jobID)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE cron_jobs SET account_id=?, failure_count=0, locked_by=NULL, locked_at=NULL WHERE id=?`,
+		newAccountID, jobID)
 	return err
 }
 

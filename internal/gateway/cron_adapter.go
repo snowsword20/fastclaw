@@ -69,3 +69,27 @@ func (a *cronStoreAdapter) DeleteCronJob(ctx context.Context, jobID string) erro
 func (a *cronStoreAdapter) GetNextDueTime(ctx context.Context) (time.Time, error) {
 	return a.st.GetNextDueTime(ctx)
 }
+
+// ListAgentChannels returns the account_ids of currently-enabled channels
+// of the given type bound to the agent. userID="" means "any owner" —
+// ListChannels already treats an empty user_id as a wildcard, and the
+// caller (the scheduler self-heal path) only cares that the bot is live,
+// not who owns it. Returns bare account_id strings so the cron package
+// stays free of store.ChannelRecord (import-cycle guard).
+func (a *cronStoreAdapter) ListAgentChannels(ctx context.Context, agentID, channelType string) ([]string, error) {
+	rows, err := a.st.ListChannels(ctx, "", agentID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		if r.Type == channelType && r.Enabled && r.AccountID != "" {
+			out = append(out, r.AccountID)
+		}
+	}
+	return out, nil
+}
+
+func (a *cronStoreAdapter) UpdateCronJobAccountByID(ctx context.Context, jobID, newAccountID string) error {
+	return a.st.UpdateCronJobAccountByID(ctx, jobID, newAccountID)
+}

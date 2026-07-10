@@ -246,12 +246,21 @@ type Store interface {
 	// agent's user_id. List by ownerUserID joins against agents.
 	ListCronJobsByOwner(ctx context.Context, ownerUserID string) ([]CronJobRecord, error)
 	ListCronJobsByAgent(ctx context.Context, agentID string) ([]CronJobRecord, error)
+	// ListCronJobsByAgentChannel lists jobs scoped to (agent_id, channel),
+	// used by the channel-rebind migration to find rows whose account_id
+	// may have gone stale after a bot was rebound.
+	ListCronJobsByAgentChannel(ctx context.Context, agentID, channel string) ([]CronJobRecord, error)
 	GetCronJob(ctx context.Context, jobID string) (*CronJobRecord, error)
 	SaveCronJob(ctx context.Context, job *CronJobRecord) error
 	DeleteCronJob(ctx context.Context, jobID string) error
 	GetDueCronJobs(ctx context.Context, now time.Time) ([]CronJobRecord, error)
 	LockCronJob(ctx context.Context, jobID, instanceID string) (bool, error)
 	UpdateCronJobRun(ctx context.Context, jobID string, lastRun, nextRun time.Time) error
+	// UpdateCronJobAccountByID rewrites a single job's account_id, used to
+	// self-heal rows whose frozen account_id went stale after a channel
+	// rebind. Also clears failure_count so a freshly re-keyed row gets a
+	// clean slate instead of carrying over pre-rebind miss counts.
+	UpdateCronJobAccountByID(ctx context.Context, jobID, newAccountID string) error
 	// IncrementCronJobFailure atomically bumps failure_count and returns
 	// the new count. Used by the scheduler when a tick can't deliver to
 	// the configured channel; the caller decides whether to delete the

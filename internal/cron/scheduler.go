@@ -52,6 +52,17 @@ type StoreInterface interface {
 	IncrementCronJobFailure(ctx context.Context, jobID string) (int, error)
 	DeleteCronJob(ctx context.Context, jobID string) error
 	GetNextDueTime(ctx context.Context) (time.Time, error)
+	// ListAgentChannels returns the currently-enabled account_ids for
+	// the given agent under the given channel type. Used by the
+	// self-heal fallback when a job's frozen account_id no longer
+	// resolves: instead of failing, the scheduler re-keys the job to a
+	// still-live bot under the same channel so a rebind doesn't drop it.
+	ListAgentChannels(ctx context.Context, agentID, channelType string) ([]string, error)
+	// UpdateCronJobAccountByID rewrites a single job's account_id and
+	// clears its failure counter. Called by the self-heal path to
+	// persist the resolved account_id so subsequent ticks skip the
+	// fallback.
+	UpdateCronJobAccountByID(ctx context.Context, jobID, newAccountID string) error
 }
 
 // ChannelChecker is the bit of channels.Manager the scheduler needs to
@@ -245,35 +256,61 @@ func (s *Scheduler) processDueJobs(ctx context.Context) {
 		// registered (e.g. the bot token died and the gateway tore
 		// it down), there's no point queuing the inbound — the
 		// agent's reply would just hit "unknown outbound channel"
-		// and be dropped. Instead, bump the failure counter; after
-		// cronMaxConsecutiveFailures consecutive misses, delete
-		// the row so the scheduler stops re-trying forever.
+		// and be dropped.
 		// "web" is the dashboard SSE, "api" is the HTTP completions
 		// endpoint — both are always reachable (replies go through
 		// the plugin's channel.send, not an IM adapter). Empty
 		// channel is a legacy row that doesn't route through any bot.
+		//
+		// Self-heal: when the frozen account_id no longer resolves (the
+		// common cause being a channel rebind that minted a fresh
+		// account_id while the cron row still holds the old one), try
+		// to re-key the job to a still-live bot under the same channel
+		// type before giving up. Only when no live bot exists at all do
+		// we fall back to bumping the failure counter; after
+		// cronMaxConsecutiveFailures consecutive misses, delete the row
+		// so the scheduler stops re-trying forever.
 		if s.channels != nil && j.Channel != "" && j.Channel != "web" && j.Channel != "api" {
 			if !s.channels.Has(j.Channel, j.AccountID) {
-				count, ferr := s.store.IncrementCronJobFailure(ctx, j.ID)
-				if ferr != nil {
-					slog.Error("failed to bump cron failure count", "id", j.ID, "error", ferr)
-					continue
-				}
-				if count >= cronMaxConsecutiveFailures {
-					slog.Warn("auto-deleting cron job — destination channel missing for too many consecutive ticks",
+				resolved, herr := s.trySelfHeal(ctx, j)
+				if herr != nil {
+					slog.Error("cron self-heal lookup failed", "id", j.ID, "error", herr)
+					// Fall through to the failure-counter path — better
+					// to count a miss than to fire blindly at a dead
+					// destination.
+				} else if resolved != "" {
+					// Re-keyed to a live bot; update the in-memory job so
+					// the InboundMessage below carries the new account_id,
+					// and persist so the next tick skips the fallback.
+					slog.Info("cron job self-healed to live channel",
+						"id", j.ID, "name", j.Name,
+						"channel", j.Channel,
+						"old_account", j.AccountID, "new_account", resolved)
+					j.AccountID = resolved
+				} else {
+					// No live bot under this channel type at all — real
+					// failure, count it and maybe delete.
+					count, ferr := s.store.IncrementCronJobFailure(ctx, j.ID)
+					if ferr != nil {
+						slog.Error("failed to bump cron failure count", "id", j.ID, "error", ferr)
+						continue
+					}
+					if count >= cronMaxConsecutiveFailures {
+						slog.Warn("auto-deleting cron job — destination channel missing for too many consecutive ticks",
+							"id", j.ID, "name", j.Name,
+							"channel", j.Channel, "account", j.AccountID,
+							"failures", count)
+						if derr := s.store.DeleteCronJob(ctx, j.ID); derr != nil {
+							slog.Error("failed to delete dead cron job", "id", j.ID, "error", derr)
+						}
+						continue
+					}
+					slog.Warn("cron destination channel missing, skipping fire",
 						"id", j.ID, "name", j.Name,
 						"channel", j.Channel, "account", j.AccountID,
-						"failures", count)
-					if derr := s.store.DeleteCronJob(ctx, j.ID); derr != nil {
-						slog.Error("failed to delete dead cron job", "id", j.ID, "error", derr)
-					}
+						"failures", count, "threshold", cronMaxConsecutiveFailures)
 					continue
 				}
-				slog.Warn("cron destination channel missing, skipping fire",
-					"id", j.ID, "name", j.Name,
-					"channel", j.Channel, "account", j.AccountID,
-					"failures", count, "threshold", cronMaxConsecutiveFailures)
-				continue
 			}
 		}
 
@@ -333,6 +370,66 @@ func (s *Scheduler) processDueJobs(ctx context.Context) {
 			_ = s.store.UpdateCronJobRun(ctx, j.ID, now, now.Add(time.Hour))
 		}
 	}
+}
+
+// trySelfHeal rescues a cron job whose frozen account_id no longer
+// resolves against the live channel registry — the common cause being a
+// channel rebind that minted a fresh account_id (e.g. a WeChat rescan
+// issues a new ilink_bot_id) while the cron row still carries the old one.
+//
+// It looks up the currently-enabled bots of the same channel type bound
+// to the job's agent and, if at least one is registered (Has == true),
+// re-keys the job's account_id to it. The caller (processDueJobs) then
+// fires against the resolved account_id and we persist the rewrite so
+// subsequent ticks skip this fallback.
+//
+// Returns:
+//   - ("", nil) when no live bot exists under this channel type — the
+//     caller should fall through to the failure-counter path.
+//   - (accountID, nil) on a successful re-key; the row has also been
+//     persisted with the new account_id (best-effort, logged on error).
+//   - ("", err) only when the lookup itself errored.
+//
+// Disambiguation when multiple live bots match is deliberately simple:
+// the first is used and a warning is logged so an operator can tighten
+// the binding if it matters. Multi-bot-per-agent-per-type is rare.
+func (s *Scheduler) trySelfHeal(ctx context.Context, j StoreJob) (string, error) {
+	if s.store == nil {
+		return "", nil
+	}
+	accounts, err := s.store.ListAgentChannels(ctx, j.AgentID, j.Channel)
+	if err != nil {
+		return "", err
+	}
+	if len(accounts) == 0 {
+		return "", nil
+	}
+	resolved := ""
+	for _, acc := range accounts {
+		if s.channels != nil && !s.channels.Has(j.Channel, acc) {
+			continue
+		}
+		if resolved != "" {
+			slog.Warn("cron self-heal: multiple live bots match, using the first",
+				"id", j.ID, "name", j.Name,
+				"channel", j.Channel,
+				"picked", resolved, "also_live", acc,
+				"agent", j.AgentID)
+			break
+		}
+		resolved = acc
+	}
+	if resolved == "" {
+		return "", nil
+	}
+	// Persist the re-key so the next tick finds the row already pointing
+	// at a live bot. Best-effort: a persistence failure doesn't undo the
+	// in-memory rewrite, so this tick still delivers correctly.
+	if err := s.store.UpdateCronJobAccountByID(ctx, j.ID, resolved); err != nil {
+		slog.Error("cron self-heal: failed to persist re-keyed account_id",
+			"id", j.ID, "new_account", resolved, "error", err)
+	}
+	return resolved, nil
 }
 
 func (s *Scheduler) runJob(ctx context.Context, job Job) {

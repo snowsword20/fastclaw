@@ -1291,7 +1291,82 @@ func (s *Server) saveChannelRecord(ctx context.Context, userID, agentID, channel
 			"type", channelType, "account", accountID, "error", err)
 		return fmt.Errorf("save channel record: %w", err)
 	}
+	// A fresh channel save is the moment a rebind lands (e.g. a WeChat
+	// rescan minted a new account_id). Migrate any cron jobs that still
+	// point at a now-orphaned account_id under the same channel type so
+	// they keep firing instead of failing 3 ticks and getting deleted.
+	// See rekeyOrphanedCronJobs for the orphan-detection rule.
+	s.rekeyOrphanedCronJobs(ctx, agentID, channelType, accountID)
 	return nil
+}
+
+// rekeyOrphanedCronJobs rewrites the account_id of cron jobs whose frozen
+// account_id no longer has a live channel row, pointing them at the
+// freshly-saved accountID (a just-bound bot). This is the rebind-time
+// complement to the scheduler's runtime self-heal: it prevents the first
+// post-rebind tick from ever failing.
+//
+// An account_id is "orphaned" when no enabled channel row of this type
+// bound to this agent still carries it — judged from the DB (the source
+// of truth for bindings), not from the in-memory Manager (which may lag a
+// hot-register). Only orphans move; jobs already pointing at another
+// still-live bot are left untouched, so a multi-bot agent doesn't have one
+// bot's jobs stolen by another.
+func (s *Server) rekeyOrphanedCronJobs(ctx context.Context, agentID, channelType, newAccountID string) {
+	if s.dataStore == nil || newAccountID == "" {
+		return
+	}
+	// Build the set of currently-live account_ids for this (agent, type)
+	// straight from the channels table — anything not in here is an orphan.
+	liveRows, err := s.dataStore.ListChannels(ctx, "", agentID)
+	if err != nil {
+		slog.Warn("rekeyOrphanedCronJobs: list channels failed",
+			"agent", agentID, "type", channelType, "error", err)
+		return
+	}
+	live := make(map[string]struct{}, len(liveRows))
+	for _, r := range liveRows {
+		if r.Type == channelType && r.Enabled && r.AccountID != "" {
+			live[r.AccountID] = struct{}{}
+		}
+	}
+	// newAccountID was just saved, so it's always live — record it
+	// explicitly in case the SaveChannel above hasn't flushed into the
+	// ListChannels read yet on some drivers.
+	live[newAccountID] = struct{}{}
+
+	jobs, err := s.dataStore.ListCronJobsByAgentChannel(ctx, agentID, channelType)
+	if err != nil {
+		slog.Warn("rekeyOrphanedCronJobs: list cron jobs failed",
+			"agent", agentID, "type", channelType, "error", err)
+		return
+	}
+	migrated := 0
+	for _, j := range jobs {
+		if j.AccountID == newAccountID {
+			continue // already on the new bot
+		}
+		if _, ok := live[j.AccountID]; ok {
+			continue // its bot is still alive — don't steal it
+		}
+		if err := s.dataStore.UpdateCronJobAccountByID(ctx, j.ID, newAccountID); err != nil {
+			slog.Warn("rekeyOrphanedCronJobs: re-key failed",
+				"job", j.ID, "name", j.Name,
+				"old_account", j.AccountID, "new_account", newAccountID, "error", err)
+			continue
+		}
+		slog.Info("rekeyOrphanedCronJobs: migrated cron job to new channel account",
+			"job", j.ID, "name", j.Name,
+			"channel", channelType,
+			"old_account", j.AccountID, "new_account", newAccountID,
+			"agent", agentID)
+		migrated++
+	}
+	if migrated > 0 {
+		slog.Info("rekeyOrphanedCronJobs done",
+			"agent", agentID, "type", channelType,
+			"new_account", newAccountID, "migrated", migrated)
+	}
 }
 
 // channelConfigToData converts a ChannelConfig to a JSON data map,

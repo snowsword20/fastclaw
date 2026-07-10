@@ -17,13 +17,23 @@ type mockStore struct {
 	locked  map[string]bool
 	deleted map[string]bool
 	updated map[string]time.Time // jobID → nextRun
+
+	// agentChannels maps "agentID|channelType" → list of account_ids
+	// that ListAgentChannels should report as enabled. Populated by tests
+	// via setAgentChannels.
+	agentChannels map[string][]string
+	// rekeyed records jobID → newAccountID for UpdateCronJobAccountByID
+	// calls, so a test can assert the self-heal persisted the rewrite.
+	rekeyed map[string]string
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		locked:  make(map[string]bool),
-		deleted: make(map[string]bool),
-		updated: make(map[string]time.Time),
+		locked:        make(map[string]bool),
+		deleted:       make(map[string]bool),
+		updated:       make(map[string]time.Time),
+		agentChannels: make(map[string][]string),
+		rekeyed:       make(map[string]string),
 	}
 }
 
@@ -90,6 +100,27 @@ func (m *mockStore) GetNextDueTime(ctx context.Context) (time.Time, error) {
 
 func (m *mockStore) IncrementCronJobFailure(ctx context.Context, jobID string) (int, error) {
 	return 1, nil
+}
+
+func (m *mockStore) ListAgentChannels(ctx context.Context, agentID, channelType string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.agentChannels[agentID+"|"+channelType], nil
+}
+
+func (m *mockStore) UpdateCronJobAccountByID(ctx context.Context, jobID, newAccountID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rekeyed[jobID] = newAccountID
+	return nil
+}
+
+// setAgentChannels configures which account_ids ListAgentChannels reports
+// as enabled for the given (agentID, channelType) pair.
+func (m *mockStore) setAgentChannels(agentID, channelType string, accounts ...string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.agentChannels[agentID+"|"+channelType] = accounts
 }
 
 func (m *mockStore) isDeleted(jobID string) bool {
@@ -283,4 +314,141 @@ func TestNotifyJobCreated(t *testing.T) {
 	// Second call should not block
 	NotifyJobCreated()
 	NotifyJobCreated() // should not panic or block
+}
+
+// mockChannelChecker implements ChannelChecker. live maps
+// "channel:accountID" → registered. A key present means Has returns true.
+type mockChannelChecker struct {
+	live map[string]bool
+}
+
+func (c *mockChannelChecker) Has(channel, accountID string) bool {
+	return c.live[channel+":"+accountID]
+}
+
+// TestSchedulerSelfHealOnRebind covers the rebind scenario: a cron job
+// was created under an account_id that's since been replaced (the bot was
+// rebound and minted a fresh account_id). The pre-flight Has() on the old
+// account_id fails, so the scheduler should look up a still-live bot under
+// the same channel type, fire against it, and persist the re-key — instead
+// of bumping the failure counter toward auto-delete.
+func TestSchedulerSelfHealOnRebind(t *testing.T) {
+	mb := bus.New()
+	// Capture the fired inbound so we can assert the account_id it carries.
+	var fired *bus.InboundMessage
+	var fireMu sync.Mutex
+	go func() {
+		for msg := range mb.Inbound {
+			fireMu.Lock()
+			f := msg
+			fired = &f
+			fireMu.Unlock()
+		}
+	}()
+
+	store := newMockStore()
+	// Job frozen with the OLD account_id that no longer resolves.
+	store.addJob(StoreJob{
+		ID:        "daily-1",
+		Name:      "alarm",
+		Type:      "cron",
+		Schedule:  "0 7 * * *",
+		Message:   "wake up",
+		Channel:   "wechat",
+		AccountID: "OLD_bot@im.bot",
+		AgentID:   "agt_1",
+		ChatID:    "openid-1",
+	})
+	// The agent now has a live bot under a NEW account_id.
+	store.setAgentChannels("agt_1", "wechat", "NEW_bot@im.bot")
+
+	// Channel registry: only the NEW bot is registered; the OLD one was
+	// torn down by the rebind.
+	checker := &mockChannelChecker{live: map[string]bool{
+		"wechat:NEW_bot@im.bot": true,
+	}}
+
+	s := &Scheduler{
+		bus:        mb,
+		store:      store,
+		channels:   checker,
+		instanceID: "test",
+	}
+
+	s.processDueJobs(context.Background())
+
+	// Give the drain goroutine a moment to record the fired message.
+	deadline := time.Now().Add(time.Second)
+	for {
+		fireMu.Lock()
+		done := fired != nil
+		fireMu.Unlock()
+		if done || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	fireMu.Lock()
+	defer fireMu.Unlock()
+	if fired == nil {
+		t.Fatal("expected the job to fire after self-heal, but no inbound was emitted")
+	}
+	if fired.AccountID != "NEW_bot@im.bot" {
+		t.Errorf("fired inbound should carry the healed account_id; got %q", fired.AccountID)
+	}
+	// The re-key should have been persisted so the next tick skips the fallback.
+	if got := store.rekeyed["daily-1"]; got != "NEW_bot@im.bot" {
+		t.Errorf("expected job account_id persisted as NEW_bot@im.bot, got %q", got)
+	}
+	// And it must NOT have been counted as a failure (no auto-delete path).
+	if store.isDeleted("daily-1") {
+		t.Error("self-healed job should not be deleted")
+	}
+}
+
+// TestSchedulerNoSelfHealWhenNoLiveBot confirms that when there is no live
+// bot under the channel type at all, the scheduler falls back to the
+// failure-counter / auto-delete path rather than firing blindly.
+func TestSchedulerNoSelfHealWhenNoLiveBot(t *testing.T) {
+	mb := bus.New()
+	go func() {
+		for range mb.Inbound {
+		}
+	}()
+
+	store := newMockStore()
+	store.addJob(StoreJob{
+		ID:        "daily-2",
+		Name:      "alarm",
+		Type:      "cron",
+		Schedule:  "0 7 * * *",
+		Message:   "wake up",
+		Channel:   "wechat",
+		AccountID: "DEAD_bot@im.bot",
+		AgentID:   "agt_2",
+		ChatID:    "openid-2",
+	})
+	// No live bots reported for this agent/channel.
+	store.setAgentChannels("agt_2", "wechat")
+
+	checker := &mockChannelChecker{live: map[string]bool{}}
+
+	s := &Scheduler{
+		bus:        mb,
+		store:      store,
+		channels:   checker,
+		instanceID: "test",
+	}
+
+	s.processDueJobs(context.Background())
+
+	// IncrementCronJobFailure returns 1 (below threshold of 3), so the job
+	// is skipped-but-kept, not deleted.
+	if store.isDeleted("daily-2") {
+		t.Error("job should not be deleted on first miss (below threshold)")
+	}
+	if got := store.rekeyed["daily-2"]; got != "" {
+		t.Errorf("no self-heal expected when no live bot exists; got rekey %q", got)
+	}
 }
