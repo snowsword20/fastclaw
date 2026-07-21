@@ -1,0 +1,98 @@
+# fastclaw-sandbox + feedgrab — runtime image for the agent's exec sandbox.
+#
+# Why this exists: the official `thinkany/fastclaw-sandbox:latest` image has
+# Python + Node + Camoufox (anti-detect Firefox), but feedgrab also needs the
+# Playwright/Patchright Chromium runtime + the feedgrab[all] Python deps so the
+# agent can run `feedgrab <url>` on the first turn with zero pip/npm round-trips.
+#
+# Build context MUST be the parent dir that contains BOTH repos:
+#
+#   E:/project/github/
+#   ├── fastclaw/        ← this Dockerfile lives at fastclaw/deploy/docker/sandbox/
+#   └── feedgrab/        ← source we COPY in
+#
+# Build (see build-feedgrab.sh):
+#   cd E:/project/github/fastclaw/deploy/docker/sandbox
+#   docker build -f Dockerfile.feedgrab -t myrepo/feedgrab-sandbox:latest \
+#     --build-arg HTTPS_PROXY=http://host.docker.internal:7890 \
+#     ../../../..     # context = E:/project/github/
+#
+# Layering strategy (maximize cache reuse):
+#   A. base image          — never rebuilds
+#   B. build tools         — almost never changes
+#   D. Python deps         — only reruns when pyproject.toml deps change
+#   C. browser binaries    — after deps (patchright is a pip module); rarely changes
+#   E. feedgrab source     — reruns on every code change, but is thin (~seconds)
+#
+# Deps (D) precede browser binaries (C) because `patchright install chromium`
+# needs the patchright Python package installed first. So editing a .py file
+# only triggers layer E (~10-30s rebuild). Only a dependency bump reruns D+C;
+# everything else stays cached.
+
+ARG BASE_IMAGE=thinkany/fastclaw-sandbox:latest
+FROM ${BASE_IMAGE}
+
+# Proxy passthrough for build-time downloads (pip, playwright, apt). Pass with
+# --build-arg HTTPS_PROXY=http://host.docker.internal:7890 (or your mirror).
+# The official base image already inherits HTTPS_PROXY into the runtime shim
+# for Camoufox; we only need it at build time here, so it stays a build ARG.
+ARG HTTPS_PROXY=""
+ARG HTTP_PROXY=""
+ARG https_proxy="${HTTPS_PROXY}"
+ARG http_proxy="${HTTP_PROXY}"
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# ── Layer B: build tools for C-extension deps (curl_cffi, XClientTransaction, etc.)
+# The base image is bookworm-slim and ships no compiler. Keep this as its own
+# layer so it's cached permanently and never re-downloaded.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+# ── Layer D: Python deps. COPY ONLY pyproject.toml first so this layer caches
+# on dep-list changes, independent of source edits. Install [all] extras for
+# full platform coverage (telegram, browser, stealth, twitter, wechat, xhs, feishu).
+# This MUST come before the browser-binary layer below — `patchright install
+# chromium` needs the patchright Python package on PYTHONPATH first.
+COPY feedgrab/pyproject.toml feedgrab/README.md /tmp/feedgrab-build/
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --break-system-packages "feedgrab[all] @ file:///tmp/feedgrab-build" \
+ && rm -rf /tmp/feedgrab-build
+
+# ── Layer C: browser binaries. feedgrab uses Playwright/Patchright Chromium,
+# which is a SEPARATE runtime from the base image's Camoufox Firefox. Must be
+# installed here so the first `feedgrab <xhs-url>` doesn't spend 60s downloading.
+#   * `playwright install --with-deps chromium` pulls chromium + apt deps
+#   * `patchright install chromium`        pulls the patchright-patched chromium
+# Both download ~150MB each; needs the proxy ARG above on GFW networks. Runs
+# AFTER the deps layer because patchright is itself a pip-installed module.
+RUN python -m playwright install --with-deps chromium \
+ && python -m patchright install chromium
+
+# ── Layer E: feedgrab source. Installs over the deps layer with --no-deps so a
+# code edit never re-resolves dependencies. -e keeps it editable; operators who
+# want to hot-patch source via /workspace can do so without rebuilding.
+# COPY paths are relative to the build context (E:/project/github/).
+COPY feedgrab/feedgrab/ /opt/feedgrab/feedgrab/
+COPY feedgrab/mcp_server.py /opt/feedgrab/mcp_server.py
+COPY feedgrab/pyproject.toml /opt/feedgrab/pyproject.toml
+# README.md is referenced by pyproject's `readme = ` field; hatchling refuses
+# to build wheel/editable metadata without it.
+COPY feedgrab/README.md /opt/feedgrab/README.md
+RUN pip install --break-system-packages --no-deps -e /opt/feedgrab
+
+# Default data layout convention. feedgrab reads FEEDGRAB_DATA_DIR (config.py)
+# for sessions/cookies; we point it at /workspace/.feedgrab/sessions so it lives
+# on the host-side workspace store (the only RW bind-mount in the fastclaw
+# sandbox) and persists across container restarts.
+# Operators must populate /workspace/.feedgrab/.env + sessions/ once (see README).
+ENV FEEDGRAB_DATA_DIR=/workspace/.feedgrab/sessions \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /workspace
+
+# Smoke check: fail the build early if the entry point didn't land.
+RUN feedgrab --version 2>/dev/null || feedgrab --help >/dev/null 2>&1 || echo "feedgrab entry point check skipped"
