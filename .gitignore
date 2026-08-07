@@ -71,3 +71,5 @@ env.toml
 web/node_modules/
 web/pnpm-lock.yaml
 fastclaw-patched
+
+.zcode/
