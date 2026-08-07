@@ -48,7 +48,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
+# sandbox(1)→docker(2)→deploy(3)→fastclaw(4)→github parent. Matches
+# build-feedgrab.sh's REPO_ROOT so the default SOURCE resolves the same way
+# (feedgrab as a sibling of fastclaw). The previous ../../.. landed inside
+# fastclaw/ itself and looked for fastclaw/feedgrab, which never exists.
+REPO_ROOT=$(cd "$SCRIPT_DIR/../../../.." && pwd)
 SOURCE=${SOURCE:-"$REPO_ROOT/feedgrab"}
 
 # Resolve Windows-style paths (E:/...) to something bash cp understands on Git Bash.
@@ -76,14 +80,44 @@ if [[ ! -d "$SOURCE" ]]; then
 fi
 
 TARGET="$DEST/.feedgrab"
-mkdir -p "$TARGET/sessions"
+
+# The session workspace is bind-mounted RW into the sandbox at /workspace,
+# and under FASTCLAW_SANDBOX_ENFORCE (or any sandbox-first config) the
+# container runs as root, so files it created — including a pre-existing
+# .feedgrab/ from an earlier feedgrab run — are owned by root. A non-root
+# operator can't mkdir/cp inside it. Detect that and fall back to copying
+# THROUGH a running fastclaw sandbox container (which sees the same /workspace
+# as root), so seeding works without passwordless sudo.
+VIA_CONTAINER=0
+if ! mkdir -p "$TARGET/sessions" 2>/dev/null; then
+  # Permission denied — likely root-owned .feedgrab/ from a sandbox run.
+  # Find a running fastclaw sandbox whose /workspace maps to this $DEST.
+  CID=$(docker ps --filter label=fastclaw=sandbox --format '{{.ID}}' 2>/dev/null | while read -r id; do
+    src=$(docker inspect "$id" --format '{{range .Mounts}}{{if eq .Destination "/workspace"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+    if [[ "$src" == "$DEST" ]]; then echo "$id"; break; fi
+  done | head -1)
+  if [[ -z "$CID" ]]; then
+    echo "ERROR: cannot write to $TARGET (permission denied) and no running" >&2
+    echo "       fastclaw sandbox maps to $DEST." >&2
+    echo "       Either run this script with sudo, or trigger a sandbox for" >&2
+    echo "       this session first (send the agent any message) and re-run." >&2
+    exit 1
+  fi
+  echo "ℹ $TARGET is root-owned; seeding through sandbox container $CID (as root)."
+  VIA_CONTAINER=1
+  docker exec "$CID" mkdir -p /workspace/.feedgrab/sessions 2>/dev/null
+fi
 
 copied=0
 
 # .env — credentials (cookies/tokens for all platforms). REQUIRED for login-only
 # platforms (Twitter, XHS, WeChat, zsxq, ...). Optional for public RSS/web.
 if [[ -f "$SOURCE/.env" ]]; then
-  cp "$SOURCE/.env" "$TARGET/.env"
+  if [[ $VIA_CONTAINER -eq 1 ]]; then
+    docker cp "$SOURCE/.env" "$CID:/workspace/.feedgrab/.env" 2>/dev/null
+  else
+    cp "$SOURCE/.env" "$TARGET/.env"
+  fi
   echo "✓ copied .env → $TARGET/.env"
   copied=1
 else
@@ -95,12 +129,16 @@ fi
 # without it the agent has to re-login on first use (interactive, painful in a
 # sandbox). Copy existing login state if present.
 if [[ -d "$SOURCE/sessions" ]] && [[ -n $(ls -A "$SOURCE/sessions" 2>/dev/null) ]]; then
-  cp -r "$SOURCE/sessions/." "$TARGET/sessions/"
+  if [[ $VIA_CONTAINER -eq 1 ]]; then
+    docker cp "$SOURCE/sessions/." "$CID:/workspace/.feedgrab/sessions/" 2>/dev/null
+  else
+    cp -r "$SOURCE/sessions/." "$TARGET/sessions/"
+  fi
   echo "✓ copied sessions/ → $TARGET/sessions/"
   copied=1
 else
   echo "ℹ no sessions/ at $SOURCE/sessions — first login-gated call will need"
-  echo "  an interactive `feedgrab login <platform>` inside the sandbox."
+  echo "  an interactive \`feedgrab login <platform>\` inside the sandbox."
 fi
 
 if [[ $copied -eq 0 ]]; then
@@ -115,5 +153,5 @@ echo "==> done. Inside the sandbox container, feedgrab now sees:"
 echo "    /workspace/.feedgrab/.env         (credentials)"
 echo "    /workspace/.feedgrab/sessions/    (login state)"
 echo
-echo "Test from an exec tool call or `docker exec`:"
+echo 'Test from an exec tool call or `docker exec`:'
 echo "    feedgrab https://example.com/feed.xml"

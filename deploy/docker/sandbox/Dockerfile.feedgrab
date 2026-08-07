@@ -72,6 +72,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN python -m playwright install --with-deps chromium \
  && python -m patchright install chromium
 
+# ── Layer D2: system Google Chrome. feedgrab's stealth_launch (browser.py)
+# hard-codes `channel="chrome"`, which makes Playwright/patchright look for a
+# system Google Chrome at /opt/google/chrome/chrome — NOT the Chromium binary
+# that playwright/patchright just downloaded. Without this, WeChat / Twitter /
+# other strongly anti-bot platforms fail at Tier 1 ("channel chrome not found"),
+# because feedgrab refuses to fall back to the bundled Chromium. Installing the
+# real Chrome keeps feedgrab's intended fingerprint (genuine Chrome + patchright
+# CDP patches) which is exactly why the author pinned channel="chrome".
+# The deb's deps overlap with the playwright --with-deps libs above, so apt
+# resolves them cheaply. Kept as its own layer so source edits don't re-download.
+RUN curl -fsSL -o /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+ && rm -f /tmp/chrome.deb \
+ && rm -rf /var/lib/apt/lists/* \
+ && google-chrome --version
+
 # ── Layer E: feedgrab source. Installs over the deps layer with --no-deps so a
 # code edit never re-resolves dependencies. -e keeps it editable; operators who
 # want to hot-patch source via /workspace can do so without rebuilding.
@@ -89,7 +106,15 @@ RUN pip install --break-system-packages --no-deps -e /opt/feedgrab
 # on the host-side workspace store (the only RW bind-mount in the fastclaw
 # sandbox) and persists across container restarts.
 # Operators must populate /workspace/.feedgrab/.env + sessions/ once (see README).
+#
+# OUTPUT_DIR is set explicitly because feedgrab's save_to_markdown
+# (utils/storage.py) SKIPS writing files when neither OUTPUT_DIR nor
+# OBSIDIAN_VAULT is set — it just returns the in-memory object. Without this,
+# the agent fetches a URL, sees no file on disk, and assumes the grab failed.
+# Point it at the same .feedgrab/ root so both sessions/ and output/ live under
+# one host-visible dir that persists across sandbox eviction/restart.
 ENV FEEDGRAB_DATA_DIR=/workspace/.feedgrab/sessions \
+    OUTPUT_DIR=/workspace/.feedgrab/output \
     PYTHONUNBUFFERED=1
 
 WORKDIR /workspace
