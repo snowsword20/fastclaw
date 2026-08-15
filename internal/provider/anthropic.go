@@ -37,25 +37,47 @@ type anthropicMessage struct {
 	Content json.RawMessage `json:"content"`
 }
 
+// anthropicCacheControl opts a prefix into Anthropic's prompt caching.
+// {"type":"ephemeral"} = default 5-minute TTL, refreshed on each hit.
+type anthropicCacheControl struct {
+	Type string `json:"type"`
+}
+
+var ephemeralCache = &anthropicCacheControl{Type: "ephemeral"}
+
+// anthropicSystemBlock is the block form of the system prompt. Anthropic
+// accepts a bare string too, but cache_control breakpoints can only be
+// attached to blocks — see buildRequest.
+type anthropicSystemBlock struct {
+	Type         string                 `json:"type"` // "text"
+	Text         string                 `json:"text"`
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+}
+
 type anthropicTool struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema interface{} `json:"input_schema"`
+	// CacheControl is set on the LAST tool only (see buildRequest) —
+	// tools serialize before system/messages, so a breakpoint there
+	// caches the tool definitions for every subsequent request.
+	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
 }
 
 type anthropicRequest struct {
-	Model     string             `json:"model"`
-	Messages  []anthropicMessage `json:"messages"`
-	System    string             `json:"system,omitempty"`
-	MaxTokens int                `json:"max_tokens"`
-	Stream    bool               `json:"stream"`
-	Tools     []anthropicTool    `json:"tools,omitempty"`
+	Model     string                 `json:"model"`
+	Messages  []anthropicMessage     `json:"messages"`
+	System    []anthropicSystemBlock `json:"system,omitempty"`
+	MaxTokens int                    `json:"max_tokens"`
+	Stream    bool                   `json:"stream"`
+	Tools     []anthropicTool        `json:"tools,omitempty"`
 }
 
 // toAnthropicMessages converts provider Messages to Anthropic wire format.
 // Extracts the system message and returns the rest.
 func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 	var system string
+	var sysParts []string
 	var out []anthropicMessage
 
 	// Anthropic rejects any tool_use whose tool_result doesn't appear
@@ -85,10 +107,27 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 		}
 	}
 
+	// System-role handling: LEADING system messages (before the first
+	// conversation message) are joined into the system param — the
+	// previous implementation overwrote `system` with each system
+	// message, so when callers injected channel hints / sender blocks
+	// between the main system prompt and the history, only the LAST of
+	// them survived and the actual system prompt was silently dropped
+	// on the Anthropic wire (the OpenAI path sent all of them). System
+	// messages that appear AFTER the conversation has started
+	// (fastclaw's per-turn tail context) have no Anthropic equivalent
+	// mid-conversation; emit them as user-role turns — the API merges
+	// consecutive user messages into one turn.
 	for i, m := range msgs {
+		role := m.Role
 		if m.Role == "system" {
-			system = m.Content
-			continue
+			if len(out) == 0 {
+				if m.Content != "" {
+					sysParts = append(sysParts, m.Content)
+				}
+				continue
+			}
+			role = "user"
 		}
 		if orphanTool[i] {
 			continue
@@ -113,7 +152,7 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 			continue
 		}
 
-		am := anthropicMessage{Role: m.Role}
+		am := anthropicMessage{Role: role}
 
 		// Tool results become role "user" with tool_result content blocks.
 		// Anthropic requires every tool_result for a parallel tool_use batch
@@ -249,6 +288,7 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 		out = append(out, am)
 	}
 
+	system = strings.Join(sysParts, "\n\n")
 	return system, out
 }
 
@@ -349,6 +389,72 @@ func thinkingBlockFor(m Message) map[string]interface{} {
 	return nil
 }
 
+// applyMessageCacheBreakpoints marks the final content block of the
+// LAST wire message and of the message three positions back (n-1 and
+// n-3).
+//
+// Why n-3/n-1 rather than the "second-to-last" pattern the Anthropic
+// docs use for plain chat apps: fastclaw's requests grow by exactly
+// TWO wire messages per exchange — a ReAct iteration appends
+// [assistant(tool_use), user(tool_result)] and a new turn appends
+// [user, tail-context]. The previous request therefore ended at what
+// is now n-3: breakpointing it reads the cache entry the previous
+// request's trailing breakpoint (n-1) wrote, and breakpointing the
+// current n-1 extends the cache by this exchange. Chained across
+// requests this hits on every call; the two message breakpoints plus
+// the tools and system breakpoints use the full budget of 4.
+func applyMessageCacheBreakpoints(msgs []anthropicMessage) {
+	n := len(msgs)
+	if n == 0 {
+		return
+	}
+	for _, idx := range []int{n - 1, n - 3} {
+		if idx < 0 {
+			continue
+		}
+		markLastBlockCacheControl(&msgs[idx])
+	}
+}
+
+// markLastBlockCacheControl attaches cache_control to the final content
+// block of one wire message. Block-array content keeps every other
+// block's bytes untouched (they round-trip as json.RawMessage); bare
+// string content is upgraded to a single-block array because
+// cache_control cannot attach to a plain string. Empty content is
+// skipped — there is nothing worth caching and an empty text block
+// would be pure overhead.
+func markLastBlockCacheControl(m *anthropicMessage) {
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(m.Content, &blocks); err == nil {
+		if len(blocks) == 0 {
+			return
+		}
+		var last map[string]any
+		if err := json.Unmarshal(blocks[len(blocks)-1], &last); err != nil {
+			return // e.g. a bare string element — not a markable block
+		}
+		if _, exists := last["cache_control"]; exists {
+			return
+		}
+		last["cache_control"] = ephemeralCache
+		reMarshalled, err := json.Marshal(last)
+		if err != nil {
+			return
+		}
+		blocks[len(blocks)-1] = reMarshalled
+		m.Content, _ = json.Marshal(blocks)
+		return
+	}
+	var s string
+	if err := json.Unmarshal(m.Content, &s); err == nil && s != "" {
+		m.Content, _ = json.Marshal([]any{map[string]any{
+			"type":          "text",
+			"text":          s,
+			"cache_control": ephemeralCache,
+		}})
+	}
+}
+
 func (p *AnthropicProvider) buildRequest(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, stream bool) (*http.Request, error) {
 	system, anthropicMsgs := toAnthropicMessages(messages)
 
@@ -365,9 +471,23 @@ func (p *AnthropicProvider) buildRequest(ctx context.Context, messages []Message
 	req := anthropicRequest{
 		Model:     StripProviderPrefix(model),
 		Messages:  anthropicMsgs,
-		System:    system,
 		MaxTokens: maxTokens,
 		Stream:    stream,
+	}
+
+	// Prompt caching: Anthropic only caches prefixes that end at an
+	// explicit cache_control breakpoint (no implicit caching). We spend
+	// the 4-breakpoint budget as: tools (last tool), system, and two
+	// message positions — see applyMessageCacheBreakpoints for why the
+	// message breakpoints sit at n-3 / n-1. Short conversations below
+	// the minimum cacheable prefix (1024 tokens) simply don't cache;
+	// the API ignores undersized breakpoints rather than erroring.
+	if system != "" {
+		req.System = []anthropicSystemBlock{{
+			Type:         "text",
+			Text:         system,
+			CacheControl: ephemeralCache,
+		}}
 	}
 
 	if len(tools) > 0 {
@@ -378,7 +498,10 @@ func (p *AnthropicProvider) buildRequest(ctx context.Context, messages []Message
 				InputSchema: t.Function.Parameters,
 			})
 		}
+		req.Tools[len(req.Tools)-1].CacheControl = ephemeralCache
 	}
+
+	applyMessageCacheBreakpoints(req.Messages)
 
 	body, err := json.Marshal(req)
 	if err != nil {

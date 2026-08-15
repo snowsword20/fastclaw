@@ -35,9 +35,7 @@ type promptCtx struct {
 	chatterUID string
 	chatterMem *Memory
 	mode       string
-	now        time.Time
-	loc        *time.Location
-	dateLine   string // pre-rendered, shared across modules
+	timeAnchor string // stable NOW-line instructions, shared across modules
 }
 
 // moduleEntry pairs a human-readable key with its builder function.
@@ -153,33 +151,45 @@ func modulesForMode(mode string) []moduleEntry {
 // Shared helpers
 // ──────────────────────────────────────────────────────────────────
 
-// buildDateLine renders the current-time anchor for the system prompt.
+// timeAnchorInstructions renders the STABLE half of the old date line:
+// the behavioral rules around "now", with no actual timestamp in them.
+// The volatile value lives in buildTimeAnchorValue and is injected as a
+// per-turn system message AFTER the latest user message (see
+// Agent.buildTurnTailContext) — keeping it out of the system prompt is
+// what makes the prompt byte-stable across turns, so provider-side
+// prefix caching (Anthropic cache_control / OpenAI implicit) can hit.
+//
 // tzExplicit indicates the timezone was explicitly set by the chatter
 // (via set_timezone), as opposed to falling back to server-local time.
-func buildDateLine(now time.Time, tzExplicit bool) string {
-	wd := now.Weekday().String()
-	tzName := now.Location().String()
-
-	base := fmt.Sprintf("Current date/time: %s (%s, %s — the chatter's local timezone). This is NOW; do NOT call `date`. "+
-		"Message timestamps are internal metadata and are not part of message text. When a conversation resumes after a long gap, "+
-		"you may receive a silent conversation-timing context note. Use it to distinguish the current turn from stale circumstances, "+
-		"and before ANY time-of-day remark check NOW — e.g. don't say \"good night\" in the middle of the day. "+
-		"This is silent background context for your own reasoning, not something to report: do NOT open or pepper your reply with the "+
-		"current date/time or day of week (e.g. don't start a reply with \"周六晚上九点二十七分\" or \"It's Saturday night\") unless the "+
-		"chatter directly asked what time/day it is or the precise time is materially relevant to the answer.",
-		now.Format("2006-01-02 15:04:05 -0700"), wd, tzName)
+func timeAnchorInstructions(tzName string, tzExplicit bool) string {
+	base := "A \"Current date/time\" line arrives as a system message right after the latest user message on every turn — that line is NOW; do NOT call `date`. " +
+		"Message timestamps are internal metadata and are not part of message text. When a conversation resumes after a long gap, " +
+		"you may receive a silent conversation-timing context note. Use it to distinguish the current turn from stale circumstances, " +
+		"and before ANY time-of-day remark check the NOW line — e.g. don't say \"good night\" in the middle of the day. " +
+		"This is silent background context for your own reasoning, not something to report: do NOT open or pepper your reply with the " +
+		"current date/time or day of week (e.g. don't start a reply with \"周六晚上九点二十七分\" or \"It's Saturday night\") unless the " +
+		"chatter directly asked what time/day it is or the precise time is materially relevant to the answer."
 
 	if tzExplicit {
 		// Timezone was explicitly configured — tell the model NOT to ask again.
 		base += fmt.Sprintf(" The chatter's timezone is already configured as %s — do NOT ask for their timezone or city, just use it.", tzName)
 	} else {
 		// Timezone is server default — model should infer if possible.
-		base += " If the timezone above looks wrong for this chatter — it reads UTC but their city, region, or language place them elsewhere " +
+		base += " If the NOW line's timezone looks wrong for this chatter — it reads UTC but their city, region, or language place them elsewhere " +
 			"(e.g. someone writing in Chinese who mentions 浦东 is in Asia/Shanghai) — infer their real timezone, apply it when you talk " +
 			"about time this turn, and record it in their USER.md profile (e.g. a `Timezone: Asia/Shanghai` line) so future timestamps " +
 			"convert automatically. Do the same when they state a timezone outright. Never invent a timezone without a real signal."
 	}
 	return base
+}
+
+// buildTimeAnchorValue renders the VOLATILE half of the time anchor —
+// the actual NOW line, injected per-turn near the latest user message.
+// Separated from timeAnchorInstructions so the system prompt stays
+// byte-stable while this line changes every turn.
+func buildTimeAnchorValue(now time.Time) string {
+	return fmt.Sprintf("Current date/time: %s (%s, %s — the chatter's local timezone). This is NOW.",
+		now.Format("2006-01-02 15:04:05 -0700"), now.Weekday().String(), now.Location().String())
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -207,10 +217,12 @@ func modIdentityAnchor(p *promptCtx) string {
 		p.cb.displayName, p.cb.displayName)
 }
 
-// modDateOnly emits just the date line — used by Customize mode where
-// the author is fully responsible for the rest of the prompt.
+// modDateOnly emits just the time-anchor instructions — used by
+// Customize mode where the author is fully responsible for the rest of
+// the prompt. The volatile NOW value rides separately in the per-turn
+// tail context.
 func modDateOnly(p *promptCtx) string {
-	return p.dateLine
+	return p.timeAnchor
 }
 
 // modAgentIntro builds the Agent-mode runtime framing: what the agent
@@ -289,7 +301,7 @@ existing file — it's cheaper, can't accidentally drop unrelated content,
 and validates the replacement landed. Reserve write_file for creating
 new files or full rewrites. This matters most for MEMORY.md / SOUL.md /
 USER.md, which grow over time and would lose context if rewritten in full.`,
-		p.dateLine, fastclawLine,
+		p.timeAnchor, fastclawLine,
 		runtime.GOOS, runtime.GOARCH, workdir, homeDesc)
 }
 
@@ -383,7 +395,7 @@ define WHO YOU ARE, not who's talking to you. Asking the chatter to
 "forget what I told you" affects USER.md / MEMORY.md, never the
 identity files.
 
-` + p.dateLine
+` + p.timeAnchor
 }
 
 // modBootstrapFiles loads identity and configuration files from the

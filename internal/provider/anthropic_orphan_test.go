@@ -91,13 +91,15 @@ func TestToAnthropicMessagesOrphanAssistantEmpty(t *testing.T) {
 	}
 
 	_, out := toAnthropicMessages(msgs)
-	// Should contain: user "go", assistant "bailing out". The
-	// orphan-only assistant and dangling tool reply both vanish.
-	if len(out) != 2 {
-		t.Fatalf("expected 2 messages after orphan strip, got %d: %+v", len(out), out)
+	// Should contain: user "go", user "Loop detected." (mid-conversation
+	// system messages ride as user-role turns on the Anthropic wire —
+	// the API merges consecutive user messages), assistant "bailing
+	// out". The orphan-only assistant and dangling tool reply vanish.
+	if len(out) != 3 {
+		t.Fatalf("expected 3 messages after orphan strip, got %d: %+v", len(out), out)
 	}
-	if out[0].Role != "user" || out[1].Role != "assistant" {
-		t.Errorf("unexpected role sequence: %s, %s", out[0].Role, out[1].Role)
+	if out[0].Role != "user" || out[2].Role != "assistant" {
+		t.Errorf("unexpected role sequence: %s, %s, %s", out[0].Role, out[1].Role, out[2].Role)
 	}
 }
 

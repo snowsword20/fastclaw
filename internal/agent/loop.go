@@ -64,14 +64,14 @@ type Agent struct {
 	// mode slash commands (/new /undo /retry /compact /model /personality).
 	// Keyed by channel name (e.g. "discord" → ["123...", "456..."]). Empty
 	// or absent → no gate, anyone can run the command (legacy default).
-	admins          map[string][]string
-	skillsCfg       config.SkillsConfig
-	globalSkillsCfg config.SkillsCfg
-	messageBus      *bus.MessageBus
-	subAgentSpawner tools.SubAgentSpawner
-	ftsStore        *store.FTSStore
-	piiScrubEnabled bool
-	memoryCfg       config.MemoryCfg
+	admins                  map[string][]string
+	skillsCfg               config.SkillsConfig
+	globalSkillsCfg         config.SkillsCfg
+	messageBus              *bus.MessageBus
+	subAgentSpawner         tools.SubAgentSpawner
+	ftsStore                *store.FTSStore
+	piiScrubEnabled         bool
+	memoryCfg               config.MemoryCfg
 	workspaceHistoryEnabled bool
 	history                 *workspace.History
 	// splitReplies is the per-agent multi-bubble toggle. Gates the
@@ -1359,6 +1359,49 @@ func renderClientParams(params map[string]any) string {
 		"```json\n" + string(blob) + "\n```"
 }
 
+// buildTurnTailContext renders the per-turn volatile context as ONE
+// system message appended AFTER the latest user message: group-chat
+// sender attribution, client parameters, the chatbot persistence
+// reminder, and the NOW time-anchor line.
+//
+// Why the tail, and why one message: everything here can change from
+// turn to turn, and provider prompt caching (Anthropic cache_control,
+// OpenAI-style implicit prefix caching) matches the LONGEST identical
+// prefix — the first differing byte poisons everything after it. These
+// blocks used to sit between the system prompt and the history, so any
+// change invalidated the entire conversation prefix every turn.
+// Appended as a single message at the end, the divergence point sits
+// after all the stable content, and the request keeps growing by
+// exactly +2 messages per turn (user message + tail), which is what
+// the Anthropic message breakpoints in provider/anthropic.go assume
+// for chained cache hits.
+func (a *Agent) buildTurnTailContext(msg bus.InboundMessage, chatterUID string, chatterMem *Memory) string {
+	var parts []string
+	if s := renderSender(msg); s != "" {
+		parts = append(parts, s)
+	}
+	if s := renderClientParams(msg.Params); s != "" {
+		parts = append(parts, s)
+	}
+	if s := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); s != "" {
+		parts = append(parts, s)
+	}
+	if s := a.ctxBuilder.BuildTimeAnchorAs(chatterUID); s != "" {
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// appendTurnTailContext appends the per-turn tail context message to a
+// wire message list (see buildTurnTailContext for why it belongs at
+// the end). No-op when there is nothing volatile to say.
+func (a *Agent) appendTurnTailContext(messages []provider.Message, msg bus.InboundMessage, chatterUID string, chatterMem *Memory) []provider.Message {
+	if tail := a.buildTurnTailContext(msg, chatterUID, chatterMem); tail != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: tail})
+	}
+	return messages
+}
+
 // stripSenderPrefix removes the leading "\[name\]: " (or unescaped
 // "[name]: ") attribution wrapper that the agent loop injects on
 // IM-routed user turns. Used by the web history rendering so the
@@ -1769,6 +1812,12 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 		messages = append(messages, provider.Message{Role: "system", Content: catalog})
 	}
 	messages = append(messages, withConversationGapContext(sess.GetMessages())...)
+	// Plan turns need the NOW line too — the planning model answers
+	// "what should we do" questions that can hinge on today's date.
+	// Tail-only, consistent with the main loop's cache-stable layout.
+	if ts := a.ctxBuilder.BuildTimeAnchorAs(chatterUID); ts != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: ts})
+	}
 	if a.piiScrubEnabled {
 		messages = privacy.ScrubMessages(messages)
 	}
@@ -2326,26 +2375,17 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		slog.Info("context compacted", "agent", a.name, "log_file", compactResult.LogFile)
 	}
 
-	messages := make([]provider.Message, 0, len(sessionMsgs)+4)
+	messages := make([]provider.Message, 0, len(sessionMsgs)+3)
 	messages = append(messages, provider.Message{Role: "system", Content: systemPrompt})
 	if hints := renderChannelHints(msg, a.splitReplies); hints != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: hints})
 	}
-	if senderMsg := renderSender(msg); senderMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: senderMsg})
-	}
-	if paramsMsg := renderClientParams(msg.Params); paramsMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: paramsMsg})
-	}
-	// Persistence reminder — chatbot-only, positioned just before the
-	// session history so recency weight outranks the model's training
-	// prior of "I have no cross-session memory". See
-	// renderChatbotPersistenceReminder for why this isn't enough to put
-	// in the main system prompt alone.
-	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: reminder})
-	}
+	// Volatile per-turn context (sender / client params / persistence
+	// reminder / NOW line) is appended AFTER the history in ONE tail
+	// message — see buildTurnTailContext. It used to be interleaved
+	// here as system messages, which broke prefix caching every turn.
 	messages = append(messages, withConversationGapContext(sessionMsgs)...)
+	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
@@ -3123,21 +3163,17 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		sessionMsgs = compactResult.Messages
 	}
 
-	messages := make([]provider.Message, 0, len(sessionMsgs)+4)
+	messages := make([]provider.Message, 0, len(sessionMsgs)+3)
 	messages = append(messages, provider.Message{Role: "system", Content: systemPrompt})
 	if hints := renderChannelHints(msg, a.splitReplies); hints != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: hints})
 	}
-	if senderMsg := renderSender(msg); senderMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: senderMsg})
-	}
-	if paramsMsg := renderClientParams(msg.Params); paramsMsg != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: paramsMsg})
-	}
-	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
-		messages = append(messages, provider.Message{Role: "system", Content: reminder})
-	}
+	// Volatile per-turn context rides in ONE tail message after the
+	// history (see buildTurnTailContext) instead of interleaved system
+	// messages, so the [system prompt + hints + history] prefix stays
+	// byte-stable for provider prompt caching.
 	messages = append(messages, withConversationGapContext(sessionMsgs)...)
+	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 

@@ -159,16 +159,13 @@ func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Mem
 
 	mode := cb.resolvedPromptMode()
 	loc, tzExplicit := cb.chatterLocation(chatterUID)
-	now := time.Now().In(loc)
 
 	p := &promptCtx{
 		cb:         cb,
 		chatterUID: chatterUID,
 		chatterMem: chatterMem,
 		mode:       mode,
-		now:        now,
-		loc:        loc,
-		dateLine:   buildDateLine(now, tzExplicit),
+		timeAnchor: timeAnchorInstructions(loc.String(), tzExplicit),
 	}
 
 	var parts []string
@@ -182,6 +179,20 @@ func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Mem
 		fmt.Fprintf(os.Stderr, "\n========== SYSTEM PROMPT [mode=%s] ==========\n%s\n========== END SYSTEM PROMPT ==========\n\n", mode, result)
 	}
 	return result
+}
+
+// BuildTimeAnchorAs renders the volatile per-turn NOW line (chatter's
+// local timezone) that rides in the tail context message right after
+// the latest user message. The system prompt only carries the stable
+// instructions (timeAnchorInstructions); this value is what makes the
+// "check NOW" rules actionable while keeping the system prompt
+// byte-stable for provider prefix caching.
+func (cb *ContextBuilder) BuildTimeAnchorAs(chatterUID string) string {
+	if chatterUID == "" {
+		chatterUID = cb.userID
+	}
+	loc, _ := cb.chatterLocation(chatterUID)
+	return buildTimeAnchorValue(time.Now().In(loc))
 }
 
 // BuildRuntimeContext returns the runtime context to inject before the user message.
