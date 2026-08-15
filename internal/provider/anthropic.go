@@ -574,6 +574,26 @@ type anthropicMessageDelta struct {
 	Usage anthropicUsage `json:"usage"`
 }
 
+// mergeDeltaUsage folds a message_delta usage block into out. Real Anthropic
+// reports only output_tokens in this event (input/cache totals live in
+// message_start), but Anthropic-compatible gateways such as Zhipu emit
+// placeholder zeros in message_start and publish the real input/cache totals
+// only in this final event — so any positive value from either event wins.
+func mergeDeltaUsage(out *Usage, u anthropicUsage) {
+	if u.OutputTokens > 0 {
+		out.OutputTokens = u.OutputTokens
+	}
+	if u.InputTokens > 0 {
+		out.InputTokens = u.InputTokens
+	}
+	if u.CacheReadInputTokens > 0 {
+		out.CacheReadTokens = u.CacheReadInputTokens
+	}
+	if u.CacheCreationInputTokens > 0 {
+		out.CacheCreationTokens = u.CacheCreationInputTokens
+	}
+}
+
 func (p *AnthropicProvider) Chat(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64) (*Response, error) {
 	httpReq, err := p.buildRequest(ctx, messages, tools, model, maxTokens, temperature, true)
 	if err != nil {
@@ -654,8 +674,8 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 				}
 			case "message_delta":
 				var md anthropicMessageDelta
-				if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
-					usage.OutputTokens = md.Usage.OutputTokens
+				if json.Unmarshal([]byte(data), &md) == nil {
+					mergeDeltaUsage(&usage, md.Usage)
 				}
 			case "content_block_start":
 				var cbs anthropicContentBlockStart
@@ -790,8 +810,8 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 			}
 		case "message_delta":
 			var md anthropicMessageDelta
-			if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
-				usage.OutputTokens = md.Usage.OutputTokens
+			if json.Unmarshal([]byte(data), &md) == nil {
+				mergeDeltaUsage(&usage, md.Usage)
 			}
 		case "content_block_start":
 			var cbs anthropicContentBlockStart
