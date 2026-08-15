@@ -780,7 +780,29 @@ func (r *Registry) Definitions() []provider.Tool {
 	for _, t := range r.tools {
 		defs = append(defs, t.def)
 	}
+	sortToolDefsByName(defs)
 	return defs
+}
+
+// sortToolDefsByName puts tool definitions in a deterministic order.
+// r.tools is a map, so iterating it yields a random rotation on every
+// call — and tools serialize ahead of the message history on the LLM
+// wire, so an unstable order invalidates the provider prefix cache on
+// every request (it also moves the last-tool cache_control breakpoint
+// used by the Anthropic request builder). Insertion sort matches the
+// ToolInfos idiom above: tool lists are tiny (<50).
+func sortToolDefsByName(defs []provider.Tool) {
+	for i := 1; i < len(defs); i++ {
+		j := i
+		for j > 0 {
+			a, b := defs[j-1], defs[j]
+			if a.Function.Name <= b.Function.Name {
+				break
+			}
+			defs[j-1], defs[j] = defs[j], defs[j-1]
+			j--
+		}
+	}
 }
 
 // ToolInfo is the lightweight projection of a registered tool used by
@@ -884,6 +906,7 @@ func (r *Registry) DefinitionsForMode(builtinAllow []string) []provider.Tool {
 			defs = append(defs, t.def)
 		}
 	}
+	sortToolDefsByName(defs)
 	return defs
 }
 
