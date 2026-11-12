@@ -30,6 +30,11 @@ const (
 	SourceHeartbeat   = "heartbeat"
 	SourceSubAgent    = "subagent"
 	SourceGoalContext = "goal_context"
+	// SourceConnector wakes a web conversation after the person connected
+	// an account the agent asked for (internal/connectors). Like
+	// goal_context, its text is runtime-authored and never shown as a
+	// user bubble.
+	SourceConnector = "connector"
 )
 
 // InboundMessage represents a message received from a channel.
@@ -83,11 +88,30 @@ type InboundMessage struct {
 	// agent-loop side to decide whether the turn should fire downstream
 	// reactions that are only valid for genuine user input.
 	Source string
+	// ChatReply marks an API turn whose caller shows the reply in a chat
+	// app (POST /v1/chat/completions with reply_format "chat"): the turn
+	// gets the same reply-format hint as an IM channel, and the reply
+	// keeps SplitMessageMarker between its messages for the caller to
+	// send as separate bubbles.
+	ChatReply bool
 	// SharedIdentity is set by the gateway when the channel has
 	// shared_identity enabled. The agent loop uses this to resolve
 	// sessions by owner identity instead of by channel triple, so
 	// conversations are shared across all channels.
 	SharedIdentity bool
+	// FromChannelOwner is set by the gateway when the sender's
+	// platform-side ID matches the account paired to the receiving IM
+	// channel (channels.bound_user_id) — i.e. this is the person who
+	// connected the bot, not just anyone who found it. The agent combines
+	// it with "the channel's binder owns this agent" to decide whether
+	// the turn may touch the host.
+	FromChannelOwner bool
+	// MachineUserID is set by the gateway on a 1:1 IM turn from the
+	// person the channel belongs to: the Fastclaw user whose own linked
+	// computers (agl machines) this turn's LLM agent may dispatch work to
+	// with run_local_agent. Empty everywhere else (groups, shared
+	// sessions, web, cron, other senders). See docs/agl-machines.md.
+	MachineUserID string
 }
 
 // SessionTriple returns the (channel, accountID, chatID) used for session

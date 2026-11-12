@@ -13,6 +13,7 @@ import (
 
 // GroupContext holds information about the group chat environment for system prompt injection.
 type GroupContext struct {
+	Instruction string   // authenticated topic transcript and turn instructions
 	BotUsername string   // this agent's bot username
 	Teammates   []string // other agent names in the group
 }
@@ -132,8 +133,12 @@ func (cb *ContextBuilder) resolvedPromptMode() string {
 // Reads everything under the agent owner's bucket — equivalent to the
 // owner chatting with their own agent. For public-link callers that
 // need per-chatter USER.md + memory isolation, use BuildSystemPromptAs.
+// Trusted is false: the only production caller is the sub-agent path, and
+// sub-agent spawns are deliberately untrusted (their task text was
+// authored in an earlier turn whose chatter can't be verified here — see
+// Agent.isTrustedTurn).
 func (cb *ContextBuilder) BuildSystemPrompt() string {
-	return cb.BuildSystemPromptAs(cb.userID, cb.memory)
+	return cb.BuildSystemPromptAs(cb.userID, cb.memory, false)
 }
 
 // BuildSystemPromptAs is BuildSystemPrompt with explicit chatter identity.
@@ -144,12 +149,45 @@ func (cb *ContextBuilder) BuildSystemPrompt() string {
 // owner's bucket because those define what the agent IS, not who is
 // talking to it. Pass cb.userID / cb.memory to mimic legacy behavior.
 //
+// trusted is the turn's operator verdict (Agent.isTrustedTurn): the
+// chatter owns this agent / is a listed channel admin, or it's a
+// heartbeat. It is passed per call rather than stored on the builder
+// because one ContextBuilder serves every chatter of a shared agent —
+// stashing it as state would leak one chatter's privileges into the next
+// turn. Modules use it to tell the model outright whether host shell and
+// platform-management work are available, instead of leaving it to infer
+// authorization from an empty USER.md and refuse.
+//
 // The prompt is assembled from ordered modules defined in prompt_modules.go.
 // Each prompt mode (Agent / Chatbot / Customize) declares its own module
 // list, and identity files (SOUL.md / IDENTITY.md) are placed early in
 // every mode so the model internalizes "who it is" before operational
 // instructions.
-func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Memory) string {
+func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Memory, trusted bool) string {
+	return cb.buildSystemPromptAs(chatterUID, chatterMem, trusted, cb.groupCtx)
+}
+
+// BuildSystemPromptAsWithGroup supplies group identity for one turn only.
+// Unlike SetGroupContext it cannot leak a web group's membership into a
+// simultaneous direct-message turn handled by the same Agent instance.
+func (cb *ContextBuilder) BuildSystemPromptAsWithGroup(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext) string {
+	return cb.buildSystemPromptAs(chatterUID, chatterMem, trusted, groupCtx)
+}
+
+// BuildTurnSystemPrompt is BuildSystemPromptAsWithGroup plus the turn's
+// host working directory (Registry.HostWorkDir — the session workspace).
+// Per call for the same reason as trusted/groupCtx: one builder serves
+// every chat of the agent concurrently. Empty workdir falls back to the
+// agent-level workspace.
+func (cb *ContextBuilder) BuildTurnSystemPrompt(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext, workdir string) string {
+	return cb.buildSystemPrompt(chatterUID, chatterMem, trusted, groupCtx, workdir)
+}
+
+func (cb *ContextBuilder) buildSystemPromptAs(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext) string {
+	return cb.buildSystemPrompt(chatterUID, chatterMem, trusted, groupCtx, "")
+}
+
+func (cb *ContextBuilder) buildSystemPrompt(chatterUID string, chatterMem *Memory, trusted bool, groupCtx *GroupContext, workdir string) string {
 	if chatterUID == "" {
 		chatterUID = cb.userID
 	}
@@ -159,13 +197,23 @@ func (cb *ContextBuilder) BuildSystemPromptAs(chatterUID string, chatterMem *Mem
 
 	mode := cb.resolvedPromptMode()
 	loc, tzExplicit := cb.chatterLocation(chatterUID)
+	now := time.Now().In(loc)
 
 	p := &promptCtx{
 		cb:         cb,
+		groupCtx:   groupCtx,
 		chatterUID: chatterUID,
 		chatterMem: chatterMem,
 		mode:       mode,
+		now:        now,
+		loc:        loc,
+		// Stable time-anchor rules only — no timestamp here, so the
+		// system prompt stays byte-stable for provider prefix caching.
+		// The volatile NOW value rides per-turn in the tail context
+		// message (see BuildTimeAnchorAs / buildTimeAnchorValue).
 		timeAnchor: timeAnchorInstructions(loc.String(), tzExplicit),
+		trusted:    trusted,
+		workdir:    workdir,
 	}
 
 	var parts []string

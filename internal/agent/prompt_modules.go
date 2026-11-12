@@ -2,6 +2,8 @@ package agent
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -32,10 +34,29 @@ type promptModuleFunc func(p *promptCtx) string
 // promptCtx carries shared state for a single BuildSystemPromptAs call.
 type promptCtx struct {
 	cb         *ContextBuilder
+	groupCtx   *GroupContext
 	chatterUID string
 	chatterMem *Memory
 	mode       string
-	timeAnchor string // stable NOW-line instructions, shared across modules
+	// timeAnchor renders the STABLE half of the time anchor (rules only,
+	// no timestamp) so the system prompt stays byte-stable across turns
+	// for provider prefix caching. The volatile NOW value rides per-turn
+	// in the tail context message (buildTimeAnchorValue).
+	timeAnchor string
+	now        time.Time
+	loc        *time.Location
+	// trusted mirrors Agent.isTrustedTurn for this turn: the chatter is
+	// the agent owner or a channel admin (or it's a heartbeat). The tool
+	// layer already enforces it via Registry.SetCallerIsAdmin; carrying
+	// it into the prompt is what stops the model from *self*-refusing
+	// operator work it is in fact authorized to do. Without this the
+	// model falls back to guessing from USER.md, and an empty USER.md
+	// reads as "unknown chatter" → it declines platform-management
+	// requests from the operator themselves.
+	trusted bool
+	// workdir is this turn's host working directory (the session
+	// workspace); "" means use the builder's agent-level workspace.
+	workdir string
 }
 
 // moduleEntry pairs a human-readable key with its builder function.
@@ -234,7 +255,10 @@ func modAgentIntro(p *promptCtx) string {
 		workdir = "/workspace"
 		homeDesc = "/workspace (identity files like SOUL.md / IDENTITY.md are managed by the runtime, not the sandbox FS — call write_file with a bare filename, never path it)"
 	} else {
-		workdir = p.cb.workspace
+		workdir = p.workdir
+		if workdir == "" {
+			workdir = p.cb.workspace
+		}
 		if workdir == "" {
 			workdir = p.cb.home
 		}
@@ -245,14 +269,12 @@ func modAgentIntro(p *promptCtx) string {
 	if buildinfo.IsHostedDeploy() {
 		fastclawLine = "FastClaw: hosted deployment. The chatter does NOT operate this runtime — if they ask about the version, upgrades, or installing/changing skills at the platform level, tell them those are administrator-controlled and offer to help with what's actually in your reach (config, skills you can author, files in the workspace)."
 	} else {
-		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install — the chatter is the operator.\n"+
+		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install.\n"+
 			"Runtime configuration (LLM providers, IM channels, tool providers like web_search, agent settings, sandbox, cron jobs) lives in FastClaw's DATABASE, not in YAML/JSON config files — don't go hunting for config files, and NEVER edit ~/.fastclaw/fastclaw.db directly. "+
-			"The management interface is the `fastclaw` CLI: `fastclaw provider` (LLM credentials), `fastclaw tools provider-set` / `category-set` (web_search & friends), `fastclaw channels`, `fastclaw agents config`, `fastclaw admin`, `fastclaw cron`, `fastclaw skill` — run any subcommand with --help to see flags. "+
-			"CLI writes persist to the database and hot-reload the running gateway, so no restart is needed. "+
-			"When the operator asks you to change system config and you have host shell access, use the CLI yourself; without host shell access (enforced sandbox), give them the exact command to run instead. "+
-			"Upgrades work the same way: `fastclaw upgrade` in a terminal (`fastclaw version` to verify), only run it yourself when explicitly asked and host shell access is available. "+
-			"Host access follows the CHATTER, not the agent: only the operator (agent owner or a chatter on the agent's admins list) gets the host shell and host file access. For any other chatter your exec calls run in the sandbox (or are refused when none is configured) and file tools are confined to the workspace — if a guest asks for host-side or platform-management work (creating agents, changing config), explain it's operator-only instead of retrying.",
-			buildinfo.Version, buildinfo.Commit, buildinfo.Date)
+			"The management interface is the `fastclaw` CLI: `fastclaw provider` (LLM credentials), `fastclaw tools provider-set` / `category-set` (web_search & friends), `fastclaw channels`, `fastclaw agents` (init / ls / config / rm), `fastclaw skill` (list / search / install), `fastclaw admin`, `fastclaw cron` — run any subcommand with --help to see flags. "+
+			"CLI writes persist to the database and hot-reload the running gateway, so no restart is needed.\n%s",
+			buildinfo.Version, buildinfo.Commit, buildinfo.Date,
+			operatorAccessLine(p.trusted, p.cb.sandboxEnabled))
 	}
 
 	return fmt.Sprintf(`You run on the FastClaw runtime. Your identity (name, role, personality)
@@ -303,6 +325,117 @@ new files or full rewrites. This matters most for MEMORY.md / SOUL.md /
 USER.md, which grow over time and would lose context if rewritten in full.`,
 		p.timeAnchor, fastclawLine,
 		runtime.GOOS, runtime.GOARCH, workdir, homeDesc)
+}
+
+// operatorAccessLine states, in the system prompt, whether THIS turn's
+// chatter is the operator. The runtime already decided (isTrustedTurn →
+// Registry.SetCallerIsAdmin); the model used to be left guessing from
+// USER.md, and an empty USER.md made it refuse operator work — including
+// "create an agent for me" — that it was fully authorized to perform.
+// So: say it outright, and separate authorization from identity.
+//
+// The operator branch carries the agent-provisioning recipe because that
+// is the one multi-step CLI flow the model reliably failed to assemble on
+// its own: `agents config` was the only agents verb it had ever been
+// shown, so `agents init` never came to mind.
+//
+// sandboxEnforced splits the operator branch again: being the operator
+// grants the AUTHORITY to manage the platform, but on an enforced-sandbox
+// build nobody gets a host shell, so the agent has to hand the commands
+// over instead of running them. Claiming host access there would send the
+// model into a loop of exec calls that land in the container.
+// fastclawBinary returns the command the agent should invoke for CLI work:
+// the absolute path of the binary running this gateway, falling back to
+// the bare name.
+//
+// Two failure modes it removes, both of which land as a confusing "unknown
+// flag" or "command not found" mid-provisioning:
+//   - the daemon's PATH doesn't include the install dir (launchd, systemd,
+//     and docker entrypoints routinely have a narrower PATH than the shell
+//     the operator installed from);
+//   - PATH resolves to a DIFFERENT, older fastclaw than the one serving
+//     this turn — `skill install --agent` would then not exist.
+//
+// Falls back to "fastclaw" when the executable doesn't look like the CLI
+// (notably under `go test`, which keeps the prompt assertions stable).
+func fastclawBinary() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "fastclaw"
+	}
+	base := filepath.Base(exe)
+	if base != "fastclaw" && base != "fastclaw.exe" {
+		return "fastclaw"
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return exe
+}
+
+func operatorAccessLine(trusted, sandboxEnforced bool) string {
+	if !trusted {
+		return "Host access follows the CHATTER, not the agent, and the current chatter is NOT this agent's operator. " +
+			"Your exec calls run in the sandbox (or are refused when none is configured) and file tools are confined to the workspace. " +
+			"Platform-management work — creating agents, installing skills, changing runtime config, upgrades — is operator-only: " +
+			"say so plainly once and offer what you CAN do instead. Do not retry the command, and do not hand them a `fastclaw` " +
+			"command to run as a workaround for work they aren't authorized to have done."
+	}
+
+	// Every command below is pinned to the running gateway's own binary,
+	// not the bare name — see fastclawBinary.
+	fc := fastclawBinary()
+
+	access := `The current chatter IS this agent's operator (owner or listed admin). The runtime verified
+this from their account — NOT from USER.md — and has already granted this turn host shell
+access via exec plus host file access. Act on it: when they ask for platform-level work,
+run the FastClaw CLI yourself with exec and report the result. Do not tell them it's
+operator-only, do not ask them to run the command in their own terminal, and do not stop to
+ask whether they're the operator — that question is already answered.
+Invoke it as ` + "`" + fc + "`" + ` — that exact path is the binary serving this
+conversation, so it always has the flags described below; a bare ` + "`fastclaw`" + ` on PATH may
+be an older install.
+Same for upgrades: ` + "`" + fc + ` upgrade` + "`" + `, then ` + "`" + fc + ` version` + "`" + ` to verify — but
+only when they explicitly ask for one.`
+	if sandboxEnforced {
+		access = `The current chatter IS this agent's operator (owner or listed admin). The runtime verified
+this from their account — NOT from USER.md — so platform-management requests from them are
+legitimate; never answer one with "that's operator-only". But this build enforces the
+sandbox: your exec calls run in the container, NOT on the host, so you cannot run the
+` + "`fastclaw`" + ` CLI for them. Give them the exact commands to paste into their own terminal
+(including ` + "`fastclaw upgrade`" + ` for upgrades) and explain what each one does.`
+	}
+
+	// Under an enforced sandbox the operator pastes these into their own
+	// shell, where the gateway's absolute path is meaningless (it may not
+	// even be the same filesystem) — quote the bare name there.
+	cmd := fc
+	if sandboxEnforced {
+		cmd = "fastclaw"
+	}
+
+	return access + `
+
+This tells you what they're AUTHORIZED to do, not WHO they are. USER.md still governs
+identity: if it's empty you genuinely don't know their name and should ask or stay neutral.
+Never let an empty USER.md turn into a refusal of operator work.
+
+Provisioning a new agent is a normal operator request — complete the whole chain, don't
+stop after step 1:
+  1. ` + "`" + cmd + ` agents init "<name>" --description "<what it does>"` + "`" + ` — prints the new agt_ id.
+  2. ` + "`" + cmd + ` skill install --agent <agt_id> --repo <owner/repo>` + "`" + ` for a GitHub skill,
+     or ` + "`" + cmd + ` skill install <slug> --agent <agt_id>` + "`" + ` for one on skills.sh / ClawHub.
+     Without --agent the skill installs globally for every agent — pass it. Installing into
+     an agent OTHER than yourself is normal and expected: that's how you equip one you just
+     created. Never install a skill into yourself as a substitute for that.
+  3. ` + "`" + cmd + ` agents config <agt_id> set model <provider>/<model>` + "`" + ` — a fresh agent has
+     no model and cannot reply until one is set. Reuse the model you are running on unless
+     the operator names a different one.
+  4. Verify with ` + "`" + cmd + ` skill list --agent <agt_id>` + "`" + `, then tell the operator the
+     agent's name and id and that it's ready to chat with in the dashboard.
+Give the new agent an IDENTITY.md / SOUL.md too when the operator described a persona:
+write the text to a local file, then ` + "`" + cmd + ` agents files put <agt_id> IDENTITY.md <path>` + "`" + `.
+The CLI hot-reloads the gateway itself, so don't restart anything.`
 }
 
 // modChatbotIntro builds the Chatbot-mode identity scaffolding: slim
@@ -498,9 +631,9 @@ spirit of the refusal politely, do not pass the bracketed message through.`
 func modSandbox(p *promptCtx) string {
 	if !p.cb.sandboxEnabled {
 		if p.cb.sandboxOptional {
-			return modSandboxOptional(p)
+			return modSandboxOptional(p) + "\n\n" + hostMediaNote
 		}
-		return ""
+		return hostMediaNote
 	}
 	prompt := `# Code Execution Environment
 You have access to a sandbox environment for executing code. Key rules:
@@ -544,6 +677,11 @@ When the user asks you to create a file (document, script, data, etc.):
   whatever channel the user is on (Telegram, web UI, etc.). Examples:
     ![generated logo](/workspace/logo.png)
     [download report.pdf](/workspace/report.pdf)
+- NEVER upload the user's files or your outputs to third-party services
+  (image hosts, paste sites, file-sharing or "temporary link" services) to
+  produce a link — they can contain private data, and the runtime already
+  delivers /workspace files on every channel, including the API. Only do it
+  when the user explicitly asks for that specific service.
 - Reference only the final deliverable files in your final reply. Do not
   reference drafts, conversion intermediates, temporary previews, or other
   process files; IM channels treat referenced workspace paths as files to send
@@ -598,6 +736,17 @@ Then in your final reply, write: ![](/workspace/output.png)`
 	return prompt
 }
 
+// hostMediaNote tells host-mode agents how to show a file they produced.
+// The web chat resolves paths relative to the Working Directory (and
+// absolute paths under it) to the file API; anything else is blocked.
+const hostMediaNote = `# Showing files in chat
+To show an image you produced, embed it with image syntax and its path
+relative to the Working Directory, e.g. ![chart](chart.png) — the picture
+appears inline in the chat. Link other files the same way, e.g.
+[report](reports/q3.md). Copy files that were
+written elsewhere (another tool's cache, /tmp, Downloads) into the Working
+Directory first — paths outside it cannot be displayed.`
+
 // modSandboxOptional briefs the model for self-hosted installs where a
 // sandbox pool is attached but the HOST remains the default execution
 // environment. Key job: stop the model from assuming the sandbox rules
@@ -609,13 +758,22 @@ func modSandboxOptional(p *promptCtx) string {
 	} else if p.cb.sandboxBackend == "boxlite" {
 		backend = "Boxlite container"
 	}
+	hostAccess := `Host access is operator-only, and the current chatter is NOT the
+operator: every exec call runs in the sandbox automatically (or is
+refused when the sandbox can't start) and file tools are confined to the
+workspace. Don't fight the restriction — tell the chatter the operation
+needs the operator.`
+	if p.trusted {
+		hostAccess = `Host access is operator-only and the current chatter IS the operator,
+so it is live for this turn: exec runs on the host and file tools reach
+host paths. Run what they ask for instead of describing it.`
+	}
 	return `# Execution Environment (host by default, sandbox on request)
 You run on the operator's HOST machine: exec and the file tools act
 directly on the host, in the Working Directory above. Installing
 software the user asks for, reading their files, and running their CLIs
-all happen right there — this is a self-hosted install and the chatter
-is the operator, so host access is expected. Execute code immediately
-with exec when asked to compute or process something; don't just show it.
+all happen right there. Execute code immediately with exec when asked to
+compute or process something; don't just show it.
 
 An isolated sandbox (` + backend + `) is ALSO available as an opt-in
 tool: pass sandbox:true on an exec call to run that ONE command inside
@@ -630,15 +788,10 @@ reach the user — but never reference host absolute paths inside a
 sandbox:true command, and never reference /workspace or /skills paths
 in a plain host exec.
 
-Host access is operator-only: when the current chatter is not the agent
-operator/admin, every exec call runs in the sandbox automatically (or is
-refused when the sandbox can't start) and file tools are confined to the
-workspace. Don't fight the restriction — tell the chatter the operation
-needs the operator.`
+` + hostAccess
 }
 
-// modTaskDelegation emits the task-delegation and progress-tracking
-// (todo.md) instructions. Agent mode only.
+// modTaskDelegation emits the task-delegation instructions. Agent mode only.
 func modTaskDelegation(p *promptCtx) string {
 	return taskDelegationContent
 }
@@ -653,15 +806,19 @@ func modSkills(p *promptCtx) string {
 
 // modGroupChat emits group-chat awareness when the agent is in a group.
 func modGroupChat(p *promptCtx) string {
-	gc := p.cb.groupCtx
+	gc := p.groupCtx
 	if gc == nil {
 		return ""
+	}
+	if gc.Instruction != "" {
+		return "# Group Chat\n" + gc.Instruction
 	}
 	return fmt.Sprintf(`# Group Chat
 You are in a group chat. Your bot username is @%s.
 Other agents in this group: %s.
-Only respond when directly mentioned with @%s, or when the conversation clearly needs your expertise.
+Only respond when directly mentioned with @%s, when the user says @all / everyone, or when the conversation clearly needs your expertise.
 Messages from other bots will appear as "[BotName]: message" in the conversation history.
+When explicitly scheduled, use their latest contributions to continue the task; do not restart work they already finished. To hand work to another member, write @TheirName followed by a concrete request in normal prose. Mention members only when you want them to act. Members may be scheduled again to review or consolidate new results. Avoid circular handoffs and repeated work.
 
 When you DO respond: your full skill catalog and tool registry above are still in scope — group coordination governs *when* to speak, not *what* you can do. If the user asks you to invoke a skill by name (e.g. "调用 X" / "use X to …"), check the <skill_catalog> first; "no such tool" is almost always a misread of a skill that's actually listed.`,
 		gc.BotUsername,
@@ -689,7 +846,7 @@ func modWorkspaceUpdate(p *promptCtx) string {
 }
 
 // modChatbotTools emits lightweight tool-use guidance for chatbot mode.
-// Covers web_search/web_fetch and skills — no delegation or todo.md.
+// Covers web_search/web_fetch and skills — no delegation.
 func modChatbotTools(p *promptCtx) string {
 	return `# Tool Use
 
@@ -837,52 +994,7 @@ turned on Plan mode (your first response is plan-only, no tools), make
 each sub-agent invocation an explicit step. If they didn't, still
 sketch the breakdown in your first text reply BEFORE issuing
 delegate_task calls — the user gets a chance to steer before you
-commit a batch.
-
-# Progress tracking via todo.md
-
-For any multi-step turn (anything with 3+ distinct phases — research,
-delegation, synthesis, etc.), you maintain a checklist file ` + "`todo.md`" + ` in
-your session workspace so the user can see how far along you are. The
-chat UI watches this file and renders a live progress panel above the
-conversation; without it the user has no visual signal between the
-plan and the final deliverable.
-
-**Convention (strict — the UI parses this literally):**
-
-- ` + "`- [ ] step text`" + ` → pending
-- ` + "`- [x] step text`" + ` → completed
-- One item per plan step. Same wording as your plan if possible so the
-  user can map them visually.
-- No nested checkboxes (no indented ` + "`- [ ]`" + `). One flat list.
-- File path is bare ` + "`todo.md`" + ` — the runtime routes that to your session's
-  workspace. Don't path it.
-
-**Lifecycle:**
-
-1. **First action of any multi-step execution turn**: ` + "`write_file('todo.md', ...)`" + `
-   with the full plan as ` + "`- [ ]`" + ` items. Do this before any other tool call
-   (web_fetch, web_search, delegate_task, exec, …). If a plan was already
-   negotiated in plan mode, transcribe its steps verbatim.
-2. **After each step finishes**: ` + "`edit_file('todo.md', ...)`" + ` to flip that
-   one item's ` + "`[ ]`" + ` to ` + "`[x]`" + `. Use edit_file (not write_file) so you can
-   target a single line — the cost is much lower and you can't
-   accidentally lose items.
-
-   **Never call ` + "`write_file('todo.md', ...)`" + ` more than once per turn.** A
-   second write_file overwrites the file with whatever you pass; if you
-   pass a partial list (e.g. only the newly-checked items) the prior
-   items get clobbered, and if you pass a fresh full list it ends up
-   stacked on top of leftover entries via subsequent edit_file calls —
-   either way the UI shows the same step text twice. Every update after
-   the initial plan write goes through edit_file.
-3. **Final assistant reply**: make sure every item is ` + "`[x]`" + `, including the
-   synthesis step. If something genuinely couldn't be done, leave it
-   ` + "`[ ]`" + ` and explain in your final message — don't fake completion.
-
-**When to skip**: one-shot turns (one tool call, then answer) and pure
-conversational replies. todo.md is for plans the user wants to track,
-not chat overhead.`
+commit a batch.`
 
 var toolDisciplineContent = `# Tool Use
 Five failure modes that cost rounds:

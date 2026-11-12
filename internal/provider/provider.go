@@ -26,12 +26,15 @@ import (
 // mutating DefaultTransport would affect every other consumer in the
 // process (it's a documented global shared resource).
 //
-// 60s is conservative for LLM APIs: response headers come back well
-// under 1s on a healthy path; 60s catches a hung connection without
-// false-positives on a slow but live network.
+// 180s: headers usually arrive within a second, but not always — a
+// gateway/proxy (one-api, local relays) or a non-streaming upstream may
+// hold the headers until the model starts producing, and prefill on a
+// large context can take over a minute. 60s cut those healthy-but-slow
+// requests off. A genuinely hung connection is still caught, and the
+// agent's llmRetry retries the timeout instead of ending the turn.
 func newLLMHTTPClient() *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = 60 * time.Second
+	tr.ResponseHeaderTimeout = 180 * time.Second
 	return &http.Client{Transport: tr}
 }
 
@@ -43,6 +46,7 @@ func newLLMHTTPClient() *http.Client {
 const (
 	OriginUser        = "" // default — pre-existing producers stay correct without edits
 	OriginGoalContext = "goal_context"
+	OriginConnector   = "connector"
 )
 
 // Message represents a chat message.
@@ -188,6 +192,10 @@ type Response struct {
 	Thinking     string          // model's reasoning/thinking content (extracted for memory)
 	Usage        Usage           // token counts for metering (zero when provider didn't report)
 	RawAssistant json.RawMessage // exact API response message JSON (for cache-safe replay)
+	// Truncated is set when the model stopped at the output token limit
+	// (OpenAI finish_reason "length", Anthropic stop_reason "max_tokens"):
+	// the text and any tool call's arguments may be cut off.
+	Truncated bool
 }
 
 // HasToolCalls returns true if the response contains tool calls.
@@ -217,6 +225,9 @@ type StreamChunk struct {
 	// thinking mode) sees the correct top-level `reasoning_content` on
 	// replay, which it does not auto-generate.
 	RawAssistant json.RawMessage
+	// Truncated is set on the final (Done) chunk when the model stopped
+	// at the output token limit; see Response.Truncated.
+	Truncated bool
 }
 
 // StreamReader reads streaming chunks from an LLM response.
@@ -244,6 +255,22 @@ func (r *StreamReader) Err() error {
 // SetErr sets the error on the stream reader.
 func (r *StreamReader) SetErr(err error) {
 	r.err = err
+}
+
+// App identity sent with every upstream LLM call so model platforms can
+// attribute traffic to FastClaw.
+const (
+	AppName = "FastClaw"
+	AppURL  = "https://fastclaw.ai"
+)
+
+// SetAppIdentityHeaders tags an outbound LLM request with the FastClaw app
+// identity. X-Title/HTTP-Referer are OpenRouter's app-attribution headers;
+// platforms that copied its leaderboard convention read the same pair.
+// Unknown headers are ignored upstream, so this is safe to send everywhere.
+func SetAppIdentityHeaders(h http.Header) {
+	h.Set("X-Title", AppName)
+	h.Set("HTTP-Referer", AppURL)
 }
 
 // Provider is the LLM provider interface.

@@ -185,7 +185,11 @@ type PrefsCfg struct {
 // per-backend field is empty (migration path for configs predating the
 // split).
 type SandboxCfg struct {
-	Enabled         bool   `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// Enforce makes the sandbox a hard boundary on self-hosted installs:
+	// every exec runs inside it, instead of the host being the default
+	// and the sandbox an opt-in per call. Hosted deploys always enforce.
+	Enforce         bool   `json:"enforce,omitempty"`
 	Image           string `json:"image,omitempty"`
 	DockerImage     string `json:"dockerImage,omitempty"`
 	E2BTemplate     string `json:"e2bTemplate,omitempty"`
@@ -198,15 +202,14 @@ type SandboxCfg struct {
 	// BoxliteURL is the full base URL (default https://api.boxlite.ai/v1);
 	// BoxliteKey is the apikey sent as `Authorization: Bearer <key>`
 	// directly (no OAuth exchange — that path was removed upstream).
-	// ClientID is retained for back-compat with older config rows but
-	// no longer wired to anything. Prefix defaults to "default" when
-	// empty so the minimum config is just (URL, Key).
-	BoxliteURL      string `json:"boxliteUrl,omitempty"`
-	BoxliteClientID string `json:"boxliteClientId,omitempty"`
-	BoxliteKey      string `json:"boxliteKey,omitempty"`
-	BoxlitePrefix   string `json:"boxlitePrefix,omitempty"`
-	Network         string `json:"network,omitempty"`
-	IdleTTLSec      int    `json:"idleTTLSec,omitempty"`
+	// URL defaults to BoxLite Cloud (https://api.boxlite.ai/v1), which
+	// takes no Prefix; set Prefix only for self-hosted servers that route
+	// under /{prefix}/boxes. The minimum config is just Key.
+	BoxliteURL    string `json:"boxliteUrl,omitempty"`
+	BoxliteKey    string `json:"boxliteKey,omitempty"`
+	BoxlitePrefix string `json:"boxlitePrefix,omitempty"`
+	Network       string `json:"network,omitempty"`
+	IdleTTLSec    int    `json:"idleTTLSec,omitempty"`
 }
 
 // GatewayAuth is now a thin shell — the authoritative auth state lives in
@@ -288,29 +291,29 @@ type SkillsLearnerCfg struct {
 // channels, agents). Callers never serialize it back out — DB tables are
 // the persistent source of truth.
 type Config struct {
-	Providers     map[string]ProviderConfig  `json:"providers"`
-	Agents        AgentsConfig               `json:"agents"`
-	Channels      map[string]ChannelConfig   `json:"channels"`
-	Bindings      []Binding                  `json:"bindings,omitempty"`
-	Teams         map[string]TeamEntry       `json:"teams,omitempty"`
-	MCPServers    map[string]MCPServerConfig `json:"mcpServers,omitempty"`
-	CronJobs      []CronJob                  `json:"cronJobs,omitempty"`
-	Heartbeat     HeartbeatCfg               `json:"heartbeat,omitempty"`
-	Storage       StorageCfg                 `json:"storage,omitempty"`
-	Sandbox       SandboxCfg                 `json:"sandbox,omitempty"`
-	ToolProviders map[string]ToolProviderCfg `json:"toolProviders,omitempty"`
-	Tools         map[string]ToolCategoryCfg `json:"tools,omitempty"`
-	ObjectStore   ObjectStoreCfg             `json:"objectStore,omitempty"`
-	Hooks         HooksCfg                   `json:"hooks,omitempty"`
-	Plugins       PluginsCfg                 `json:"plugins,omitempty"`
-	Gateway       GatewayCfg                 `json:"gateway,omitempty"`
-	TaskQueue     TaskQueueCfg               `json:"taskQueue,omitempty"`
-	Skills        SkillsCfg                  `json:"skills,omitempty"`
-	Memory        MemoryCfg                  `json:"memory,omitempty"`
-	WorkspaceHistory WorkspaceHistoryCfg    `json:"workspaceHistory,omitempty"`
-	Privacy       PrivacyCfg                 `json:"privacy,omitempty"`
-	SkillsLearner SkillsLearnerCfg           `json:"skillsLearner,omitempty"`
-	Prefs         PrefsCfg                   `json:"prefs,omitempty"`
+	Providers        map[string]ProviderConfig  `json:"providers"`
+	Agents           AgentsConfig               `json:"agents"`
+	Channels         map[string]ChannelConfig   `json:"channels"`
+	Bindings         []Binding                  `json:"bindings,omitempty"`
+	Teams            map[string]TeamEntry       `json:"teams,omitempty"`
+	MCPServers       map[string]MCPServerConfig `json:"mcpServers,omitempty"`
+	CronJobs         []CronJob                  `json:"cronJobs,omitempty"`
+	Heartbeat        HeartbeatCfg               `json:"heartbeat,omitempty"`
+	Storage          StorageCfg                 `json:"storage,omitempty"`
+	Sandbox          SandboxCfg                 `json:"sandbox,omitempty"`
+	ToolProviders    map[string]ToolProviderCfg `json:"toolProviders,omitempty"`
+	Tools            map[string]ToolCategoryCfg `json:"tools,omitempty"`
+	ObjectStore      ObjectStoreCfg             `json:"objectStore,omitempty"`
+	Hooks            HooksCfg                   `json:"hooks,omitempty"`
+	Plugins          PluginsCfg                 `json:"plugins,omitempty"`
+	Gateway          GatewayCfg                 `json:"gateway,omitempty"`
+	TaskQueue        TaskQueueCfg               `json:"taskQueue,omitempty"`
+	Skills           SkillsCfg                  `json:"skills,omitempty"`
+	Memory           MemoryCfg                  `json:"memory,omitempty"`
+	WorkspaceHistory WorkspaceHistoryCfg        `json:"workspaceHistory,omitempty"`
+	Privacy          PrivacyCfg                 `json:"privacy,omitempty"`
+	SkillsLearner    SkillsLearnerCfg           `json:"skillsLearner,omitempty"`
+	Prefs            PrefsCfg                   `json:"prefs,omitempty"`
 }
 
 // ModelCost holds pricing info for a model.
@@ -664,9 +667,17 @@ type ResolvedAgent struct {
 }
 
 type TeamEntry struct {
+	Description   string   `json:"description,omitempty"`
+	HumanName     string   `json:"humanName,omitempty"`
+	Name          string   `json:"name,omitempty"`
 	Agents        []string `json:"agents"`
 	DefaultAgent  string   `json:"defaultAgent,omitempty"`
+	SessionID     string   `json:"sessionId,omitempty"`
 	GroupBehavior string   `json:"groupBehavior,omitempty"`
+	CreatedAt     int64    `json:"createdAt,omitempty"`
+	// AvatarURL is the group's own picture: a small image data URL the web
+	// client downsizes before saving. Empty shows the members' avatars.
+	AvatarURL string `json:"avatarUrl,omitempty"`
 }
 
 type TeamConfig struct {
@@ -736,9 +747,10 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.Agents.Defaults.Temperature == 0 {
 		cfg.Agents.Defaults.Temperature = 0.7
 	}
-	if cfg.Agents.Defaults.MaxToolIterations == 0 {
-		cfg.Agents.Defaults.MaxToolIterations = 20
-	}
+	// MaxToolIterations deliberately has no default: 0 means no fixed
+	// per-turn tool budget (see agent.toolIterationLimit). Failure
+	// guards and the turn deadline stop stuck turns; a fixed 20 cut
+	// off healthy long tasks mid-way.
 }
 
 // MergedAgentConfig merges defaults with an agent entry to produce a fully
@@ -764,7 +776,7 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 		Thinking:             cfg.Agents.Defaults.Thinking,
 		Sandbox:              cfg.Sandbox,
 		PolicyPreset:         cfg.Agents.Defaults.PolicyPreset,
-		WorkspaceHistory:       cfg.Agents.Defaults.WorkspaceHistory,
+		WorkspaceHistory:     cfg.Agents.Defaults.WorkspaceHistory,
 	}
 
 	if entry.MaxTokens > 0 {
@@ -897,7 +909,7 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 	// user wait too long.
 	if resolved.PromptMode == PromptModeChatbot && entry.MaxToolIterations == 0 {
 		const chatbotDefaultIter = 5
-		if resolved.MaxToolIterations > chatbotDefaultIter {
+		if resolved.MaxToolIterations == 0 || resolved.MaxToolIterations > chatbotDefaultIter {
 			resolved.MaxToolIterations = chatbotDefaultIter
 		}
 	}

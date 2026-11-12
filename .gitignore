@@ -73,3 +73,7 @@ web/pnpm-lock.yaml
 fastclaw-patched
 
 .zcode/
+
+# Python bytecode from skill scripts
+__pycache__/
+*.pyc

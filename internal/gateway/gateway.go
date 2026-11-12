@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,10 +27,12 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
 	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
+	"github.com/fastclaw-ai/fastclaw/internal/agl"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/cron"
+	"github.com/fastclaw-ai/fastclaw/internal/drain"
 	"github.com/fastclaw-ai/fastclaw/internal/plugin"
 	"github.com/fastclaw-ai/fastclaw/internal/rediscoord"
 	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
@@ -238,8 +241,17 @@ type Gateway struct {
 	// SSE hub a user-typed POST /api/chat turn uses. Nil-safe: unset
 	// keeps the legacy bus.Outbound → WebChannel async-bubble path.
 	chatEvents *agent.EventHub
-	mu         sync.RWMutex
-	dedup      sync.Map
+	// aglBridge runs IM turns of runtime "agl" agents on the owner's
+	// linked computer instead of the LLM (agl.go). Nil = off.
+	aglBridge *agl.Bridge
+	// aglTools runs local_agents / run_local_agent for LLM agents and
+	// holds their chats' open permission requests.
+	aglTools *agl.Tools
+	mu       sync.RWMutex
+	dedup    sync.Map
+	// pairFails counts wrong /pair attempts per channel row id (see
+	// pairing.go); the outstanding code is burned once it hits the cap.
+	pairFails sync.Map
 }
 
 // SetProjectRuntime wires the coding-agent runtime manager. Call once at
@@ -486,10 +498,28 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		}
 		ag := space.Agents.AgentByID(task.AgentID)
 		if ag == nil {
+			// Routing already authorized this agent for the space, but
+			// it may have been evicted (on-demand) or the space reloaded
+			// since. Re-attach rather than dropping the message.
+			if err := space.EnsureAgent(ctx, g.store, g.bus, g.workspace, task.AgentID); err == nil {
+				ag = space.Agents.AgentByID(task.AgentID)
+			}
+		}
+		if ag == nil {
 			return "", fmt.Errorf("agent %q not found", task.AgentID)
 		}
-		if len(task.Message.MediaItems) > 0 {
-			atts := make([]agent.Attachment, 0, len(task.Message.MediaItems))
+		// Photos go to the model as vision input (PhotoURL/PhotoURLs) but are
+		// also written to the workspace, like web-chat uploads, so skills
+		// that process the image get a real file path.
+		photos := task.Message.PhotoURLs
+		if task.Message.PhotoURL != "" {
+			photos = append([]string{task.Message.PhotoURL}, photos...)
+		}
+		if len(task.Message.MediaItems) > 0 || len(photos) > 0 {
+			atts := make([]agent.Attachment, 0, len(task.Message.MediaItems)+len(photos))
+			for _, u := range photos {
+				atts = append(atts, agent.Attachment{URL: u}) // unique image_<token>_<i> name
+			}
 			for _, item := range task.Message.MediaItems {
 				mimeType := item.ContentType
 				if mimeType == "" {
@@ -510,6 +540,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 			}
 		}
 		chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
+		stopMsgTyping := chanMgr.StartMessageTyping(task.Message.Channel, task.AccountID, task.Message.ChatID, task.Message.MessageID)
 		typingDone := make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(5 * time.Second)
@@ -553,6 +584,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 
 		reply := ag.HandleMessage(ctx, task.Message)
 		close(typingDone)
+		stopMsgTyping()
 		// Extract `![alt](workspace/relative/path)` markdown image refs
 		// from the agent's reply, resolve their bytes via the
 		// workspace.Store, and ship them as MediaItems so IM channels
@@ -710,7 +742,26 @@ func (g *Gateway) Run() error {
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-stopCh
-		slog.Info("received signal, shutting down", "signal", sig)
+		// Finish the turns already running first (a rolling deploy must
+		// not cut them off); a second signal stops at once.
+		drain.Start()
+		timeout := drainTimeout()
+		slog.Info("received signal, draining running turns", "signal", sig, "active", drain.Active(), "timeout", timeout)
+		waitCtx, stopWaiting := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case sig := <-stopCh:
+				slog.Warn("second signal, not waiting for running turns", "signal", sig)
+				stopWaiting()
+			case <-waitCtx.Done():
+			}
+		}()
+		if drain.Wait(waitCtx, timeout) {
+			slog.Info("all turns finished, shutting down")
+		} else {
+			slog.Warn("shutting down with turns still running", "active", drain.Active())
+		}
+		stopWaiting()
 		cancel()
 	}()
 
@@ -731,26 +782,19 @@ func (g *Gateway) Run() error {
 		}
 	}()
 
-	var wg sync.WaitGroup
+	var wg workers
 	if err := g.bus.Start(ctx); err != nil {
 		return fmt.Errorf("start message bus: %w", err)
 	}
-	wg.Add(1)
-	go func() { defer wg.Done(); g.users.startEvictor(ctx) }()
-	wg.Add(1)
-	go func() { defer wg.Done(); g.cleanupDedup(ctx) }()
-	wg.Add(1)
-	go func() { defer wg.Done(); g.processInbound(ctx) }()
-	wg.Add(1)
-	go func() { defer wg.Done(); g.chanMgr.Start(ctx) }()
+	wg.Go("evictor", func() { g.users.startEvictor(ctx) })
+	wg.Go("dedup-cleanup", func() { g.cleanupDedup(ctx) })
+	wg.Go("inbound", func() { g.processInbound(ctx) })
+	wg.Go("channels", func() { g.chanMgr.Start(ctx) })
 	if g.scheduler != nil {
-		wg.Add(1)
-		go func() { defer wg.Done(); g.scheduler.Start(ctx) }()
+		wg.Go("scheduler", func() { g.scheduler.Start(ctx) })
 	}
 	if g.webhookSrv != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go("webhook-server", func() {
 			port := readSystemHooks(g.store).Port
 			if port == 0 {
 				port = 18954
@@ -759,7 +803,7 @@ func (g *Gateway) Run() error {
 			if err := g.webhookSrv.ListenAndServe(ctx, addr); err != nil {
 				slog.Error("webhook server error", "error", err)
 			}
-		}()
+		})
 	}
 	if g.pluginMgr != nil {
 		if err := g.pluginMgr.StartAll(ctx); err != nil {
@@ -772,7 +816,14 @@ func (g *Gateway) Run() error {
 		plugin.RegisterPluginProviders(ctx, g.pluginMgr, toolProviderRegistry)
 	}
 	slog.Info("gateway started")
-	wg.Wait()
+	<-ctx.Done()
+	// Every worker watches ctx, but a stuck one (a channel adapter blocked
+	// in a library call) must not keep the process alive: it would hold
+	// agl WebSockets and channel pollers until the pod is killed, so
+	// devices look offline to the new pod meanwhile.
+	if stuck := wg.Wait(shutdownGrace()); len(stuck) > 0 {
+		slog.Warn("workers did not stop in time, exiting anyway", "workers", stuck)
+	}
 	if g.taskQueue != nil {
 		g.taskQueue.Stop()
 	}
@@ -784,6 +835,72 @@ func (g *Gateway) Run() error {
 	}
 	slog.Info("gateway stopped")
 	return nil
+}
+
+// shutdownGrace bounds how long shutdown waits for the gateway's workers
+// after the turns have drained.
+func shutdownGrace() time.Duration { return 15 * time.Second }
+
+// workers is a WaitGroup that remembers which named workers are running,
+// so a shutdown that gives up can say what was stuck.
+type workers struct {
+	wg   sync.WaitGroup
+	mu   sync.Mutex
+	live map[string]int
+}
+
+func (w *workers) Go(name string, fn func()) {
+	w.mu.Lock()
+	if w.live == nil {
+		w.live = map[string]int{}
+	}
+	w.live[name]++
+	w.mu.Unlock()
+	w.wg.Add(1)
+	go func() {
+		defer func() {
+			w.mu.Lock()
+			if w.live[name]--; w.live[name] <= 0 {
+				delete(w.live, name)
+			}
+			w.mu.Unlock()
+			w.wg.Done()
+		}()
+		fn()
+	}()
+}
+
+// Wait waits up to d for every worker to return and lists the ones
+// still running (nil when all stopped).
+func (w *workers) Wait(d time.Duration) []string {
+	done := make(chan struct{})
+	go func() { w.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(d):
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	names := make([]string, 0, len(w.live))
+	for n := range w.live {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// drainTimeout is how long shutdown waits for running turns:
+// FASTCLAW_DRAIN_TIMEOUT (a Go duration, e.g. "10m"; "0" = don't wait),
+// default 10 minutes. Keep the pod's terminationGracePeriodSeconds above it.
+func drainTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("FASTCLAW_DRAIN_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d >= 0 {
+			return d
+		}
+		slog.Warn("invalid FASTCLAW_DRAIN_TIMEOUT, using the default", "value", v)
+	}
+	return 10 * time.Minute
 }
 
 // makeStoreFirstAgentFileLoader returns a loader that reads per-agent
@@ -984,18 +1101,16 @@ func splitFilesFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 	cursor := 0
 	for _, m := range matches {
 		path := reply[m[4]:m[5]]
-		key := strings.TrimPrefix(path, "/workspace/")
-		rc, err := ws.Get(ctx, agentID, projectID, sessionID, key)
+		data, base, err := resolveWorkspaceBytes(ctx, ws, agentID, projectID, sessionID, path)
 		if err != nil {
-			slog.Warn("split file: workspace get failed", "key", key, "error", err)
+			slog.Warn("split file: workspace get failed", "path", path, "error", err)
 			continue
 		}
-		data, readErr := io.ReadAll(rc)
-		rc.Close()
-		if readErr != nil || len(data) == 0 || len(data) > maxAttachmentBytes {
+		if len(data) > maxAttachmentBytes {
+			slog.Warn("split file: skipping oversize attachment",
+				"agent", agentID, "session", sessionID, "filename", base, "size", len(data), "cap", maxAttachmentBytes)
 			continue
 		}
-		base := filepath.Base(key)
 		items = append(items, bus.MediaItem{Filename: base, ContentType: mime.TypeByExtension(filepath.Ext(base)), Bytes: data})
 		out.WriteString(reply[cursor:m[0]])
 		cursor = m[1]
@@ -1008,6 +1123,78 @@ func splitFilesFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 	}
 	out.WriteString(reply[cursor:])
 	return strings.TrimSpace(out.String()), items
+}
+
+// resolveWorkspaceBytes reads a workspace-relative key for an outbound
+// media/file ref, looking beyond just the session scope.
+//
+// Agents emit refs as bare relative paths (`![cat](cat.png)`), but the
+// file they name was not necessarily written into the session scope
+// the gateway resolves against (sessions/<chatID>/). Turns that run
+// without a session scope — cron jobs, web-dashboard default scope,
+// and anything that shells out to a host tool whose cwd is the
+// agent-shared root (`exec`) — drop
+// their files directly under <root>/<agent>/. Resolving only the
+// session scope therefore misses the file, and the image is silently
+// stripped from the reply with nothing sent to the IM channel.
+//
+// So try the session scope first (the common case, and the only scope
+// a chat can normally write to) and then widen to the project root and
+// the agent-shared root. Every candidate is still passed through
+// workspace.Store, so the ".." escape guard in the backend applies to
+// all of them.
+func resolveWorkspaceBytes(ctx context.Context, ws workspace.Store, agentID, projectID, sessionID, path string) ([]byte, string, error) {
+	if ws == nil {
+		return nil, "", fmt.Errorf("no workspace store")
+	}
+	key := strings.TrimPrefix(path, "/workspace/")
+	key = strings.TrimPrefix(key, "workspace/")
+	key = strings.TrimPrefix(key, "/")
+	if key == "" {
+		return nil, "", fmt.Errorf("empty workspace key")
+	}
+	candidates := [][2]string{{projectID, sessionID}}
+	if projectID != "" {
+		candidates = append(candidates, [2]string{projectID, ""})
+	}
+	if sessionID != "" && projectID != "" {
+		candidates = append(candidates, [2]string{"", sessionID})
+	}
+	candidates = append(candidates, [2]string{"", ""})
+
+	var lastErr error
+	for i, c := range candidates {
+		dup := false
+		for _, prev := range candidates[:i] {
+			if prev == c {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		rc, err := ws.Get(ctx, agentID, c[0], c[1], key)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		data, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if len(data) == 0 {
+			lastErr = fmt.Errorf("workspace: %s is empty", key)
+			continue
+		}
+		return data, filepath.Base(key), nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("workspace: %s not found in any scope", key)
+	}
+	return nil, "", lastErr
 }
 
 // splitMediaFromReply pulls every `![alt](src)` ref out of `reply` and
@@ -1066,23 +1253,13 @@ func splitMediaFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 				filename = name
 			}
 		} else if ws != nil {
-			key := strings.TrimPrefix(path, "/workspace/")
-			key = strings.TrimPrefix(key, "workspace/")
-			key = strings.TrimPrefix(key, "/")
-			if key != "" {
-				rc, err := ws.Get(ctx, agentID, projectID, sessionID, key)
-				if err != nil {
-					slog.Warn("split media: workspace get failed", "agent", agentID, "project", projectID, "session", sessionID, "key", key, "error", err)
-				} else {
-					data, rerr := io.ReadAll(rc)
-					rc.Close()
-					if rerr != nil {
-						slog.Warn("split media: read failed", "key", key, "error", rerr)
-					} else {
-						bytes = data
-						filename = filepath.Base(key)
-					}
-				}
+			data, name, err := resolveWorkspaceBytes(ctx, ws, agentID, projectID, sessionID, path)
+			if err != nil {
+				slog.Warn("split media: workspace get failed",
+					"agent", agentID, "project", projectID, "session", sessionID, "key", path, "error", err)
+			} else {
+				bytes = data
+				filename = name
 			}
 		}
 

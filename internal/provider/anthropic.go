@@ -122,11 +122,25 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 		role := m.Role
 		if m.Role == "system" {
 			if len(out) == 0 {
-				if m.Content != "" {
+				// Leading system messages (main prompt, channel hints,
+				// plan-mode nudges) are ALL joined into the system param
+				// — pulling up only the last one silently dropped the
+				// main prompt whenever the loop added a note after it.
+				// Whitespace-only system messages are skipped.
+				if c := strings.TrimSpace(m.Content); c != "" {
 					sysParts = append(sysParts, m.Content)
 				}
 				continue
 			}
+			// Mid-conversation system messages are fastclaw's per-turn
+			// tail context (sender attribution, NOW line, connector and
+			// agent mounts — volatile by design). Emit them as user-role
+			// turns instead of joining them into the system param: the
+			// system param is the head of the cacheable prefix, and a
+			// per-turn-volatile system string would miss the prompt
+			// cache on every single turn. The API merges consecutive
+			// user messages into one turn, so the tail lands right
+			// after the latest user message where it belongs.
 			role = "user"
 		}
 		if orphanTool[i] {
@@ -509,7 +523,7 @@ func (p *AnthropicProvider) buildRequest(ctx context.Context, messages []Message
 	}
 
 	url := p.apiBase + "/v1/messages"
-	slog.Info("anthropic request", "url", url, "model", req.Model)
+	slog.Info("anthropic request", "url", url, "model", req.Model, "request_bytes", len(body))
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -517,6 +531,7 @@ func (p *AnthropicProvider) buildRequest(ctx context.Context, messages []Message
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-api-key", p.apiKey)
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	SetAppIdentityHeaders(httpReq.Header)
 	return httpReq, nil
 }
 
@@ -571,6 +586,9 @@ type anthropicMessageStart struct {
 }
 
 type anthropicMessageDelta struct {
+	Delta struct {
+		StopReason string `json:"stop_reason"`
+	} `json:"delta"`
 	Usage anthropicUsage `json:"usage"`
 }
 
@@ -631,6 +649,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 		}
 		blocks := make(map[int]*blockState)
 		var usage Usage
+		truncated := false
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -654,8 +673,11 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 				}
 			case "message_delta":
 				var md anthropicMessageDelta
-				if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
-					usage.OutputTokens = md.Usage.OutputTokens
+				if json.Unmarshal([]byte(data), &md) == nil {
+					if md.Usage.OutputTokens > 0 {
+						usage.OutputTokens = md.Usage.OutputTokens
+					}
+					truncated = truncated || md.Delta.StopReason == "max_tokens"
 				}
 			case "content_block_start":
 				var cbs anthropicContentBlockStart
@@ -735,6 +757,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 					ThinkingSignature: thinkingSig,
 					Usage:             usage,
 					Done:              true,
+					Truncated:         truncated,
 				}:
 				case <-ctx.Done():
 				}
@@ -766,6 +789,7 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 	}
 	blocks := make(map[int]*blockState)
 	var usage Usage
+	truncated := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -790,8 +814,11 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 			}
 		case "message_delta":
 			var md anthropicMessageDelta
-			if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
-				usage.OutputTokens = md.Usage.OutputTokens
+			if json.Unmarshal([]byte(data), &md) == nil {
+				if md.Usage.OutputTokens > 0 {
+					usage.OutputTokens = md.Usage.OutputTokens
+				}
+				truncated = truncated || md.Delta.StopReason == "max_tokens"
 			}
 		case "content_block_start":
 			var cbs anthropicContentBlockStart
@@ -837,8 +864,9 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 	}
 
 	result := &Response{
-		Content: contentBuilder.String(),
-		Usage:   usage,
+		Content:   contentBuilder.String(),
+		Usage:     usage,
+		Truncated: truncated,
 	}
 	var thinkingBuilder strings.Builder
 	var thinkingSig string

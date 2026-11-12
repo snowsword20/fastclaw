@@ -17,8 +17,10 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { Save, Check, Clock, Container } from "lucide-react";
 import { getConfig, updateConfig, getMe, type ConfigResponse } from "@/lib/api";
+import { useLocale } from "@/components/locale-provider";
 
 export default function RuntimeSettingsPage() {
+  const { tr } = useLocale();
   const router = useRouter();
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -27,6 +29,7 @@ export default function RuntimeSettingsPage() {
   const [saveError, setSaveError] = useState("");
 
   const [sandboxEnabled, setSandboxEnabled] = useState(false);
+  const [sandboxEnforce, setSandboxEnforce] = useState(false);
   const [sandboxBackend, setSandboxBackend] = useState("docker");
   const [sandboxDockerImage, setSandboxDockerImage] = useState("");
   const [sandboxE2BTemplate, setSandboxE2BTemplate] = useState("base");
@@ -45,10 +48,13 @@ export default function RuntimeSettingsPage() {
         return;
       }
       setLoading(true);
-      getConfig()
+      // Explicit system scope: this page edits deployment-wide settings,
+      // and the default (merged) view lets a user-level row shadow them.
+      getConfig("system")
         .then((cfg) => {
           setConfig(cfg);
           setSandboxEnabled(cfg.sandbox?.enabled || false);
+          setSandboxEnforce(cfg.sandbox?.enforce || false);
           const backend = cfg.sandbox?.backend || "docker";
           setSandboxBackend(backend);
           // Each backend has its own persisted field. For configs
@@ -96,22 +102,29 @@ export default function RuntimeSettingsPage() {
         },
         sandbox: {
           enabled: sandboxEnabled,
+          enforce: sandboxEnabled && sandboxEnforce,
           backend: sandboxBackend,
-          image: activeImage || undefined,
-          dockerImage: sandboxDockerImage || undefined,
-          e2bTemplate: sandboxE2BTemplate || undefined,
-          boxliteSnapshot: sandboxBoxliteImage || undefined,
+          // Send "" (not undefined) for every optional field: the server
+          // PATCHes, so undefined means "keep", and a cleared field never
+          // cleared — e.g. an E2B template id left in the legacy slot got
+          // pulled as the BoxLite image, and a stale BoxLite image pinned
+          // a cached :latest instead of the current default. API keys stay
+          // undefined-when-empty so a blank field doesn't wipe a stored key.
+          image: activeImage,
+          dockerImage: sandboxDockerImage,
+          e2bTemplate: sandboxE2BTemplate,
+          boxliteSnapshot: sandboxBoxliteImage,
           e2bKey: sandboxE2BKey || undefined,
           boxliteKey: sandboxBoxliteKey || undefined,
-          boxliteUrl: sandboxBoxliteURL || undefined,
+          boxliteUrl: sandboxBoxliteURL,
         },
-      });
+      }, "system");
       if (result?.ok === false) {
-        setSaveError(result.error || "Save failed");
+        setSaveError(result.error || tr("Save failed", "保存失败"));
         return;
       }
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Save failed");
+      setSaveError(err instanceof Error ? err.message : tr("Save failed", "保存失败"));
       return;
     } finally {
       setSaving(false);
@@ -134,9 +147,9 @@ export default function RuntimeSettingsPage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-xl font-semibold tracking-tight">Runtime</h3>
+          <h3 className="text-xl font-semibold tracking-tight">{tr("Runtime", "运行环境")}</h3>
           <p className="text-sm text-muted-foreground mt-1">
-            Gateway and sandbox configuration.
+            {tr("Gateway and sandbox configuration.", "配置网关和沙箱运行环境。")}
           </p>
         </div>
         <Button
@@ -148,12 +161,12 @@ export default function RuntimeSettingsPage() {
           {saved ? (
             <>
               <Check className="h-4 w-4 mr-2" />
-              Saved
+              {tr("Saved", "已保存")}
             </>
           ) : (
             <>
               <Save className="h-4 w-4 mr-2" />
-              {saving ? "Saving..." : "Save"}
+              {saving ? tr("Saving…", "正在保存…") : tr("Save", "保存")}
             </>
           )}
         </Button>
@@ -170,14 +183,17 @@ export default function RuntimeSettingsPage() {
             <Clock className="mt-0.5 h-4 w-4 text-sky-500" />
             <div className="grid flex-1 gap-4 sm:grid-cols-[1fr_260px] sm:items-start">
               <div>
-                <h3 className="font-medium">Default timezone</h3>
+                <h3 className="font-medium">{tr("Default timezone", "默认时区")}</h3>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  System preference used before falling back to the deployment
-                  TZ. Current deployment fallback: {config.meta?.serverTimezone || "Local"}.
+                  {tr(
+                    "Used before falling back to the deployment timezone. Current deployment fallback: {{timezone}}.",
+                    "优先使用此系统设置；未设置时回退到部署环境时区。当前部署环境时区：{{timezone}}。",
+                    { timezone: config.meta?.serverTimezone || tr("Local", "本地时区") },
+                  )}
                 </p>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="default-timezone">IANA timezone</Label>
+                <Label htmlFor="default-timezone">{tr("IANA timezone", "IANA 时区")}</Label>
                 <Input
                   id="default-timezone"
                   value={defaultTimezone}
@@ -195,10 +211,10 @@ export default function RuntimeSettingsPage() {
             <div>
               <div className="flex items-center gap-2 mb-1">
                 <Container className="h-4 w-4 text-purple-500" />
-                <h3 className="font-medium">Sandbox</h3>
+                <h3 className="font-medium">{tr("Sandbox", "沙盒")}</h3>
               </div>
               <p className="text-sm text-muted-foreground">
-                Execute code in isolated sandbox environments
+                {tr("Execute code in isolated sandbox environments", "在隔离的沙箱环境中执行代码")}
               </p>
             </div>
             <Switch checked={sandboxEnabled} onCheckedChange={setSandboxEnabled} />
@@ -207,14 +223,26 @@ export default function RuntimeSettingsPage() {
         {sandboxEnabled && (
           <div className="px-5 pb-5 space-y-4">
             <Separator />
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <Label>{tr("Always run in the sandbox", "强制在沙盒执行")}</Label>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {tr(
+                    "On: every command runs inside the sandbox and never on this machine. Off: commands run on this machine by default and the agent opts into the sandbox per call (guest chatters are always sandboxed).",
+                    "开启后所有命令都在沙盒中执行，不会在本机运行。关闭时默认在本机执行，由智能体按需选择沙盒（非管理员的访客始终在沙盒中执行）。",
+                  )}
+                </p>
+              </div>
+              <Switch checked={sandboxEnforce} onCheckedChange={setSandboxEnforce} />
+            </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="space-y-2">
-                <Label>Backend</Label>
+                <Label>{tr("Backend", "后端")}</Label>
                 <Select value={sandboxBackend} onValueChange={(v) => v && setSandboxBackend(v)}>
                   <SelectTrigger>
                     <SelectValue>
                       {(v: unknown) =>
-                        ({ docker: "Docker", e2b: "E2B (cloud)", boxlite: "BoxLite (cloud)" } as Record<string, string>)[
+                        ({ docker: "Docker", e2b: tr("E2B (cloud)", "E2B（云端）"), boxlite: tr("BoxLite (cloud)", "BoxLite（云端）") } as Record<string, string>)[
                           v as string
                         ] ?? (v as string) ?? ""
                       }
@@ -222,15 +250,15 @@ export default function RuntimeSettingsPage() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="docker">Docker</SelectItem>
-                    <SelectItem value="e2b">E2B (cloud)</SelectItem>
-                    <SelectItem value="boxlite">BoxLite (cloud)</SelectItem>
+                    <SelectItem value="e2b">{tr("E2B (cloud)", "E2B（云端）")}</SelectItem>
+                    <SelectItem value="boxlite">{tr("BoxLite (cloud)", "BoxLite（云端）")}</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
               {sandboxBackend === "e2b" ? (
                 <>
                   <div className="space-y-2">
-                    <Label>E2B API Key</Label>
+                    <Label>{tr("E2B API key", "E2B API 密钥")}</Label>
                     <Input
                       type="password"
                       value={sandboxE2BKey}
@@ -240,7 +268,7 @@ export default function RuntimeSettingsPage() {
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label>E2B Template</Label>
+                    <Label>{tr("E2B template", "E2B 模板")}</Label>
                     <Input
                       value={sandboxE2BTemplate}
                       onChange={(e) => setSandboxE2BTemplate(e.target.value)}
@@ -252,45 +280,47 @@ export default function RuntimeSettingsPage() {
               ) : sandboxBackend === "boxlite" ? (
                 <>
                   <div className="space-y-2">
-                    <Label>BoxLite API Key</Label>
+                    <Label>{tr("BoxLite API key", "BoxLite API 密钥")}</Label>
                     <Input
                       type="password"
                       value={sandboxBoxliteKey}
                       onChange={(e) => setSandboxBoxliteKey(e.target.value)}
-                      placeholder="client_secret"
+                      placeholder="blk_live_..."
                       className="font-mono text-sm"
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label>Snapshot</Label>
+                    <Label>{tr("Image (optional)", "镜像（选填）")}</Label>
                     <Input
                       value={sandboxBoxliteImage}
                       onChange={(e) => setSandboxBoxliteImage(e.target.value)}
-                      placeholder="fastclaw-sandbox"
+                      placeholder="thinkany/fastclaw-sandbox:20261112"
                       className="font-mono text-sm"
                     />
                     <p className="text-xs text-muted-foreground">
-                      BoxLite snapshot name (imported via the BoxLite Dashboard),
-                      not a Docker Hub image reference.
+                      {tr(
+                        "Any public registry image; short names resolve to Docker Hub. Leave empty to use the default.",
+                        "任意公共仓库镜像，短名称默认指向 Docker Hub。留空则使用默认镜像。",
+                      )}
                     </p>
                   </div>
                   <div className="space-y-2 sm:col-span-2">
-                    <Label>API URL (optional)</Label>
+                    <Label>{tr("API URL (optional)", "API 地址（选填）")}</Label>
                     <Input
                       value={sandboxBoxliteURL}
                       onChange={(e) => setSandboxBoxliteURL(e.target.value)}
-                      placeholder="https://api.dev.boxlite.ai/api/v1"
+                      placeholder="https://api.boxlite.ai/v1"
                       className="font-mono text-sm"
                     />
                   </div>
                 </>
               ) : (
                 <div className="space-y-2">
-                  <Label>Docker Image</Label>
+                  <Label>{tr("Docker image", "Docker 镜像")}</Label>
                   <Input
                     value={sandboxDockerImage}
                     onChange={(e) => setSandboxDockerImage(e.target.value)}
-                    placeholder="thinkany/fastclaw-sandbox:latest"
+                    placeholder="thinkany/fastclaw-sandbox:20261112"
                     className="font-mono text-sm"
                   />
                 </div>

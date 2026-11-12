@@ -5,21 +5,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/codeany-ai/open-agent-sdk-go/costtracker"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent/goal"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
+	"github.com/fastclaw-ai/fastclaw/internal/billing"
 	"github.com/fastclaw-ai/fastclaw/internal/buildinfo"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/drain"
 	"github.com/fastclaw-ai/fastclaw/internal/mcp"
 	"github.com/fastclaw-ai/fastclaw/internal/privacy"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
@@ -35,15 +39,19 @@ import (
 
 // Agent is the ReAct agent loop.
 type Agent struct {
-	name                 string
-	provider             provider.Provider
-	registry             *tools.Registry
-	sessions             *session.Manager
-	memory               *Memory
-	ctxBuilder           *ContextBuilder
-	mcpMgr               *mcp.Manager
-	hooks                *HookRegistry
-	model                string
+	name       string
+	provider   provider.Provider
+	registry   *tools.Registry
+	sessions   *session.Manager
+	memory     *Memory
+	ctxBuilder *ContextBuilder
+	mcpMgr     *mcp.Manager
+	hooks      *HookRegistry
+	model      string
+	// providers are the LLM provider credentials visible to this agent
+	// (system + owner + agent scope), kept so a per-turn model override
+	// (WithTurnModel) can reach a provider other than the default one.
+	providers            map[string]config.ProviderConfig
 	maxTokens            int
 	temperature          float64
 	maxToolIterations    int
@@ -55,11 +63,21 @@ type Agent struct {
 	// even after the operator explicitly chose chatbot/customize.
 	// PromptMode also drives the per-turn tool filter via
 	// builtinAllowForMode below.
-	promptMode    string
-	homePath      string // agent's home: SOUL.md, sessions, memory, skills
-	workspacePath string // working dir where agent creates user files
-	homeDir       string // FastClaw root, ~/.fastclaw
-	ownerUserID   string // the user that owns this agent (for hook namespacing)
+	promptMode string
+	// listReachableAgents: the message_agent roster (nil = none). Set by
+	// registerMessageAgent.
+	listReachableAgents func(ctx context.Context) ([]AgentBrief, error)
+	// endUserConnectors: see EndUserConnectorGate (nil = none).
+	endUserConnectors EndUserConnectorGate
+	homePath          string // agent's home: SOUL.md, sessions, memory, skills
+	workspacePath     string // working dir where agent creates user files
+	homeDir           string // FastClaw root, ~/.fastclaw
+	ownerUserID       string // the UserSpace user the agent runs for (hook / data namespacing)
+	// agentOwnerID is agents.user_id — the account that actually owns the
+	// agent. It differs from ownerUserID whenever the agent runs in another
+	// user's space (an app's end-user, a public-link visitor, an admin
+	// browsing). Owner/operator trust is decided against it.
+	agentOwnerID string
 	// admins is the per-channel allowlist of chatters who can run write-
 	// mode slash commands (/new /undo /retry /compact /model /personality).
 	// Keyed by channel name (e.g. "discord" → ["123...", "456..."]). Empty
@@ -79,7 +97,8 @@ type Agent struct {
 	// to the LLM (see renderChannelHints) AND stamps
 	// OutboundMessage.AllowSplit so the dispatcher splits the reply at
 	// the marker before handing each chunk to the channel adapter.
-	// Per-agent only — there's no system-level fallback.
+	// Per-agent only — there's no system-level fallback. On unless the
+	// agent explicitly opts out (see splitRepliesEnabled).
 	splitReplies bool
 	// memoryStore is the optional Store-backed source of identity files
 	// (SOUL.md, IDENTITY.md, ...). Kept on the Agent so ReloadWorkspaceFiles
@@ -104,6 +123,7 @@ type Agent struct {
 	workspaceStore workspace.Store
 	skillsLearner  *SkillsLearner
 	turnCount      int
+	turnCounter    *atomic.Int64
 	engine         *sdkEngine
 	costTracker    *costtracker.Tracker
 	agentID        string
@@ -115,6 +135,10 @@ type Agent struct {
 	// agent loop checks the owner's quota before processing a turn.
 	// Nil means no quota enforcement (unlimited).
 	quotaStore usage.QuotaStore
+	// billing records usage events and asks the paying account's billing
+	// hook before turns and costly tools (docs/usage-metering.md). Nil
+	// records nothing and allows everything.
+	billing *billing.Service
 	// sandboxPool is the per-user (agent + session) sandbox pool. Set
 	// once at boot/hot-reload by attachSandboxToAgents; bindSession
 	// pulls a session-scoped executor from it at the top of every turn
@@ -185,9 +209,8 @@ func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 // can stamp it onto persisted rows for later replay. Called at the top
 // of HandleMessage / HandleMessageStream before any tool runs.
 //
-// Mutating the shared registry across concurrent chats would race, but
-// the current invariant is one chat-in-flight per agent — the gateway
-// serializes per-agent turns. Documenting it here in case that changes.
+// HandleMessage and HandleMessageStream fork the registry before binding,
+// so concurrent topics never mutate each other's tool or workspace scope.
 func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, projectID string) {
 	a.registry.SetSessionID(sessionID)
 	a.registry.SetProjectID(projectID)
@@ -294,6 +317,7 @@ func NewAgentWithFullCfg(rc config.ResolvedAgent, prov provider.Provider, mb *bu
 		learnerLoader := NewSkillsLoaderWithGlobal(homeDir, rc.Home, "", rc.Skills, fullCfg.Skills)
 		learnerLoader.agentID = rc.ID
 		ag.skillsLearner = NewSkillsLearner(rc.Home, prov, model, learnerLoader.AllSkillDirs()...)
+		ag.skillsLearner.onUsage = ag.meterBackground
 		if fullCfg.SkillsLearner.MinToolCalls > 0 {
 			ag.skillsLearner.minToolCalls = fullCfg.SkillsLearner.MinToolCalls
 		}
@@ -334,7 +358,8 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	// workspaceStore. The manager will call ReloadWorkspaceFiles after
 	// wiring to refresh the summary with OSS-hosted skills, and runOnce
 	// re-hydrates on every turn to pick up later uploads.
-	loader := NewSkillsLoaderWithGlobal(homeDir, rc.Home, "", rc.Skills, globalSkillsCfg)
+	loader := NewSkillsLoaderWithGlobal(homeDir, rc.Home, "", rc.Skills, globalSkillsCfg).
+		WithSandbox(buildinfo.IsSandboxEnforced())
 	loader.agentID = rc.ID
 	skills := loader.LoadSkills()
 	skillsSummary := loader.BuildSkillsSummary(skills)
@@ -372,6 +397,7 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 
 	ag := &Agent{
 		name:                 rc.ID,
+		turnCounter:          &atomic.Int64{},
 		provider:             prov,
 		registry:             registry,
 		sessions:             session.NewManager(rc.Home + "/sessions"),
@@ -379,6 +405,7 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		ctxBuilder:           newContextBuilderWithSandbox(rc.Home, workspace, memory, skillsSummary, rc.Thinking, sandboxEnforced, rc.Sandbox.Backend, rc.PromptMode),
 		hooks:                hooks,
 		model:                rc.Model,
+		providers:            rc.Providers,
 		maxTokens:            rc.MaxTokens,
 		temperature:          rc.Temperature,
 		maxToolIterations:    rc.MaxToolIterations,
@@ -399,16 +426,14 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 	// Multi-bubble split-replies: per-agent only — system-level toggle
 	// was removed since "every agent splits the same way" is rarely
 	// what an operator wants for a deployment running multiple personas.
-	// nil override = off (default); non-nil = explicit value. Plumbed at
+	// nil override = on (default); non-nil = explicit value. Plumbed at
 	// this layer (not just NewAgentWithFullCfg) so foreign-attached
 	// agents — chatters reaching an agent they don't own via a channel
 	// binding — also pick up the toggle. Without this the wechat
 	// dispatcher hint never reaches the LLM for non-owner chatters and
 	// the model falls back to markdown `---` separators that render as
 	// one bubble.
-	if rc.SplitReplies != nil {
-		ag.splitReplies = *rc.SplitReplies
-	}
+	ag.splitReplies = splitRepliesEnabled(rc.SplitReplies)
 	// Stamp the operator-given display name onto the context builder
 	// so an empty IDENTITY.md doesn't leak the base-model identity
 	// ("I am Claude") through to chatters — the system prompt's
@@ -599,12 +624,12 @@ func (a *Agent) SteerWeb(sessionId, projectIDHint, text string) bool {
 // turn is active so the caller falls back to taskQueue.Submit.
 func (a *Agent) SteerInbound(msg bus.InboundMessage, text string) bool {
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
-	return sess.PushSteerIfActive(provider.Message{
+	return sess.PushSteerIfActiveFrom(provider.Message{
 		Role:      "user",
 		Content:   text,
 		Metadata:  senderMetadata(msg),
 		Timestamp: time.Now().UnixMilli(),
-	})
+	}, a.isTrustedTurn(msg))
 }
 
 // recoverWebTriple maps a URL `?session=` token (which can be a
@@ -668,6 +693,7 @@ func (a *Agent) SetGroupContext(gc *GroupContext) {
 // understood markdown source.
 func (a *Agent) InjectGroupMessage(ctx context.Context, msg bus.InboundMessage) {
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+	ctx = withMeterSession(ctx, sess.Key())
 	label := msg.SenderName
 	if label == "" {
 		label = "Bot"
@@ -698,6 +724,19 @@ func (a *Agent) SetOwnerUserID(uid string) {
 	a.ownerUserID = uid
 }
 
+// SetAgentOwnerID records agents.user_id, the account that owns the agent.
+func (a *Agent) SetAgentOwnerID(uid string) { a.agentOwnerID = uid }
+
+// trustOwnerID is the user treated as the agent's owner for operator
+// trust: the real owner, or — on legacy installs without one — the
+// UserSpace user.
+func (a *Agent) trustOwnerID() string {
+	if a.agentOwnerID != "" {
+		return a.agentOwnerID
+	}
+	return a.ownerUserID
+}
+
 // OwnerUserID returns the agent's owning user ID — the user that
 // created / owns this agent. Exposed so callers that mint records
 // on the user's behalf (e.g. /goal slash) can stamp ownership
@@ -717,6 +756,16 @@ func (a *Agent) SetQuotaStore(qs usage.QuotaStore) { a.quotaStore = qs }
 // owner has exceeded their billing quota. Returns "" when the request
 // should proceed (no quota, unlimited, or still under limit).
 func (a *Agent) checkQuota(ctx context.Context) string {
+	// Billing hold: an external billing system (e.g. a hosted FastClaw
+	// Cloud) can hold the account that pays for this agent — its real
+	// owner — when its balance runs out. Every channel stops here.
+	if a.dataStore != nil {
+		// The hold's reason is the billing system's note; chatters only
+		// get the generic message.
+		if hold, _, err := a.dataStore.GetBillingHold(ctx, a.trustOwnerID()); err == nil && hold {
+			return "Sorry, this service is paused because the account's balance is used up. Please contact your service provider."
+		}
+	}
 	if a.quotaStore == nil || a.meter == nil {
 		return ""
 	}
@@ -728,33 +777,6 @@ func (a *Agent) checkQuota(ctx context.Context) string {
 		status.TokensUsed, status.MonthlyTokenLimit,
 		status.RequestsUsed, status.MonthlyRequestLimit,
 		status.ResetsAt)
-}
-
-// meterTokens records one Chat call's token counts. Safe to call with
-// zero usage (still bumps request_count). Errors are logged but never
-// propagated — metering must not break the chat path. The agent's
-// configured model string carries the provider prefix when a per-agent
-// override is set; we split it so the meter stores provider and model
-// in their own columns rather than mashing them together.
-// durationMs is the wall-clock time of the LLM call; pass 0 when not
-// measured (the daily bucket doesn't use it, only the log table).
-func (a *Agent) meterTokens(ctx context.Context, sessionKey string, u provider.Usage, durationMs int64) {
-	if a.meter == nil {
-		return
-	}
-	prov, mdl := provider.SplitProviderModel(a.model)
-	t := usage.Tokens{
-		Input:         u.InputTokens,
-		Output:        u.OutputTokens,
-		CacheRead:     u.CacheReadTokens,
-		CacheCreation: u.CacheCreationTokens,
-	}
-	if err := a.meter.RecordTokens(ctx, a.ownerUserID, a.agentID, sessionKey, prov, mdl, t); err != nil {
-		slog.Warn("meter record failed", "agent", a.name, "error", err)
-	}
-	if err := a.meter.RecordTokenLog(ctx, a.ownerUserID, a.agentID, sessionKey, prov, mdl, t, durationMs); err != nil {
-		slog.Warn("meter log failed", "agent", a.name, "error", err)
-	}
 }
 
 // streamChatToResponse is a drop-in replacement for provider.Chat that
@@ -789,10 +811,12 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 	var (
 		contentBuilder strings.Builder
 		toolCalls      []provider.ToolCall
+		truncated      bool
 		thinking       string
 		thinkingSig    string
 		rawAssistant   json.RawMessage
 		streamUsage    provider.Usage
+		gate           deltaGate // tool-call markup never streams
 	)
 	for {
 		chunk, ok := sr.Next()
@@ -807,14 +831,17 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 				// that only know about the legacy `content` event
 				// ignore unknown types and rely on the final
 				// emit (caller's responsibility) instead.
-				emitEvent(ctx, ChatEvent{
-					Type: "content_delta",
-					Data: map[string]any{"delta": chunk.Content},
-				})
+				if d := gate.Push(chunk.Content); d != "" {
+					emitEvent(ctx, ChatEvent{
+						Type: "content_delta",
+						Data: map[string]any{"delta": d},
+					})
+				}
 			}
 		}
 		if chunk.Done {
 			toolCalls = chunk.ToolCalls
+			truncated = chunk.Truncated
 			if chunk.Thinking != "" {
 				thinking = chunk.Thinking
 			}
@@ -832,6 +859,11 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 	}
 	if err := sr.Err(); err != nil {
 		return nil, err
+	}
+	if emitDeltas {
+		if d := gate.Flush(); d != "" {
+			emitEvent(ctx, ChatEvent{Type: "content_delta", Data: map[string]any{"delta": d}})
+		}
 	}
 	// Mirror what AnthropicProvider.parseSSE does when no
 	// RawAssistant was emitted but we still captured thinking text:
@@ -852,6 +884,7 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 		Thinking:     thinking,
 		Usage:        streamUsage,
 		RawAssistant: rawAssistant,
+		Truncated:    truncated,
 	}, nil
 }
 
@@ -940,6 +973,7 @@ func (a *Agent) sessionHasActiveGoal(ctx context.Context, msg bus.InboundMessage
 		return false
 	}
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+	ctx = withMeterSession(ctx, sess.Key())
 	if sess == nil {
 		return false
 	}
@@ -959,8 +993,11 @@ func (a *Agent) sessionHasActiveGoal(ctx context.Context, msg bus.InboundMessage
 // empty text part — some upstreams reject content-less wire messages.
 func buildUserMessage(msg bus.InboundMessage) provider.Message {
 	origin := provider.OriginUser
-	if msg.Source == bus.SourceGoalContext {
+	switch msg.Source {
+	case bus.SourceGoalContext:
 		origin = provider.OriginGoalContext
+	case bus.SourceConnector:
+		origin = provider.OriginConnector
 	}
 	// IM DMs are not prefixed with `[SenderName]:` — there's only one
 	// chatter per DM, the sender is already surfaced as a per-turn
@@ -1052,9 +1089,36 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 	}
 	resolved := a.sessions.ResolveSessionKey(sessionId)
 	sess := a.sessions.GetByKey(resolved)
-	msgs := sess.ArchivedMessages()
+	return webHistoryEntries(sess.ArchivedMessages())
+}
+
+// WebChatHistoryPage returns one page of chat history ending before the
+// cursor, read straight from the archive so a long conversation opens as
+// fast as a short one. before < 0 asks for the newest page; the returned
+// start is the cursor for the next older page. ok is false when the
+// session has no paged archive and the caller should page
+// WebChatHistory in memory instead.
+func (a *Agent) WebChatHistoryPage(sessionId string, before int64, limit int) (history []map[string]any, start int64, hasMore, ok bool) {
+	if sessionId == "" {
+		sessionId = "web-ui"
+	}
+	resolved := a.sessions.ResolveSessionKey(sessionId)
+	msgs, start, hasMore, ok := a.sessions.ArchivedMessagesPage(resolved, before, limit)
+	if !ok {
+		return nil, 0, false, false
+	}
+	return webHistoryEntries(msgs), start, hasMore, true
+}
+
+// webHistoryEntries converts archived messages into the chat UI's
+// history shape, dropping runtime-injected and empty messages.
+func webHistoryEntries(msgs []provider.Message) []map[string]any {
 	var history []map[string]any
+	var groupTurnID string
 	for _, m := range msgs {
+		if value, ok := m.Metadata["groupTurnId"].(string); ok && value != "" {
+			groupTurnID = value
+		}
 		// Hide runtime-injected messages (currently only goal_context
 		// continuations). They live in the session for the LLM's
 		// benefit; surfacing them to the user would expose audit
@@ -1094,6 +1158,9 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 				continue
 			}
 			entry := map[string]any{"role": "user", "content": text}
+			if m.Timestamp > 0 {
+				entry["timestamp"] = m.Timestamp
+			}
 			if len(imageURLs) > 0 {
 				entry["imageUrls"] = imageURLs
 			}
@@ -1109,9 +1176,21 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 					entry["senderChannel"] = v
 				}
 			}
+			if value, ok := m.Metadata["groupTurnId"].(string); ok && value != "" {
+				entry["groupTurnId"] = value
+			}
+			if from, ok := m.Metadata["privateFrom"].(map[string]any); ok {
+				entry["privateFrom"] = from
+			}
 			history = append(history, entry)
 		case "assistant":
 			entry := map[string]any{"role": "assistant"}
+			if groupTurnID != "" {
+				entry["groupTurnId"] = groupTurnID
+			}
+			if m.Timestamp > 0 {
+				entry["timestamp"] = m.Timestamp
+			}
 			if m.Content != "" {
 				entry["content"] = m.Content
 			}
@@ -1144,6 +1223,9 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 				"name":       m.Name,
 				"toolCallId": m.ToolCallID,
 			}
+			if m.Timestamp > 0 {
+				entry["timestamp"] = m.Timestamp
+			}
 			if len(m.Metadata) > 0 {
 				entry["metadata"] = m.Metadata
 			}
@@ -1156,6 +1238,12 @@ func (a *Agent) WebChatHistory(sessionId string) []map[string]any {
 // WebChatSessions returns a list of web chat sessions with metadata.
 func (a *Agent) WebChatSessions() []session.WebSession {
 	return a.sessions.ListWebSessions()
+}
+
+// SessionTurnActive reports whether a turn is running in the session
+// with this key, whichever channel started it (web, IM, cron).
+func (a *Agent) SessionTurnActive(sessionKey string) bool {
+	return a.sessions.TurnActive(sessionKey)
 }
 
 // DeleteWebChatSession removes a chat session (any channel) by the URL
@@ -1336,10 +1424,17 @@ func filepathDir(p string) string {
 // LLMs honor structured params framed as a separate document
 // section much more reliably than as inline prose.
 func renderClientParams(params map[string]any) string {
-	if len(params) == 0 {
+	publicParams := make(map[string]any, len(params))
+	for key, value := range params {
+		if strings.HasPrefix(key, "__fastclaw") {
+			continue
+		}
+		publicParams[key] = value
+	}
+	if len(publicParams) == 0 {
 		return ""
 	}
-	blob, err := json.MarshalIndent(params, "", "  ")
+	blob, err := json.MarshalIndent(publicParams, "", "  ")
 	if err != nil {
 		return ""
 	}
@@ -1362,7 +1457,7 @@ func renderClientParams(params map[string]any) string {
 // buildTurnTailContext renders the per-turn volatile context as ONE
 // system message appended AFTER the latest user message: group-chat
 // sender attribution, client parameters, the chatbot persistence
-// reminder, and the NOW time-anchor line.
+// reminder, the NOW time-anchor line, and any extraNotes.
 //
 // Why the tail, and why one message: everything here can change from
 // turn to turn, and provider prompt caching (Anthropic cache_control,
@@ -1375,7 +1470,7 @@ func renderClientParams(params map[string]any) string {
 // exactly +2 messages per turn (user message + tail), which is what
 // the Anthropic message breakpoints in provider/anthropic.go assume
 // for chained cache hits.
-func (a *Agent) buildTurnTailContext(msg bus.InboundMessage, chatterUID string, chatterMem *Memory) string {
+func (a *Agent) buildTurnTailContext(msg bus.InboundMessage, chatterUID string, chatterMem *Memory, extraNotes ...string) string {
 	var parts []string
 	if s := renderSender(msg); s != "" {
 		parts = append(parts, s)
@@ -1389,17 +1484,62 @@ func (a *Agent) buildTurnTailContext(msg bus.InboundMessage, chatterUID string, 
 	if s := a.ctxBuilder.BuildTimeAnchorAs(chatterUID); s != "" {
 		parts = append(parts, s)
 	}
+	for _, note := range extraNotes {
+		if strings.TrimSpace(note) != "" {
+			parts = append(parts, note)
+		}
+	}
 	return strings.Join(parts, "\n\n")
 }
 
 // appendTurnTailContext appends the per-turn tail context message to a
 // wire message list (see buildTurnTailContext for why it belongs at
-// the end). No-op when there is nothing volatile to say.
-func (a *Agent) appendTurnTailContext(messages []provider.Message, msg bus.InboundMessage, chatterUID string, chatterMem *Memory) []provider.Message {
-	if tail := a.buildTurnTailContext(msg, chatterUID, chatterMem); tail != "" {
+// the end). extraNotes carries additional per-turn volatile blocks
+// (connector mounts, reachable-agent lists) so they ride in the same
+// tail message instead of interleaving into the cache-stable prefix.
+// No-op when there is nothing volatile to say.
+func (a *Agent) appendTurnTailContext(messages []provider.Message, msg bus.InboundMessage, chatterUID string, chatterMem *Memory, extraNotes ...string) []provider.Message {
+	if tail := a.buildTurnTailContext(msg, chatterUID, chatterMem, extraNotes...); tail != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: tail})
 	}
 	return messages
+}
+
+func groupContextFromParams(params map[string]any) *GroupContext {
+	raw, ok := params["__fastclawGroupChat"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	botUsername, _ := raw["botUsername"].(string)
+	botUsername = strings.TrimSpace(botUsername)
+	if botUsername == "" {
+		return nil
+	}
+	var teammates []string
+	switch values := raw["teammates"].(type) {
+	case []string:
+		teammates = append(teammates, values...)
+	case []any:
+		for _, value := range values {
+			if name, ok := value.(string); ok && strings.TrimSpace(name) != "" {
+				teammates = append(teammates, strings.TrimSpace(name))
+			}
+		}
+	}
+	instruction, _ := raw["instruction"].(string)
+	return &GroupContext{BotUsername: botUsername, Teammates: teammates, Instruction: instruction}
+}
+
+func applyInternalMessageMetadata(message *provider.Message, params map[string]any) {
+	turnID, _ := params["__fastclawGroupTurnId"].(string)
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" {
+		return
+	}
+	if message.Metadata == nil {
+		message.Metadata = map[string]any{}
+	}
+	message.Metadata["groupTurnId"] = turnID
 }
 
 // stripSenderPrefix removes the leading "\[name\]: " (or unescaped
@@ -1436,6 +1576,11 @@ func stripSenderPrefix(text, senderName string) string {
 // LLM payload. The nickname is still funneled to the LLM via the
 // `\[nickname\]: ` prefix on Message.Content (set by callers).
 func senderMetadata(msg bus.InboundMessage) map[string]any {
+	// A private message from another agent (message_agent) keeps its
+	// source so the recipient's chat can label the turn.
+	if from, ok := msg.Params[PrivateFromParamKey].(map[string]any); ok && msg.SenderName == "" {
+		return map[string]any{"privateFrom": from}
+	}
 	if msg.SenderName == "" {
 		return nil
 	}
@@ -1569,46 +1714,50 @@ func renderChatbotPersistenceReminder(mode, displayName, userMD, memoryMD string
 }
 
 // renderChannelHints emits per-turn protocol notes that the LLM can
-// only honor if it knows about them. Today there's exactly one: IM
-// channels with a single-message-per-bubble UI accept the
-// channels.SplitMessageMarker token as "split this reply into multiple
-// bubbles." The marker constant is colocated with the splitter in
-// internal/channels/base.go so changing the wire token only touches
-// one place; the actual split happens in the channels manager's
-// dispatcher, uniformly across all IM adapters.
+// only honor if it knows about them. Web and IM chat surfaces accept
+// the channels.SplitMessageMarker token as "split this reply into
+// multiple bubbles." The marker constant is colocated with the splitter
+// in internal/channels/base.go so changing the wire token only touches
+// one place. IM adapters split during dispatch; the web client splits
+// the stored reply while rendering it.
 //
-// `splitEnabled` is the per-agent toggle. When false (the default) we
+// `splitEnabled` is the per-agent toggle (on by default). When false we
 // skip the hint so the LLM never learns the marker — and the dispatcher
 // collapses any stray marker back to a newline. The two branches must
 // stay in lockstep.
 //
-// Returns "" for non-IM channels (web, api) so they don't waste tokens
-// on a hint the chatter wouldn't perceive — web renders one bubble per
-// chat-message anyway.
+// Returns "" for non-chat transports such as API calls, where inserting
+// a UI control token into the response would be surprising — unless the
+// API caller said it relays the reply into a chat (msg.ChatReply).
 func renderChannelHints(msg bus.InboundMessage, splitEnabled bool) string {
-	if !splitEnabled || !isIMChannel(msg.Channel) {
+	if !splitEnabled || (msg.Channel != "web" && !isIMChannel(msg.Channel) && !msg.ChatReply) {
 		return ""
 	}
-	// Sample alone is enough — the LLM picks up the protocol from one
-	// well-formed example without us listing every rule.
 	return "## Reply Format\n\n" +
-		"This channel renders one chat bubble per message. To split your " +
-		"reply into separate bubbles, write `" + channels.SplitMessageMarker +
-		"` on its own line between the parts. Each part is sent as a " +
-		"distinct message in order.\n\n" +
-		"Use this when a short, conversational, multi-beat reply reads more " +
-		"naturally than one long block (e.g. \"好。\\n" + channels.SplitMessageMarker +
-		"\\n第一条先到了。\\n" + channels.SplitMessageMarker + "\\n第二条在这。\"). " +
-		"For a single coherent answer, just reply normally — no marker needed."
+		"Reply like a capable person in a messaging app: answer directly, in " +
+		"the chatter's language, as plain conversational text.\n\n" +
+		"A simple answer is one compact message. A richer answer is usually 2–4 " +
+		"separate chat bubbles, never more than 4, instead of one long message. " +
+		"Each bubble carries one conversational beat in 1–2 short sentences.\n\n" +
+		"Write `" + channels.SplitMessageMarker + "` on its own line between " +
+		"bubbles. Each part is delivered as a distinct message in order, for " +
+		"example: \"有结果了。\\n" + channels.SplitMessageMarker +
+		"\\nidoubi 是一位独立开发者。\\n" + channels.SplitMessageMarker +
+		"\\n他主要在做 AI 应用。\"\n\n" +
+		"Avoid headings, nested lists, bold section labels, repeated " +
+		"introductions, and generic offers to do more — say the few things that " +
+		"matter instead of cataloguing everything. Keep code blocks, tables, " +
+		"long quotes, and tightly coupled structured content together in one " +
+		"bubble; only split their conversational framing."
 }
 
 // isIMChannel returns true for channels with single-message-per-bubble
 // UX where splitting one logical reply into multiple sequential
-// messages reads naturally. Web/API channels render long replies in
-// place — splitting there adds nothing.
+// messages reads naturally. Web is handled separately because its
+// React renderer understands the same marker; API responses do not.
 func isIMChannel(channel string) bool {
 	switch channel {
-	case "wechat", "telegram", "discord", "slack", "line", "feishu":
+	case "wechat", "telegram", "discord", "slack", "line", "feishu", "wecom", "whatsapp", "imessage":
 		return true
 	}
 	return false
@@ -1629,6 +1778,9 @@ func isIMChannel(channel string) bool {
 // Returns "" for web chats and any other caller that doesn't populate
 // SenderName, so we don't waste tokens.
 func renderSender(msg bus.InboundMessage) string {
+	if speaker := renderSpeaker(msg.Params); speaker != "" {
+		return speaker
+	}
 	if msg.SenderName == "" {
 		return ""
 	}
@@ -1644,6 +1796,37 @@ func renderSender(msg bus.InboundMessage) string {
 	}
 	if msg.PeerKind != "" {
 		fmt.Fprintf(&b, "- peer_kind: %s\n", msg.PeerKind)
+	}
+	return b.String()
+}
+
+// SpeakerParamKey is the internal params key carrying the group-chat
+// speaker an API caller named in `params.speaker`. Like every
+// __fastclaw key it is hidden from the Client Parameters block.
+const SpeakerParamKey = "__fastclawSpeaker"
+
+// renderSpeaker renders the API caller's group-chat speaker
+// ({"id": "...", "name": "..."}) as per-turn context. It lives only in
+// this turn's prompt — never in session history — and grants nothing:
+// the id is the calling app's user id, not a FastClaw identity.
+func renderSpeaker(params map[string]any) string {
+	raw, ok := params[SpeakerParamKey].(map[string]any)
+	if !ok {
+		return ""
+	}
+	id, _ := raw["id"].(string)
+	name, _ := raw["name"].(string)
+	id, name = strings.TrimSpace(id), strings.TrimSpace(name)
+	if id == "" && name == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("## Current Speaker\n\nThis conversation has several participants. The latest user turn was sent by:\n")
+	if name != "" {
+		fmt.Fprintf(&b, "- name: %s\n", name)
+	}
+	if id != "" {
+		fmt.Fprintf(&b, "- id: %s\n", id)
 	}
 	return b.String()
 }
@@ -1697,11 +1880,6 @@ func planModeNudge() string {
 		"That's the only way the execution turn stays inside its " +
 		"iteration budget; trying to do all of it directly will burn the " +
 		"cap on exploration and never reach synthesis.\n\n" +
-		"Your VERY FIRST execution action (next turn) should be " +
-		"`write_file('todo.md', <plan as - [ ] items>)` so the user sees " +
-		"a live progress panel as you work. Mention this in the plan as " +
-		"an explicit Step 0 (or fold it into Step 1) — the UI requires " +
-		"the file to render anything.\n\n" +
 		"Output a numbered plan with 3-7 steps. Each step is one or two " +
 		"sentences describing the action plus the tool you'll use, e.g. " +
 		"\"Step 3: Use `delegate_task` to find 10 solo insurance agents in " +
@@ -1762,6 +1940,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	ctx = store.WithChatterUserID(ctx, chatterUID)
 	ctx = store.WithChannel(ctx, msg.Channel)
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+	ctx = withMeterSession(ctx, sess.Key())
 	// Session.ctx() builds its OWN context from session-held fields
 	// rather than inheriting the caller's ctx — without binding the
 	// chatter onto sess itself, the WithChatterUserID we just stamped
@@ -1777,6 +1956,9 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	// the user's next turn — which matches the plan-mode contract
 	// (review the plan, then reply to execute).
 	sess.BeginTurn()
+	if a.isTrustedTurn(msg) {
+		sess.MarkTurnTrusted()
+	}
 	defer a.flushLeftoverSteer(sess)
 	defer padOrphanToolResults(sess)
 
@@ -1784,16 +1966,20 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	// + IM-bridge payloads (PhotoURL / PhotoURLs) land in session
 	// history the same way they would on a non-plan turn.
 	userMsg := buildUserMessage(msg)
+	applyInternalMessageMetadata(&userMsg, msg.Params)
 	sess.Append(userMsg)
 
 	if a.provider == nil {
 		noProviderMsg := "Agent is not configured with a usable LLM provider. Check that cfg.Providers contains the prefix referenced by model `" + a.model + "`."
-		emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": noProviderMsg}})
+		emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{
+			"code":    chatErrorCodeLLMProviderNotConfigured,
+			"message": noProviderMsg,
+		}})
 		emitEvent(ctx, ChatEvent{Type: "done"})
 		return noProviderMsg
 	}
 
-	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, a.memory.WithUserID(chatterUID))
+	systemPrompt := a.ctxBuilder.BuildSystemPromptAsWithGroup(chatterUID, a.memory.WithUserID(chatterUID), a.isTrustedTurn(msg), groupContextFromParams(msg.Params))
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 	// Tool catalog injection: plan mode passes tools=nil to the LLM so
@@ -1811,7 +1997,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	if catalog != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: catalog})
 	}
-	messages = append(messages, withConversationGapContext(sess.GetMessages())...)
+	messages = append(messages, withConversationGapContext(modelMessagesWithRecentImages(sess.GetMessages()))...)
 	// Plan turns need the NOW line too — the planning model answers
 	// "what should we do" questions that can hinge on today's date.
 	// Tail-only, consistent with the main loop's cache-stable layout.
@@ -1834,7 +2020,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 		emitEvent(ctx, ChatEvent{Type: "done"})
 		return "Sorry, I couldn't draft the plan — the LLM call failed."
 	}
-	a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
+	a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, 0)
 
 	planMeta := mergeMetadata(map[string]any{"planMode": true}, knowledgeMeta)
 	sess.Append(provider.Message{
@@ -1886,14 +2072,25 @@ func (a *Agent) flushLeftoverSteer(sess *session.Session) {
 	}
 }
 
-// llmRetry wraps an LLM call with retry logic for transient errors (network
-// glitches, server 5xx, EOF). Context cancellation / deadline exceeded are
-// treated as terminal — there's no point retrying when the caller has gone
-// away or the deadline has passed. Uses exponential backoff (1s, 4s, 9s)
-// across up to wechatLLMRetryAttempts calls.
+// llmRetry wraps an LLM call with retry logic for transient failures:
+// network errors, upstream timeouts, 408/409/425/429 and 5xx. Permanent
+// failures (bad request, auth, model not found, payload too large) fail
+// fast — repeating them cannot succeed.
+//
+// Only the CALLER's context ending (Stop, shutdown, the turn deadline)
+// is terminal. Checking errors.Is(err, context.DeadlineExceeded) is not
+// enough: net/http's "timeout awaiting response headers" also matches
+// it, and treating that as terminal ended whole turns on one slow
+// upstream response instead of retrying it.
+//
+// Backoff doubles from 2s up to 30s across llmRetryAttempts calls
+// (≈2 minutes of waiting in total), so a provider blip or a restarting
+// local gateway is ridden out without the user having to type
+// "continue". onRetry, when non-nil, is told about each retry so the
+// caller can surface it.
 //
 // The label argument is used for structured logging (typically a.name).
-const llmRetryAttempts = 3
+const llmRetryAttempts = 6
 
 func llmRetry(ctx context.Context, label string, fn func(context.Context) (*provider.Response, error)) (*provider.Response, error) {
 	var lastErr error
@@ -1908,16 +2105,27 @@ func llmRetry(ctx context.Context, label string, fn func(context.Context) (*prov
 		}
 		lastErr = err
 
-		// Context errors are terminal — don't retry.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// The caller gave up (Stop / shutdown / turn deadline): terminal.
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		if !isRetryableLLMError(err) {
+			slog.Warn("LLM call failed with a permanent error, not retrying",
+				"agent", label, "attempt", attempt, "error", err)
 			return nil, err
 		}
 
 		if attempt < llmRetryAttempts {
-			backoff := time.Duration(attempt*attempt) * time.Second // 1s, 4s, 9s
+			backoff := llmRetryBackoff(attempt)
 			slog.Warn("LLM call failed, retrying",
 				"agent", label, "attempt", attempt,
 				"max", llmRetryAttempts, "backoff", backoff, "error", err)
+			emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{
+				"phase":       "retrying",
+				"attempt":     attempt + 1,
+				"maxAttempts": llmRetryAttempts,
+				"error":       err.Error(),
+			}})
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
@@ -1928,6 +2136,40 @@ func llmRetry(ctx context.Context, label string, fn func(context.Context) (*prov
 	slog.Error("LLM call failed after all retries",
 		"agent", label, "attempts", llmRetryAttempts, "error", lastErr)
 	return nil, lastErr
+}
+
+// llmRetryBackoff is 2s, 4s, 8s, 16s, 30s, 30s… for attempt 1, 2, 3, …
+// A var so tests can shrink it.
+var llmRetryBackoff = func(attempt int) time.Duration {
+	d := time.Duration(1<<attempt) * time.Second
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
+}
+
+// apiErrorStatusRe pulls the HTTP status out of the providers'
+// "API error <status>: <body>" errors.
+var apiErrorStatusRe = regexp.MustCompile(`API error (\d{3})\b`)
+
+// isRetryableLLMError reports whether an LLM call error is worth
+// retrying. Errors without an HTTP status (connection refused/reset,
+// EOF, header or read timeouts, a stream that died mid-way) are
+// transient by nature; with a status, only 408/409/425/429 and 5xx are.
+func isRetryableLLMError(err error) bool {
+	m := apiErrorStatusRe.FindStringSubmatch(err.Error())
+	if m == nil {
+		return true
+	}
+	status, _ := strconv.Atoi(m[1])
+	switch {
+	case status >= 500:
+		return true
+	case status == 408, status == 409, status == 425, status == 429:
+		return true
+	default:
+		return false
+	}
 }
 
 // sameToolFailStreakLimit and softDeadlineFraction gate the two stall-
@@ -2064,67 +2306,24 @@ func maybeInjectSoftDeadlineWarning(ctx context.Context, turnStart time.Time, me
 	return append(messages, warnMsg), true
 }
 
-// pendingTodoItems returns the unchecked items in this session's
-// todo.md, or nil when there is no todo file (the common case — most
-// turns never write one).
-//
-// Reads through the workspace store rather than the filesystem so it
-// sees the same bytes write_file wrote, in every deployment.
-func (a *Agent) pendingTodoItems(ctx context.Context) []string {
-	if a.workspaceStore == nil || a.agentID == "" || a.registry == nil {
-		return nil
-	}
-	rc, err := a.workspaceStore.Get(ctx, a.agentID, a.registry.ProjectID(), a.registry.SessionID(), "todo.md")
-	if err != nil {
-		return nil
-	}
-	defer rc.Close()
-	body, err := io.ReadAll(io.LimitReader(rc, 64<<10))
-	if err != nil {
-		return nil
-	}
-	return uncheckedTodoItems(string(body))
-}
+// hardToolIterationCeiling bounds a turn when no explicit
+// maxToolIterations is configured. Healthy progress — tool calls that
+// succeed — is not what this budget is for: long tasks (driving a CLI,
+// polling a background job, multi-file edits) legitimately need dozens
+// of rounds. Stuck turns are stopped by the failure guards instead
+// (same-tool fail streak, all-failed rounds, identical-call loop
+// detection) and by the turn's wall-clock deadline. The ceiling is only
+// a backstop against a model that loops forever on "successful" calls.
+const hardToolIterationCeiling = 200
 
-// uncheckedTodoItems parses the "- [ ] step" convention the UI renders.
-// Anything that isn't a checkbox line is prose and ignored, matching the
-// panel's own parser.
-func uncheckedTodoItems(body string) []string {
-	var out []string
-	for _, line := range strings.Split(body, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if rest, ok := strings.CutPrefix(trimmed, "- [ ]"); ok {
-			if item := strings.TrimSpace(rest); item != "" {
-				out = append(out, item)
-			}
-		}
+// toolIterationLimit is the turn's tool-round budget: the agent's
+// explicit maxToolIterations when set (chatbot mode defaults to 5),
+// otherwise hardToolIterationCeiling.
+func (a *Agent) toolIterationLimit() int {
+	if a.maxToolIterations > 0 {
+		return a.maxToolIterations
 	}
-	return out
-}
-
-// todoReconcileNudge asks for one more pass when a turn is about to end
-// with its own checklist still showing unfinished work.
-//
-// The checklist is a promise rendered in the UI, and it drifts for a
-// mundane reason: something goes wrong mid-turn, the model firefights,
-// and never returns to the file. What the user then sees is a reply
-// saying "all done" beside a progress panel reading 1/5 — and there is
-// no way to tell from the outside which one is lying.
-//
-// Fires at most once per turn, and accepts "I did not finish these" as a
-// valid resolution — leaving an item unchecked is correct when the work
-// genuinely did not happen. What is not acceptable is the mismatch.
-func todoReconcileNudge(pending []string) provider.Message {
-	return provider.Message{
-		Role: "system",
-		Content: fmt.Sprintf(
-			"Before this reply goes out: todo.md still has %d unchecked item(s) — %s. "+
-				"The user sees that checklist as a live progress panel next to your answer, so it must not contradict what you are about to say. "+
-				"Resolve it one of two ways: edit_file('todo.md', …) to flip the items you actually completed, "+
-				"or keep them unchecked and say plainly in your reply which steps did not get done and why. "+
-				"Do not claim the task is complete while its own checklist says otherwise.",
-			len(pending), strings.Join(pending, "; ")),
-	}
+	return hardToolIterationCeiling
 }
 
 // softIterationFraction is the share of the tool-call budget left when
@@ -2208,6 +2407,8 @@ func (a *Agent) runToolsWithProgress(ctx context.Context, toolCalls []provider.T
 
 // HandleMessage processes an inbound message through the ReAct loop.
 func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) string {
+	// A deploy waits for this turn before the process exits (drain).
+	defer drain.Track()()
 	// Check for slash commands first. Empty reply means "handled but
 	// intentionally silent" — /goal foo and /goal resume both fall
 	// through to a streaming continuation that IS the response, so
@@ -2231,6 +2432,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		return result.reply
 	}
 
+	a = a.forkTurn()
+	a.applyTurnModel(ctx)
+
 	// Quota gate: reject the turn early when the agent owner has
 	// exceeded their billing ceiling. Checked before plan-mode and
 	// the main ReAct loop so no LLM tokens are burned.
@@ -2238,6 +2442,15 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": rejection}})
 		emitEvent(ctx, ChatEvent{Type: "done"})
 		return rejection
+	}
+	// Billing hook (docs/usage-metering.md): the paying account may
+	// refuse the turn; its message is the reply. Also starts the turn's
+	// metering scope (turn_id) for every usage event below.
+	ctx, billingRejection := a.beginBillingTurn(ctx, msg)
+	if billingRejection != "" {
+		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": billingRejection}})
+		emitEvent(ctx, ChatEvent{Type: "done"})
+		return billingRejection
 	}
 
 	// Plan mode short-circuits the ReAct loop: tools off, the model
@@ -2285,6 +2498,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID, "user", chatterUID)
 	a.refreshSkillsFromStore(chatterUID)
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+	ctx = withMeterSession(ctx, sess.Key())
 	// Bind chatter onto sess. Session.ctx() builds its own
 	// context.Background-rooted ctx for store calls, so the
 	// WithChatterUserID we stamped onto the caller ctx above does NOT
@@ -2314,6 +2528,14 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// per-turn chatter's row, not the UserSpace owner — see
 	// Registry.systemFileUserID for the routing rule.
 	a.registry.SetChatterUserID(chatterUID)
+	// The chatter's connected third-party accounts (internal/connectors):
+	// mounted only where they may be used; see mountConnectors.
+	connectorNote := a.mountConnectors(ctx, msg, chatterUID, sess.SessionKey())
+	// The person's own computers (agl): run_local_agent on 1:1 IM turns
+	// of the person the chat belongs to; see mountLocalAgents.
+	localAgentsNote := a.mountLocalAgents(ctx, msg)
+	// The other FastClaw agents message_agent can reach (roster).
+	agentsNote := a.reachableAgentsNote(ctx, msg)
 
 	// Steering: mark a turn in-flight so messages arriving mid-run are
 	// buffered onto the session (drained between tool iterations below)
@@ -2322,6 +2544,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// before padOrphanToolResults so it runs LAST (defers are LIFO) —
 	// orphan padding settles history first.
 	sess.BeginTurn()
+	if a.isTrustedTurn(msg) {
+		sess.MarkTurnTrusted()
+	}
 	defer a.flushLeftoverSteer(sess)
 
 	// Safety net for client-aborted turns: if the loop exits with a
@@ -2345,7 +2570,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 
 	chatterMem := a.memory.WithUserID(chatterUID)
-	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem)
+	systemPrompt := a.ctxBuilder.BuildTurnSystemPrompt(chatterUID, chatterMem, a.isTrustedTurn(msg), groupContextFromParams(msg.Params), a.registry.HostWorkDir())
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 
@@ -2360,6 +2585,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// `[SenderName]:` content-prefix policy lives there (group-only;
 	// DMs stay bare to avoid SOUL.md language-bias regressions).
 	userMsg := buildUserMessage(msg)
+	applyInternalMessageMetadata(&userMsg, msg.Params)
 	sess.Append(userMsg)
 
 	// Context compaction: check if session messages are too large
@@ -2367,6 +2593,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
+	}
+	if compactResult != nil && compactResult.Usage != nil {
+		a.meterTokens(ctx, sess.Key(), a.model, *compactResult.Usage, 0)
 	}
 	if compactResult != nil && compactResult.Pruned {
 		// Replace session messages with compacted version
@@ -2380,14 +2609,15 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	if hints := renderChannelHints(msg, a.splitReplies); hints != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: hints})
 	}
-	// Volatile per-turn context (sender / client params / persistence
-	// reminder / NOW line) is appended AFTER the history in ONE tail
-	// message — see buildTurnTailContext. It used to be interleaved
-	// here as system messages, which broke prefix caching every turn.
-	messages = append(messages, withConversationGapContext(sessionMsgs)...)
-	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem)
+	// Volatile per-turn context (sender / client params / connector and
+	// agent mounts / persistence reminder / NOW line) is appended AFTER
+	// the history in ONE tail message — see buildTurnTailContext. It
+	// used to be interleaved here as system messages, which broke prefix
+	// caching every turn.
+	messages = append(messages, withConversationGapContext(modelMessagesWithRecentImages(sessionMsgs))...)
+	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem, connectorNote, agentsNote, localAgentsNote)
 
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := withoutGroupSideChannels(a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode)), msg)
 
 	// Loop detection: track consecutive identical tool calls and results.
 	var loopDetector toolLoopDetector
@@ -2420,7 +2650,6 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	turnStart := time.Now()
 	softDeadlineFired := false
 	iterBudgetWarned := false
-	todoReconciled := false
 
 	// replyParts accumulates every non-empty assistant text segment
 	// emitted across iterations (preamble lines before tool calls + the
@@ -2430,9 +2659,14 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// channels.SplitMessageMarker at return time; manager.dispatchOutbound
 	// splits on it (AllowSplit=true) or collapses to newlines otherwise.
 	var replyParts []string
+	outputLimitRetries := 0
+
+	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit()}
+	loopWarned := false
+	totalFailedCalls := 0
 
 	// ReAct loop
-	for i := 0; i < a.maxToolIterations; i++ {
+	for i := 0; i < a.toolIterationLimit(); i++ {
 		slog.Info("agent loop iteration",
 			"agent", a.name,
 			"iteration", i+1,
@@ -2441,7 +2675,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		)
 
 		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
-		messages, iterBudgetWarned = maybeInjectIterationBudgetWarning(ctx, i, a.maxToolIterations, messages, iterBudgetWarned)
+		messages, iterBudgetWarned = maybeInjectIterationBudgetWarning(ctx, i, a.toolIterationLimit(), messages, iterBudgetWarned)
 
 		// Hook: BeforeModelCall
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
@@ -2458,7 +2692,10 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		if a.provider == nil {
 			slog.Error("agent has no provider configured", "agent", a.name, "model", a.model)
 			noProviderMsg := "Agent is not configured with a usable LLM provider. Check that cfg.Providers contains the prefix referenced by model `" + a.model + "`."
-			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": noProviderMsg}})
+			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{
+				"code":    chatErrorCodeLLMProviderNotConfigured,
+				"message": noProviderMsg,
+			}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			return noProviderMsg
 		}
@@ -2494,6 +2731,11 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 					allFailedRounds,
 				),
 			})
+		} else if totalFailedCalls >= maxFailedToolCallsPerTurn {
+			slog.Warn("disabling tools after too many failed calls this turn",
+				"agent", a.name, "failed_calls", totalFailedCalls)
+			callTools = nil
+			llmMessages = append(llmMessages, failedCallsBudgetMessage(totalFailedCalls))
 		}
 		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
 		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
@@ -2516,34 +2758,39 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			}
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			fallback := buildFallbackReply(err, replyParts, streakState.lastFailedTool, streakState.lastFailureText)
+			a.recordTurnFailure(sess, fallback)
 			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			return fallback
 		}
-		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
+
+		// A reply cut off at the output limit (typically one huge tool
+		// call) is dropped and the model asked again to work in smaller
+		// pieces, instead of running half-written arguments or ending
+		// the turn on an empty reply.
+		if cutOffAtOutputLimit(resp) && outputLimitRetries < maxOutputLimitRetries {
+			outputLimitRetries++
+			slog.Warn("model reply cut off at the output limit — retrying",
+				"agent", a.name, "max_tokens", a.maxTokens, "tool_calls", len(resp.ToolCalls), "retry", outputLimitRetries)
+			messages = append(messages, outputLimitMessage(a.maxTokens))
+			i-- // the dropped reply doesn't use up a tool round
+			continue
+		}
 
 		if !resp.HasToolCalls() {
 			if strings.TrimSpace(resp.Content) == "" {
 				emptyMsg := "model returned an empty response"
+				if resp.Truncated {
+					emptyMsg = "the model's reply was cut off at its output limit before it produced anything usable"
+				}
+				a.recordTurnFailure(sess, emptyMsg)
 				emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": emptyMsg}})
 				emitEvent(ctx, ChatEvent{Type: "done"})
 				return emptyMsg
 			}
 			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
-
-			// Reconcile the checklist BEFORE the answer is emitted — once
-			// the user has read "all done", a corrected todo panel is just
-			// a second contradiction. Firing once per turn bounds this to
-			// one extra round and cannot loop.
-			if !todoReconciled {
-				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
-					todoReconciled = true
-					messages = append(messages, asst, todoReconcileNudge(pending))
-					continue
-				}
-				todoReconciled = true
-			}
 
 			sess.Append(asst)
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content, "metadata": knowledgeMeta}})
@@ -2686,11 +2933,17 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		// as a 4xx/5xx HTTP error or executor error? Tracked here so
 		// the next iteration can decide whether to drop tools.
 		roundAllFailed := len(results) > 0
+		// A tool that put a card in front of the person (connectors) ends
+		// the turn after this round: nothing the model could add now is
+		// true yet. A model once carried on after such a card and claimed
+		// a change that never ran.
+		endTurn := false
 		// Process results
 		for idx, r := range results {
 			totalToolCalls++
 			tc := resp.ToolCalls[idx]
 			resultContent, meta := extractToolMeta(r.result)
+			resultContent = capToolResult(resultContent, a.registry.HostWorkDir(), tc.ID)
 
 			// Hook: AfterToolCall
 			a.hooks.Run(ctx, &HookContext{
@@ -2727,6 +2980,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 					summary = firstNonEmptyLine(resultContent)
 				}
 				a.registry.RecordToolFailure(r.toolName, tc.Function.Arguments, summary)
+				totalFailedCalls++
 				// Same-tool-fail-streak tracking (P0.1): counts
 				// consecutive failures of THIS tool regardless of
 				// arguments, independent of roundAllFailed (which
@@ -2750,6 +3004,10 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				a.sendMediaFiles(msg, mediaPaths)
 			}
 
+			if ends, _ := meta["endsTurn"].(bool); ends {
+				endTurn = true
+				delete(meta, "endsTurn")
+			}
 			toolMsg := provider.Message{
 				Role:       "tool",
 				Content:    resultContent,
@@ -2775,11 +3033,6 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				loopDetected = true
 			}
 		}
-		if loopDetected {
-			warnMsg := repeatedToolCallWarning("Loop detected: you called the same tool with the same arguments and received the same result 3 times. Please try a different approach.")
-			sess.Append(warnMsg)
-			messages = append(messages, warnMsg)
-		}
 		// Update consecutive-failed-rounds tally now that the whole
 		// round's results have been processed. A single non-failure
 		// resets it — the model just got useful info, give it room
@@ -2789,8 +3042,23 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		} else {
 			allFailedRounds = 0
 		}
+		if endTurn {
+			emitEvent(ctx, ChatEvent{Type: "done"})
+			a.runPostTurn(ctx, msg, messages, totalToolCalls, chatterMem)
+			return joinReplyParts(replyParts)
+		}
+		// First repetition only warns (polling a background job looks
+		// exactly like this); a repeat after the warning ends the turn.
 		if loopDetected {
-			break
+			if loopWarned {
+				stop.reason = stopReasonLoop
+				break
+			}
+			loopWarned = true
+			loopDetector.Reset()
+			warnMsg := repeatedToolCallWarning(loopWarningText)
+			sess.Append(warnMsg)
+			messages = append(messages, warnMsg)
 		}
 
 		// Steering: messages that arrived while this tool round ran are
@@ -2801,12 +3069,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		}
 	}
 
-	slog.Warn("max tool iterations reached — forcing final delivery", "agent", a.name, "max", a.maxToolIterations)
+	slog.Warn("tool loop cut off — forcing final delivery", "agent", a.name, "reason", stop.reason, "max", stop.limit)
 	// Forced final delivery: one more LLM call with tools disabled and a
 	// nudge that tells the model to synthesize what it has. Replaces the
 	// old behavior of just returning a canned warning, which left users
 	// with zero deliverable after a full iteration budget got burned.
-	finalMessages := append(messages, capReachedNudge(a.maxToolIterations))
+	finalMessages := append(messages, stop.nudge())
 	if a.piiScrubEnabled {
 		finalMessages = privacy.ScrubMessages(finalMessages)
 	}
@@ -2814,16 +3082,16 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	finalResp, finalErr := a.streamChatToResponseQuiet(ctx, finalMessages, nil)
 	if finalErr == nil {
 		finalContent = scrubLeakedToolCallContent(finalResp.Content)
-		a.meterTokens(ctx, sess.Key(), finalResp.Usage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, finalResp.Usage, 0)
 	}
 	if finalContent == "" {
 		// Synthesis call itself failed or returned empty — fall back to
 		// the canned line so the user still gets *something* with the
 		// badge attached.
-		finalContent = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
+		finalContent = stop.fallback()
 	}
-	finalContent += iterationCapNotice(msg.Channel, a.maxToolIterations)
-	capMeta := mergeMetadata(iterationCapMetadata(a.maxToolIterations), knowledgeMeta)
+	finalContent += stop.notice(msg.Channel)
+	capMeta := mergeMetadata(stop.metadata(), knowledgeMeta)
 	sess.Append(provider.Message{
 		Role:      "assistant",
 		Content:   finalContent,
@@ -2969,7 +3237,11 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	if chatterMem == nil {
 		chatterMem = a.memory
 	}
-	a.turnCount++
+	if a.turnCounter != nil {
+		a.turnCount = int(a.turnCounter.Add(1))
+	} else {
+		a.turnCount++
+	}
 
 	// Index user/assistant messages in FTS. Skip runtime-injected
 	// messages (e.g. goal_context continuations) — they're synthetic
@@ -3046,13 +3318,17 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 			model = a.model
 		}
 		slog.Info("auto-persist firing", "agent", a.name, "chatter", chatterUID, "model", model, "chatter_turns", chatterTurns, "messages", len(messages))
-		go AutoPersistMemory(ctx, chatterMem, a.provider, model, messages)
+		sessionKey := meterSessionFrom(ctx)
+		go AutoPersistMemory(detachCollector(ctx), chatterMem, a.provider, model, messages,
+			func(bctx context.Context, u provider.Usage, durationMs int64) {
+				a.meterTokens(bctx, sessionKey, model, u, durationMs)
+			})
 	}
 
 	// Skills learner
 	if a.skillsLearner != nil {
 		go func() {
-			if err := a.skillsLearner.MaybeExtract(ctx, messages, toolCallCount); err != nil {
+			if err := a.skillsLearner.MaybeExtract(detachCollector(ctx), messages, toolCallCount); err != nil {
 				slog.Debug("skills learner error", "error", err)
 			}
 		}()
@@ -3099,9 +3375,16 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		return provider.NewStreamReader(ch)
 	}
 
+	a = a.forkTurn()
+	a.applyTurnModel(ctx)
+
 	// Quota gate — mirrors the check in HandleMessage.
 	if rejection := a.checkQuota(ctx); rejection != "" {
 		return a.stringStream(rejection)
+	}
+	ctx, billingRejection := a.beginBillingTurn(ctx, msg)
+	if billingRejection != "" {
+		return a.stringStream(billingRejection)
 	}
 
 	chatterUID := a.chatterUserID(msg)
@@ -3114,6 +3397,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID, "user", chatterUID)
 	a.refreshSkillsFromStore(chatterUID)
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+	ctx = withMeterSession(ctx, sess.Key())
 	// Bind chatter onto sess so its ctx() embeds WithChatterUserID
 	// for DBStore session writes — Session.ctx() rebuilds ctx from its
 	// own fields, so the chatter has to live on sess itself.
@@ -3142,7 +3426,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 	chatterMem := a.memory.WithUserID(chatterUID)
-	systemPrompt := a.ctxBuilder.BuildSystemPromptAs(chatterUID, chatterMem)
+	systemPrompt := a.ctxBuilder.BuildTurnSystemPrompt(chatterUID, chatterMem, a.isTrustedTurn(msg), groupContextFromParams(msg.Params), a.registry.HostWorkDir())
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt, UserID: a.ownerUserID})
@@ -3151,12 +3435,16 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	// flatten + senderMetadata. Group msgs keep their `[SenderName]:`
 	// prefix (applied in buildUserMessage); DMs stay bare.
 	userMsg := buildUserMessage(msg)
+	applyInternalMessageMetadata(&userMsg, msg.Params)
 	sess.Append(userMsg)
 
 	sessionMsgs := sess.GetMessages()
 	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
+	}
+	if compactResult != nil && compactResult.Usage != nil {
+		a.meterTokens(ctx, sess.Key(), a.model, *compactResult.Usage, 0)
 	}
 	if compactResult != nil && compactResult.Pruned {
 		sess.ReplaceMessages(compactResult.Messages)
@@ -3172,10 +3460,10 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	// history (see buildTurnTailContext) instead of interleaved system
 	// messages, so the [system prompt + hints + history] prefix stays
 	// byte-stable for provider prompt caching.
-	messages = append(messages, withConversationGapContext(sessionMsgs)...)
+	messages = append(messages, withConversationGapContext(modelMessagesWithRecentImages(sessionMsgs))...)
 	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem)
 
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := withoutGroupSideChannels(a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode)), msg)
 
 	var loopDetector toolLoopDetector
 	totalToolCalls := 0
@@ -3189,12 +3477,15 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	turnStart := time.Now()
 	softDeadlineFired := false
 	iterBudgetWarned := false
-	todoReconciled := false
+
+	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit()}
+	loopWarned := false
+	totalFailedCalls := 0
 
 	// ReAct loop - use Chat for tool iterations
-	for i := 0; i < a.maxToolIterations; i++ {
+	for i := 0; i < a.toolIterationLimit(); i++ {
 		messages, softDeadlineFired = maybeInjectSoftDeadlineWarning(ctx, turnStart, messages, softDeadlineFired)
-		messages, iterBudgetWarned = maybeInjectIterationBudgetWarning(ctx, i, a.maxToolIterations, messages, iterBudgetWarned)
+		messages, iterBudgetWarned = maybeInjectIterationBudgetWarning(ctx, i, a.toolIterationLimit(), messages, iterBudgetWarned)
 
 		hcBefore := &HookContext{AgentName: a.name, Point: BeforeModelCall, Messages: messages, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID}
 		a.hooks.Run(ctx, hcBefore)
@@ -3216,6 +3507,11 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 					streakState.lastFailedTool, streakState.streak,
 				),
 			})
+		} else if totalFailedCalls >= maxFailedToolCallsPerTurn {
+			slog.Warn("disabling tools after too many failed calls this turn",
+				"agent", a.name, "failed_calls", totalFailedCalls)
+			callTools = nil
+			messages = append(messages, failedCallsBudgetMessage(totalFailedCalls))
 		}
 
 		dumpLLMRequest(a.name, a.model, messages, callTools)
@@ -3230,26 +3526,10 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			return a.stringStream(buildFallbackReply(err, nil, streakState.lastFailedTool, streakState.lastFailureText))
 		}
-		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
-			// Reconcile the checklist before re-issuing as a stream. This
-			// path decides tool-calls-or-not with a non-streaming call
-			// first, which is the last moment nothing has been sent to the
-			// user yet — and this is the path the web UI uses, where the
-			// todo panel the answer would contradict is actually rendered.
-			if !todoReconciled {
-				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
-					todoReconciled = true
-					messages = append(messages,
-						provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, RawAssistant: resp.RawAssistant},
-						todoReconcileNudge(pending))
-					continue
-				}
-				todoReconciled = true
-			}
-
 			// Final response - use streaming
 			sr, err := a.provider.ChatStream(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
 			if err != nil {
@@ -3303,7 +3583,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 						return
 					}
 				}
-				a.meterTokens(ctx, sess.Key(), streamUsage, 0)
+				a.meterTokens(ctx, sess.Key(), a.model, streamUsage, 0)
 				msg := provider.Message{Role: "assistant", Content: full.String(), Thinking: thinking, Metadata: knowledgeMeta}
 				switch {
 				case len(rawAssistant) > 0:
@@ -3360,6 +3640,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		for idx, r := range results {
 			tc := resp.ToolCalls[idx]
 			resultContent, meta := extractToolMeta(r.result)
+			resultContent = capToolResult(resultContent, a.registry.HostWorkDir(), tc.ID)
 			a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterToolCall, ToolName: r.toolName, ToolResult: resultContent, Error: r.err, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey(), IsPlanMode: isPlanMode(msg.Params), Source: msg.Source})
 
 			if r.err != nil {
@@ -3379,6 +3660,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 					summary = firstNonEmptyLine(resultContent)
 				}
 				streakState = updateSameToolFailStreak(streakState, r.toolName, true, summary)
+				totalFailedCalls++
 			} else {
 				streakState = updateSameToolFailStreak(streakState, r.toolName, false, "")
 			}
@@ -3396,18 +3678,23 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 				loopDetected = true
 			}
 		}
+		// First repetition only warns; a repeat after the warning ends
+		// the turn (see the HandleMessage loop).
 		if loopDetected {
-			warnMsg := repeatedToolCallWarning("Loop detected: you called the same tool with the same arguments and received the same result 3 times. Please try a different approach.")
+			if loopWarned {
+				stop.reason = stopReasonLoop
+				break
+			}
+			loopWarned = true
+			loopDetector.Reset()
+			warnMsg := repeatedToolCallWarning(loopWarningText)
 			sess.Append(warnMsg)
 			messages = append(messages, warnMsg)
 		}
-		if loopDetected {
-			break
-		}
 	}
 
-	slog.Warn("max tool iterations reached — streaming forced final delivery", "agent", a.name, "max", a.maxToolIterations)
-	return a.streamFinalDeliveryAfterCap(ctx, msg, messages, sess, totalToolCalls, chatterMem)
+	slog.Warn("tool loop cut off — streaming forced final delivery", "agent", a.name, "reason", stop.reason, "max", stop.limit)
+	return a.streamFinalDeliveryAfterCap(ctx, msg, messages, sess, totalToolCalls, chatterMem, stop)
 }
 
 // streamFinalDeliveryAfterCap runs one extra ChatStream with tools
@@ -3415,15 +3702,14 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 // with iteration-cap metadata so the chat UI can badge the bubble.
 // Returned StreamReader matches the contract of the normal "final
 // response" branch above so callers don't need a special case.
-func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.InboundMessage, messages []provider.Message, sess *session.Session, toolCallCount int, chatterMem *Memory) *provider.StreamReader {
-	capMeta := mergeMetadata(iterationCapMetadata(a.maxToolIterations), knowledgeMetadata(extractKnowledgeCitationSources(firstSystemContent(messages))))
-	finalMessages := append(messages, capReachedNudge(a.maxToolIterations))
+func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.InboundMessage, messages []provider.Message, sess *session.Session, toolCallCount int, chatterMem *Memory, stop turnStop) *provider.StreamReader {
+	capMeta := mergeMetadata(stop.metadata(), knowledgeMetadata(extractKnowledgeCitationSources(firstSystemContent(messages))))
+	finalMessages := append(messages, stop.nudge())
 	sr, err := a.provider.ChatStream(ctx, finalMessages, nil, a.model, a.maxTokens, a.temperature)
 	if err != nil {
 		// Streaming endpoint failed — persist+emit a fallback line
 		// with the badge so the user still gets the signal.
-		fallback := fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations) +
-			iterationCapNotice(inboundMsg.Channel, a.maxToolIterations)
+		fallback := stop.fallback() + stop.notice(inboundMsg.Channel)
 		fallbackMsg := provider.Message{Role: "assistant", Content: fallback, Metadata: capMeta, Timestamp: time.Now().UnixMilli()}
 		sess.Append(fallbackMsg)
 		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": fallback, "metadata": capMeta}})
@@ -3466,16 +3752,16 @@ func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.
 				return
 			}
 		}
-		a.meterTokens(ctx, sess.Key(), streamUsage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, streamUsage, 0)
 		content := full.String()
 		if content == "" {
-			content = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
+			content = stop.fallback()
 		}
 		// Emit the truncation notice as a trailing chunk too, not just in
 		// the persisted message: a streaming consumer renders what it
 		// received, so a notice added only to the stored copy would never
 		// reach the person actually reading the reply.
-		if notice := iterationCapNotice(inboundMsg.Channel, a.maxToolIterations); notice != "" {
+		if notice := stop.notice(inboundMsg.Channel); notice != "" {
 			content += notice
 			select {
 			case outCh <- provider.StreamChunk{Content: notice}:
@@ -3526,6 +3812,13 @@ func extractToolMeta(result string) (string, map[string]any) {
 	if strings.HasPrefix(result, tools.MetaSandboxPrefix) {
 		return strings.TrimPrefix(result, tools.MetaSandboxPrefix), map[string]any{"sandbox": true}
 	}
+	if rest, ok := strings.CutPrefix(result, tools.MetaJSONPrefix); ok {
+		line, text, _ := strings.Cut(rest, "\n")
+		var meta map[string]any
+		if json.Unmarshal([]byte(line), &meta) == nil {
+			return text, meta
+		}
+	}
 	return result, nil
 }
 
@@ -3552,6 +3845,73 @@ func capReachedNudge(maxIterations int) provider.Message {
 		),
 	}
 }
+
+// Why a turn's tool loop ended without the model finishing on its own.
+const (
+	stopReasonCap  = "cap"  // used the whole tool-round budget
+	stopReasonLoop = "loop" // kept repeating an identical call after a warning
+)
+
+// maxFailedToolCallsPerTurn caps error retries across the whole turn.
+// The consecutive-failure guards (sameToolFailStreakLimit,
+// failedRoundsLimit) miss a model that alternates a failing call with
+// unrelated successful ones; once this many calls have failed in total,
+// tools are dropped and the model must answer with what it has.
+// Successful calls never count against any budget except the backstop
+// ceiling.
+const maxFailedToolCallsPerTurn = 10
+
+// turnStop records why a turn's tool loop was cut off, so the forced
+// final delivery tells the user (and the model) what actually happened
+// instead of always blaming the iteration budget.
+type turnStop struct {
+	reason string
+	limit  int
+}
+
+func (t turnStop) nudge() provider.Message {
+	if t.reason == stopReasonLoop {
+		return provider.Message{
+			Role: "system",
+			Content: "You kept repeating the same tool call with the same arguments and got the same result, even after being warned, so the turn was stopped. " +
+				"Tools are now disabled for this final response — do not attempt to call any. " +
+				"Tell the user plainly where things stand: what you did, what you were waiting on or retrying, and that it had not changed. " +
+				"Report ONLY what tool results actually showed; do not claim a step finished unless a result confirms it. " +
+				"If something is still running in the background, say so and tell the user they can ask you to check again.",
+		}
+	}
+	return capReachedNudge(t.limit)
+}
+
+func (t turnStop) notice(channel string) string {
+	if t.reason == stopReasonLoop {
+		if channel == "web" {
+			return ""
+		}
+		return "\n\n---\n⚠️ This turn was stopped because the same step kept returning the same result — the answer above may be incomplete. Reply to continue."
+	}
+	return iterationCapNotice(channel, t.limit)
+}
+
+func (t turnStop) metadata() map[string]any {
+	m := iterationCapMetadata(t.limit)
+	m["iterationStopReason"] = t.reason
+	return m
+}
+
+func (t turnStop) fallback() string {
+	if t.reason == stopReasonLoop {
+		return "I stopped because the same step kept returning the same result and couldn't synthesize a final response. The work above is what I gathered so far."
+	}
+	return fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", t.limit)
+}
+
+// loopWarningText is injected the first time identical-call repetition is
+// detected. The detector is then reset; repeating three more times ends
+// the turn (stopReasonLoop).
+const loopWarningText = "Loop detected: you called the same tool with the same arguments and received the same result 3 times. " +
+	"If you are waiting on something that runs in the background, wait before checking again (e.g. a sleep in the same command) " +
+	"instead of re-polling immediately; otherwise try a different approach. Repeating the identical call again will end this turn."
 
 // iterationCapNotice is the in-band truncation marker for channels that
 // cannot render the iterationCapReached badge.
@@ -3695,12 +4055,36 @@ var chatbotBuiltinAllowlist = []string{
 	// extension mechanism — without exec the chatbot can't run them.
 	"exec",
 	"load_skill",
+	// message_agent: "ask 小微 to …" from a chat persona. It reaches only
+	// agents the space may reach (the owner's own; for a product's end
+	// user, the agents the product marked for them), so a chatbot with
+	// nothing reachable just gets an error listing none.
+	"message_agent",
 }
 
 // builtinAllowForMode returns the built-in tool name allowlist for the
 // given prompt mode. Plugin / MCP tools are always included regardless
 // — see Registry.DefinitionsForMode. nil means "all built-ins";
 // []string{} means "no built-ins"; a non-empty slice means "only these".
+// withoutGroupSideChannels drops the sending tools from a group-chat
+// turn. There, public text and [[private:…]] blocks are the only delivery
+// channels; `message` and `message_agent` would side-step the group's
+// privacy and scheduling (and `message` reported success for a made-up
+// "group" target).
+func withoutGroupSideChannels(defs []provider.Tool, msg bus.InboundMessage) []provider.Tool {
+	if _, group := msg.Params["__fastclawGroupChat"]; !group {
+		return defs
+	}
+	kept := defs[:0:0]
+	for _, def := range defs {
+		if def.Function.Name == "message" || def.Function.Name == "message_agent" {
+			continue
+		}
+		kept = append(kept, def)
+	}
+	return kept
+}
+
 func builtinAllowForMode(mode string) []string {
 	switch mode {
 	case config.PromptModeChatbot:
@@ -3795,6 +4179,7 @@ func formatConversationGap(gap time.Duration) string {
 // UpdateConfig updates the agent's runtime config (model, temperature, etc.)
 func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	a.model = rc.Model
+	a.providers = rc.Providers
 	a.maxTokens = rc.MaxTokens
 	a.temperature = rc.Temperature
 	a.maxToolIterations = rc.MaxToolIterations
@@ -3822,12 +4207,16 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	// hook is needed for the tool surface.
 	a.promptMode = rc.PromptMode
 	a.ctxBuilder.SetPromptMode(rc.PromptMode)
-	// Per-agent WeChat split-replies. Nil override = keep whatever the
-	// system layer initialized at boot (don't reset to false). Non-nil
-	// = authoritative for this agent.
-	if rc.SplitReplies != nil {
-		a.splitReplies = *rc.SplitReplies
-	}
+	// Per-agent split-replies. Nil override (never set, or reset from
+	// the dashboard) falls back to the default.
+	a.splitReplies = splitRepliesEnabled(rc.SplitReplies)
+}
+
+// splitRepliesEnabled resolves the per-agent multi-bubble override.
+// Chat replies default to short messenger-style bubbles; an agent only
+// sends single long messages when it explicitly opts out.
+func splitRepliesEnabled(override *bool) bool {
+	return override == nil || *override
 }
 
 // chatterUserID picks the per-message chatter identity, falling back
@@ -3876,7 +4265,8 @@ func (a *Agent) refreshSkillsFromStore(userID string) {
 	}
 	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.homePath, "", a.skillsCfg, a.globalSkillsCfg).
 		WithObjectStore(a.workspaceStore, a.agentID).
-		WithUserID(userID)
+		WithUserID(userID).
+		WithSandbox(buildinfo.IsSandboxEnforced())
 	skills := loader.LoadSkills()
 	summary := loader.BuildSkillsSummary(skills)
 	a.ctxBuilder.SetSkillsSummary(summary)
@@ -3908,16 +4298,27 @@ func (a *Agent) ReloadWorkspaceFiles() {
 	// from object storage so skills uploaded on another replica (or
 	// post-boot on this one) become visible.
 	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.homePath, "", a.skillsCfg, a.globalSkillsCfg).
-		WithUserID(a.ownerUserID)
+		WithUserID(a.ownerUserID).
+		WithSandbox(buildinfo.IsSandboxEnforced())
 	if a.workspaceStore != nil {
 		loader.WithObjectStore(a.workspaceStore, a.agentID)
 	}
 	skills := loader.LoadSkills()
 	skillsSummary := loader.BuildSkillsSummary(skills)
 	tools.RegisterLoadSkill(a.registry, loader.AllSkillDirs())
+	prev := a.ctxBuilder
 	a.ctxBuilder = NewContextBuilder(a.homePath, a.memory, skillsSummary)
 	a.ctxBuilder.SetWorkspace(a.workspacePath)
 	a.ctxBuilder.SetPromptMode(a.promptMode)
+	// Carry the thinking level and sandbox mode over: they come from the
+	// agent's config, not its files, and a reload (e.g. after importing
+	// an agent archive) must not make the prompt describe host paths.
+	if prev != nil {
+		a.ctxBuilder.thinking = prev.thinking
+		a.ctxBuilder.sandboxEnabled = prev.sandboxEnabled
+		a.ctxBuilder.sandboxOptional = prev.sandboxOptional
+		a.ctxBuilder.sandboxBackend = prev.sandboxBackend
+	}
 	a.ctxBuilder.SetDisplayName(a.displayName)
 	// Preserve Store-backed identity reads across reload; without this,
 	// Postgres-mode pods silently fall back to pod-local filesystem.

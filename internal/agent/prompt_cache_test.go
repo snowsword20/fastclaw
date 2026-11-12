@@ -26,9 +26,9 @@ func TestSystemPromptStableAcrossTime(t *testing.T) {
 	cb := newChatbotBuilder(store)
 	chatterMem := cb.memory.WithUserID(chatterUID)
 
-	first := cb.BuildSystemPromptAs(chatterUID, chatterMem)
+	first := cb.BuildSystemPromptAs(chatterUID, chatterMem, false)
 	// Different wall-clock moments must not change a single byte.
-	second := cb.BuildSystemPromptAs(chatterUID, cb.memory.WithUserID(chatterUID))
+	second := cb.BuildSystemPromptAs(chatterUID, cb.memory.WithUserID(chatterUID), false)
 
 	if first != second {
 		t.Fatalf("system prompt differs between two builds at different times — prefix cache would miss every turn.\nfirst bytes=%d second bytes=%d", len(first), len(second))
@@ -46,8 +46,8 @@ func TestAgentModeSystemPromptStableAcrossTime(t *testing.T) {
 	cb := newChatbotBuilder(store)
 	cb.SetPromptMode("") // resolves to agent mode
 
-	first := cb.BuildSystemPromptAs(chatterUID, cb.memory.WithUserID(chatterUID))
-	second := cb.BuildSystemPromptAs(chatterUID, cb.memory.WithUserID(chatterUID))
+	first := cb.BuildSystemPromptAs(chatterUID, cb.memory.WithUserID(chatterUID), false)
+	second := cb.BuildSystemPromptAs(chatterUID, cb.memory.WithUserID(chatterUID), false)
 	if first != second {
 		t.Fatalf("agent-mode system prompt differs between builds at different times")
 	}

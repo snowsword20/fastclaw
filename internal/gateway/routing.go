@@ -40,10 +40,12 @@ func (g *Gateway) processInbound(ctx context.Context) {
 		case msg := <-g.bus.InboundConsumer():
 			ownerID := msg.OwnerUserID
 			var sharedIdentity bool
+			var channel *store.ChannelRecord
 			if ownerID == "" {
 				info := g.resolveChannelOwner(ctx, msg)
 				ownerID = info.ownerID
 				sharedIdentity = info.sharedIdentity
+				channel = info.channel
 			}
 			if ownerID == "" {
 				slog.Warn("dropping inbound: cannot resolve owner",
@@ -63,6 +65,20 @@ func (g *Gateway) processInbound(ctx context.Context) {
 					"message_id", msg.MessageID, "peer_kind", msg.PeerKind,
 					"account", msg.AccountID)
 				continue
+			}
+
+			// Pairing gate for IM channels (see pairing.go). Runs while
+			// msg.UserID is still the raw platform sender id.
+			if channel != nil {
+				fromOwner, handled := g.gatePairing(ctx, msg, channel)
+				if handled {
+					continue
+				}
+				msg.FromChannelOwner = fromOwner
+				// Shared identity merges the owner's own channels into one
+				// session/memory; it must not hand that session to anyone
+				// else who messages the bot.
+				sharedIdentity = sharedIdentity && fromOwner
 			}
 
 			// When shared_identity is enabled on the channel, the owner
@@ -99,6 +115,9 @@ func (g *Gateway) processInbound(ctx context.Context) {
 type channelOwnerInfo struct {
 	ownerID        string
 	sharedIdentity bool
+	// channel is the matched channels-table row; nil for legacy
+	// configs-table bindings, which predate pairing and stay ungated.
+	channel *store.ChannelRecord
 }
 
 // resolveChannelOwner looks up the channels table for the inbound's
@@ -111,7 +130,7 @@ func (g *Gateway) resolveChannelOwner(ctx context.Context, msg bus.InboundMessag
 	}
 	// Try the new channels table first.
 	if ch, err := g.store.LookupChannel(ctx, msg.Channel, msg.AccountID); err == nil && ch != nil {
-		info := channelOwnerInfo{sharedIdentity: ch.SharedIdentity}
+		info := channelOwnerInfo{sharedIdentity: ch.SharedIdentity, channel: ch}
 		if ch.UserID != "" {
 			info.ownerID = ch.UserID
 			return info
@@ -273,11 +292,20 @@ func groupSteerText(msg bus.InboundMessage) string {
 }
 
 func (g *Gateway) routeDM(ctx context.Context, msg bus.InboundMessage) {
+	// A 1/2/3 answering a running run_local_agent's permission request
+	// is consumed here, before any agent routing, queueing or steering.
+	if g.interceptToolApproval(ctx, msg) {
+		return
+	}
 	space, err := g.users.getOrLoad(ctx, msg.OwnerUserID)
 	if err != nil {
 		slog.Warn("user space load failed", "user", msg.OwnerUserID, "error", err)
 		return
 	}
+	if g.routeAgl(ctx, space, msg) {
+		return
+	}
+	msg.MachineUserID = g.machineUserFor(ctx, msg)
 	ag := g.matchAgent(ctx, space, msg)
 	if ag == nil {
 		slog.Warn("no agent matched for DM, dropping",
@@ -300,7 +328,11 @@ func (g *Gateway) routeGroup(ctx context.Context, msg bus.InboundMessage) {
 		slog.Warn("user space load failed", "user", msg.OwnerUserID, "error", err)
 		return
 	}
-	boundAgents := g.agentsBoundToMessage(ctx, space, msg)
+	boundAgents, aglRefused := g.withoutAglAgents(ctx, g.agentsBoundToMessage(ctx, space, msg))
+	if aglRefused && len(boundAgents) == 0 {
+		g.aglGroupRefusal(ctx, msg)
+		return
+	}
 	if len(boundAgents) == 0 {
 		slog.Warn("no agents bound for group message, dropping",
 			"user", msg.OwnerUserID, "chat_id", msg.ChatID)
@@ -374,6 +406,13 @@ func (g *Gateway) matchAgent(ctx context.Context, space *UserSpace, msg bus.Inbo
 		if ag := space.Agents.AgentByID(msg.AgentID); ag != nil {
 			return ag
 		}
+		// On-demand spaces don't preload every owned agent; attach the
+		// target now. Restricted to agents this account owns.
+		if err := space.EnsureOwnedAgent(ctx, g.store, g.bus, g.workspace, msg.AgentID); err == nil {
+			if ag := space.Agents.AgentByID(msg.AgentID); ag != nil {
+				return ag
+			}
+		}
 	}
 	bindings := space.Config.Bindings
 	if len(bindings) == 0 {
@@ -410,6 +449,20 @@ func (g *Gateway) ensureForeignAgent(ctx context.Context, space *UserSpace, agen
 		return nil
 	}
 	return space.EnsureAgent(ctx, g.store, g.bus, g.workspace, agentID)
+}
+
+// ownedAgent returns agentID from space, attaching it on demand when the
+// space's account owns it. Callers that got agentID from an untrusted
+// place (LLM tool calls, webhook paths) use this instead of EnsureAgent
+// so they can never pull in someone else's agent.
+func (g *Gateway) ownedAgent(ctx context.Context, space *UserSpace, agentID string) *agent.Agent {
+	if ag := space.Agents.AgentByID(agentID); ag != nil {
+		return ag
+	}
+	if err := space.EnsureOwnedAgent(ctx, g.store, g.bus, g.workspace, agentID); err != nil {
+		return nil
+	}
+	return space.Agents.AgentByID(agentID)
 }
 
 func matchBinding(m config.Match, msg bus.InboundMessage) bool {
@@ -569,7 +622,7 @@ func (s *gatewaySubAgentSpawner) SpawnSubAgent(ctx context.Context, agentID stri
 	if err != nil {
 		return fmt.Sprintf("Error: load user space: %v", err)
 	}
-	ag := space.Agents.AgentByID(agentID)
+	ag := s.gateway.ownedAgent(ctx, space, agentID)
 	if ag == nil {
 		return fmt.Sprintf("Error: agent %q not found", agentID)
 	}
@@ -592,7 +645,7 @@ func (h *webhookAgentHandler) HandleMessage(ctx context.Context, agentID string,
 	if err != nil {
 		return "", err
 	}
-	ag := space.Agents.AgentByID(agentID)
+	ag := h.gateway.ownedAgent(ctx, space, agentID)
 	if ag == nil {
 		return "", fmt.Errorf("agent %q not found for user %q", agentID, msg.OwnerUserID)
 	}

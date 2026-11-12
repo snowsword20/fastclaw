@@ -19,6 +19,15 @@ type EnvConfig struct {
 	Sandbox EnvSandbox
 	Redis   EnvRedis
 	Log     EnvLog
+	Connany EnvConnany
+}
+
+// EnvConnany points at the Connany connector service, which lets people
+// connect their own third-party accounts (internal/connectors). Both
+// unset = connectors off.
+type EnvConnany struct {
+	URL    string // FASTCLAW_CONNANY_URL     — e.g. https://connany.example (HTTP only on localhost)
+	APIKey string // FASTCLAW_CONNANY_API_KEY — the project key; server-side only
 }
 
 type EnvGateway struct {
@@ -42,14 +51,13 @@ type EnvRedis struct {
 }
 
 type EnvSandbox struct {
-	Enabled         bool   // FASTCLAW_SANDBOX_ENABLED
-	Backend         string // FASTCLAW_SANDBOX_BACKEND  — "docker", "e2b", or "boxlite"
-	Image           string // FASTCLAW_SANDBOX_IMAGE
-	E2BKey          string // E2B_API_KEY
-	BoxliteURL      string // FASTCLAW_SANDBOX_BOXLITE_URL — full base URL e.g. https://api.boxlite.ai/v1
-	BoxliteClientID string // FASTCLAW_SANDBOX_BOXLITE_CLIENT_ID — default "default"
-	BoxliteKey      string // BOXLITE_API_KEY — apikey sent as Authorization: Bearer
-	BoxlitePrefix   string // FASTCLAW_SANDBOX_BOXLITE_PREFIX — workspace prefix, default "default"
+	Enabled       bool   // FASTCLAW_SANDBOX_ENABLED
+	Backend       string // FASTCLAW_SANDBOX_BACKEND  — "docker", "e2b", or "boxlite"
+	Image         string // FASTCLAW_SANDBOX_IMAGE
+	E2BKey        string // E2B_API_KEY
+	BoxliteURL    string // FASTCLAW_SANDBOX_BOXLITE_URL — full base URL e.g. https://api.boxlite.ai/v1
+	BoxliteKey    string // BOXLITE_API_KEY — apikey sent as Authorization: Bearer
+	BoxlitePrefix string // FASTCLAW_SANDBOX_BOXLITE_PREFIX — path prefix for self-hosted servers; empty for BoxLite Cloud
 }
 
 type EnvLog struct {
@@ -126,15 +134,15 @@ func LoadEnv() *EnvConfig {
 	if v := os.Getenv("FASTCLAW_SANDBOX_BOXLITE_URL"); v != "" {
 		cfg.Sandbox.BoxliteURL = v
 	}
-	if v := os.Getenv("FASTCLAW_SANDBOX_BOXLITE_CLIENT_ID"); v != "" {
-		cfg.Sandbox.BoxliteClientID = v
-	}
 	if v := os.Getenv("BOXLITE_API_KEY"); v != "" {
 		cfg.Sandbox.BoxliteKey = v
 	}
 	if v := os.Getenv("FASTCLAW_SANDBOX_BOXLITE_PREFIX"); v != "" {
 		cfg.Sandbox.BoxlitePrefix = v
 	}
+
+	cfg.Connany.URL = os.Getenv("FASTCLAW_CONNANY_URL")
+	cfg.Connany.APIKey = os.Getenv("FASTCLAW_CONNANY_API_KEY")
 
 	if v := os.Getenv("FASTCLAW_LOG_LEVEL"); v != "" {
 		cfg.Log.Level = v
@@ -223,6 +231,7 @@ func ScrubBootSecrets() {
 		"FASTCLAW_OBJECT_STORE_USESSL",
 		"FASTCLAW_OBJECT_STORE_ALIYUN_INTERNAL",
 		"FASTCLAW_REDIS_PASSWORD",
+		"FASTCLAW_CONNANY_API_KEY",
 		"BOXLITE_API_KEY",
 		"E2B_API_KEY",
 	}
@@ -263,9 +272,6 @@ func (e *EnvConfig) ApplyToConfig(cfg *Config) {
 		}
 		if e.Sandbox.BoxliteURL != "" {
 			cfg.Sandbox.BoxliteURL = e.Sandbox.BoxliteURL
-		}
-		if e.Sandbox.BoxliteClientID != "" {
-			cfg.Sandbox.BoxliteClientID = e.Sandbox.BoxliteClientID
 		}
 		if e.Sandbox.BoxliteKey != "" {
 			cfg.Sandbox.BoxliteKey = e.Sandbox.BoxliteKey

@@ -18,6 +18,10 @@ const (
 	PruneTurnAge = 20
 	// truncatedPlaceholder replaces pruned tool results.
 	truncatedPlaceholder = "[Result truncated - see memory logs]"
+	// estimatedInlineImageTokens is a deliberately conservative fixed cost.
+	// Exact vision accounting depends on provider-side tiling and dimensions,
+	// but counting images as zero lets multimodal sessions evade compaction.
+	estimatedInlineImageTokens = 1500
 )
 
 // EstimateTokens provides a rough token estimate: chars/4.
@@ -25,6 +29,14 @@ func EstimateTokens(messages []provider.Message) int {
 	total := 0
 	for _, m := range messages {
 		total += len(m.Content) / 4
+		for _, part := range m.ContentParts {
+			switch part.Type {
+			case "text":
+				total += len(part.Text) / 4
+			case "image_url":
+				total += estimatedInlineImageTokens
+			}
+		}
 		for _, tc := range m.ToolCalls {
 			total += len(tc.Function.Arguments) / 4
 			total += len(tc.Function.Name) / 4
@@ -38,6 +50,9 @@ type CompactResult struct {
 	Messages []provider.Message
 	Pruned   bool
 	LogFile  string
+	// Usage is the summarization call's usage when one ran (nil
+	// otherwise) — the caller meters it against the turn.
+	Usage *provider.Usage
 }
 
 // CompactMessages prunes and optionally compresses the message history when it exceeds the token threshold.
@@ -73,13 +88,14 @@ func CompactMessages(messages []provider.Message, workspace string, prov provide
 	}
 
 	// Step 2: Compression - summarize older messages
-	compressed, err := compressOlderMessages(pruned, prov, model)
+	compressed, summaryUsage, err := compressOlderMessages(pruned, prov, model)
 	if err != nil {
 		slog.Warn("compression failed, using pruned messages", "error", err)
 		return &CompactResult{
 			Messages: pruned,
 			Pruned:   true,
 			LogFile:  logFile,
+			Usage:    summaryUsage,
 		}, nil
 	}
 
@@ -89,6 +105,7 @@ func CompactMessages(messages []provider.Message, workspace string, prov provide
 		Messages: compressed,
 		Pruned:   true,
 		LogFile:  logFile,
+		Usage:    summaryUsage,
 	}, nil
 }
 
@@ -145,9 +162,10 @@ func pruneOldToolResults(messages []provider.Message) []provider.Message {
 }
 
 // compressOlderMessages asks the LLM to summarize older messages into a compact summary.
-func compressOlderMessages(messages []provider.Message, prov provider.Provider, model string) ([]provider.Message, error) {
+// The returned usage is the summarization call's (nil when no call ran).
+func compressOlderMessages(messages []provider.Message, prov provider.Provider, model string) ([]provider.Message, *provider.Usage, error) {
 	if len(messages) <= PruneTurnAge {
-		return messages, nil
+		return messages, nil, nil
 	}
 
 	cutoff := safeCompactionCutoff(messages, len(messages)-PruneTurnAge)
@@ -167,7 +185,7 @@ func compressOlderMessages(messages []provider.Message, prov provider.Provider, 
 		if m.Origin != provider.OriginUser {
 			continue
 		}
-		text += fmt.Sprintf("[%s] %s\n", m.Role, m.Content)
+		text += fmt.Sprintf("[%s] %s\n", m.Role, m.TextContent())
 	}
 
 	summaryPrompt := []provider.Message{
@@ -183,8 +201,9 @@ func compressOlderMessages(messages []provider.Message, prov provider.Provider, 
 
 	resp, err := prov.Chat(nil, summaryPrompt, nil, model, 2048, 0.3)
 	if err != nil {
-		return nil, fmt.Errorf("summarize conversation: %w", err)
+		return nil, nil, fmt.Errorf("summarize conversation: %w", err)
 	}
+	summaryUsage := resp.Usage
 
 	// Build new message list: summary + recent messages
 	compressed := make([]provider.Message, 0, PruneTurnAge+1)
@@ -194,7 +213,7 @@ func compressOlderMessages(messages []provider.Message, prov provider.Provider, 
 	})
 	compressed = append(compressed, messages[cutoff:]...)
 
-	return compressed, nil
+	return compressed, &summaryUsage, nil
 }
 
 // writeHistoryLog writes the full message history to a JSONL log file.
