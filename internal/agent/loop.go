@@ -2008,6 +2008,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 		messages = privacy.ScrubMessages(messages)
 	}
 
+	llmStart := time.Now()
 	resp, err := a.streamChatToResponse(ctx, messages, nil)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -2020,7 +2021,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 		emitEvent(ctx, ChatEvent{Type: "done"})
 		return "Sorry, I couldn't draft the plan — the LLM call failed."
 	}
-	a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, 0)
+	a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, time.Since(llmStart).Milliseconds())
 
 	planMeta := mergeMetadata(map[string]any{"planMode": true}, knowledgeMeta)
 	sess.Append(provider.Message{
@@ -2737,10 +2738,11 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			callTools = nil
 			llmMessages = append(llmMessages, failedCallsBudgetMessage(totalFailedCalls))
 		}
-		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
-		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-			return a.streamChatToResponse(ctx, llmMessages, callTools)
-		})
+			dumpLLMRequest(a.name, a.model, llmMessages, callTools)
+			llmStart := time.Now()
+			resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+				return a.streamChatToResponse(ctx, llmMessages, callTools)
+			})
 
 		// Hook: AfterModelCall
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
@@ -2763,7 +2765,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			return fallback
 		}
-		a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, time.Since(llmStart).Milliseconds())
 		a.maybeRecoverToolCalls(resp)
 
 		// A reply cut off at the output limit (typically one huge tool
@@ -3079,10 +3081,11 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		finalMessages = privacy.ScrubMessages(finalMessages)
 	}
 	finalContent := ""
+	llmStart := time.Now()
 	finalResp, finalErr := a.streamChatToResponseQuiet(ctx, finalMessages, nil)
 	if finalErr == nil {
 		finalContent = scrubLeakedToolCallContent(finalResp.Content)
-		a.meterTokens(ctx, sess.Key(), a.model, finalResp.Usage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, finalResp.Usage, time.Since(llmStart).Milliseconds())
 	}
 	if finalContent == "" {
 		// Synthesis call itself failed or returned empty — fall back to
@@ -3514,10 +3517,11 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			messages = append(messages, failedCallsBudgetMessage(totalFailedCalls))
 		}
 
-		dumpLLMRequest(a.name, a.model, messages, callTools)
-		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-			return a.provider.Chat(ctx, messages, callTools, a.model, a.maxTokens, a.temperature)
-		})
+			dumpLLMRequest(a.name, a.model, messages, callTools)
+			llmStart := time.Now()
+			resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+				return a.provider.Chat(ctx, messages, callTools, a.model, a.maxTokens, a.temperature)
+			})
 
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
 		a.hooks.Run(ctx, hcAfter)
@@ -3526,11 +3530,12 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			return a.stringStream(buildFallbackReply(err, nil, streakState.lastFailedTool, streakState.lastFailureText))
 		}
-		a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, time.Since(llmStart).Milliseconds())
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
 			// Final response - use streaming
+			llmStart := time.Now()
 			sr, err := a.provider.ChatStream(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
 			if err != nil {
 				slog.Error("LLM stream failed, falling back", "agent", a.name, "error", err)
@@ -3583,7 +3588,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 						return
 					}
 				}
-				a.meterTokens(ctx, sess.Key(), a.model, streamUsage, 0)
+				a.meterTokens(ctx, sess.Key(), a.model, streamUsage, time.Since(llmStart).Milliseconds())
 				msg := provider.Message{Role: "assistant", Content: full.String(), Thinking: thinking, Metadata: knowledgeMeta}
 				switch {
 				case len(rawAssistant) > 0:
@@ -3705,6 +3710,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.InboundMessage, messages []provider.Message, sess *session.Session, toolCallCount int, chatterMem *Memory, stop turnStop) *provider.StreamReader {
 	capMeta := mergeMetadata(stop.metadata(), knowledgeMetadata(extractKnowledgeCitationSources(firstSystemContent(messages))))
 	finalMessages := append(messages, stop.nudge())
+	llmStart := time.Now()
 	sr, err := a.provider.ChatStream(ctx, finalMessages, nil, a.model, a.maxTokens, a.temperature)
 	if err != nil {
 		// Streaming endpoint failed — persist+emit a fallback line
@@ -3752,7 +3758,7 @@ func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.
 				return
 			}
 		}
-		a.meterTokens(ctx, sess.Key(), a.model, streamUsage, 0)
+		a.meterTokens(ctx, sess.Key(), a.model, streamUsage, time.Since(llmStart).Milliseconds())
 		content := full.String()
 		if content == "" {
 			content = stop.fallback()
