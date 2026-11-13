@@ -164,6 +164,11 @@ interface ChatMessage {
   id: string;
   role: "user" | "agent" | "tool-group";
   content: string;
+  // Model's reasoning text (anthropic extended thinking). Persisted on
+  // the assistant message server-side and rendered as a collapsible
+  // block above the answer — live via thinking/thinking_delta events,
+  // after refresh via ChatHistoryMessage.thinking.
+  thinking?: string;
   timestamp: number;
   toolCalls?: { id: string; name: string; arguments: string; result?: string; metadata?: ToolResultMetadata }[];
   // Private message this reply answers (another agent's request) or
@@ -509,7 +514,7 @@ function buildChatMessages(history: ChatHistoryMessage[], historyOffset = 0): Ch
       // server-side may still carry it.
       const preContent = stripLeakedToolMarkup(h.content || "");
       if (preContent) {
-        msgs.push({ id: `h-pre-${historyId(i)}`, role: "agent", content: preContent, timestamp: 0, metadata: h.metadata });
+        msgs.push({ id: `h-pre-${historyId(i)}`, role: "agent", content: preContent, thinking: h.thinking, timestamp: 0, metadata: h.metadata });
       }
       msgs.push({
         id: `h-tool-${historyId(i)}`,
@@ -530,11 +535,11 @@ function buildChatMessages(history: ChatHistoryMessage[], historyOffset = 0): Ch
         history[i].content &&
         !(history[i].toolCalls && history[i].toolCalls!.length > 0)
       ) {
-        msgs.push({ id: `h-${historyId(i)}`, role: "agent", content: stripLeakedToolMarkup(history[i].content || ""), timestamp: 0, metadata: history[i].metadata });
+        msgs.push({ id: `h-${historyId(i)}`, role: "agent", content: stripLeakedToolMarkup(history[i].content || ""), thinking: history[i].thinking, timestamp: 0, metadata: history[i].metadata });
         i++;
       }
     } else if (h.role === "assistant") {
-      msgs.push({ id: `h-${historyId(i)}`, role: "agent", content: stripLeakedToolMarkup(h.content || ""), timestamp: 0, metadata: h.metadata });
+      msgs.push({ id: `h-${historyId(i)}`, role: "agent", content: stripLeakedToolMarkup(h.content || ""), thinking: h.thinking, timestamp: 0, metadata: h.metadata });
       i++;
     } else {
       i++; // skip unexpected
@@ -1277,6 +1282,38 @@ export function ChatScreen() {
               transientBubbleIdRef.current = null;
               scopedMessages((prev) => prev.filter((message) => message.id !== id));
             }
+            break;
+          }
+          case "thinking_delta": {
+            // 与 POST 通道同逻辑：思考增量累积到 delta 气泡的 thinking
+            // 字段，渲染为可折叠"思考过程"块；没有气泡就先建空占位。
+            const delta = data.data?.delta;
+            if (!delta) break;
+            setToolRoundStatus(null);
+            if (!deltaBubbleId) deltaBubbleId = `resume-delta-${crypto.randomUUID()}`;
+            const tid = deltaBubbleId;
+            transientBubbleIdRef.current = tid;
+            scopedMessages((prev) => {
+              if (generation !== viewGenerationRef.current) return prev;
+              const index = prev.findIndex((message) => message.id === tid);
+              if (index < 0) return [...prev, { id: tid, role: "agent" as const, content: "", thinking: delta, timestamp: Date.now() }];
+              return prev.map((message) => message.id === tid ? { ...message, thinking: (message.thinking || "") + delta } : message);
+            });
+            break;
+          }
+          case "thinking": {
+            // 每轮模型调用完成后的全量思考文本（权威版），覆盖累积值。
+            const text = data.data?.content || "";
+            if (!text) break;
+            if (!deltaBubbleId) deltaBubbleId = `resume-delta-${crypto.randomUUID()}`;
+            const fid = deltaBubbleId;
+            transientBubbleIdRef.current = fid;
+            scopedMessages((prev) => {
+              if (generation !== viewGenerationRef.current) return prev;
+              const index = prev.findIndex((message) => message.id === fid);
+              if (index < 0) return [...prev, { id: fid, role: "agent" as const, content: "", thinking: text, timestamp: Date.now() }];
+              return prev.map((message) => message.id === fid ? { ...message, thinking: text } : message);
+            });
             break;
           }
           case "content_delta": {
@@ -2232,6 +2269,39 @@ export function ChatScreen() {
               curContent = "";
               setMessages((prev) => prev.filter((m) => m.id !== id));
             }
+            break;
+          }
+          case "thinking_delta": {
+            // 模型思考过程的增量：累积到流式气泡的 thinking 字段，
+            // 渲染为答案上方的可折叠"思考过程"块。没有气泡就先建
+            // 一个空内容气泡占位，后续 content_delta 继续写它。
+            const delta = evt.data?.delta || "";
+            if (!delta) break;
+            if (!streamingMsgIdRef.current) {
+              const id = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+              streamingMsgIdRef.current = id;
+              streamRaw = "";
+              setMessages((prev) => [...prev, { id, role: "agent", content: "", thinking: delta, timestamp: Date.now() }]);
+              break;
+            }
+            const id = streamingMsgIdRef.current;
+            setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, thinking: (m.thinking || "") + delta } : m)));
+            break;
+          }
+          case "thinking": {
+            // 每轮模型调用完成后的全量思考文本（权威版）：直接覆盖
+            // 累积值，防止分片丢失导致的不完整。
+            const text = evt.data?.content || "";
+            if (!text) break;
+            if (!streamingMsgIdRef.current) {
+              const id = `a-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+              streamingMsgIdRef.current = id;
+              streamRaw = "";
+              setMessages((prev) => [...prev, { id, role: "agent", content: "", thinking: text, timestamp: Date.now() }]);
+              break;
+            }
+            const id = streamingMsgIdRef.current;
+            setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, thinking: text } : m)));
             break;
           }
           case "content_delta": {
@@ -3193,6 +3263,16 @@ export function ChatScreen() {
                           </div>
                         ) : null;
                       })()}
+                      {msg.thinking && (
+                        <details className="group mb-2 rounded-lg border bg-muted/40">
+                          <summary className="cursor-pointer select-none px-3 py-1.5 text-xs text-muted-foreground">
+                            {tr("Thinking process", "思考过程")}
+                          </summary>
+                          <div className="max-h-64 overflow-y-auto whitespace-pre-wrap border-t px-3 py-2 text-xs leading-relaxed text-muted-foreground">
+                            {msg.thinking}
+                          </div>
+                        </details>
+                      )}
                       {msg.content && (
                         renderContentWithDataImages(
                           msg.content,

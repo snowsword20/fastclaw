@@ -857,6 +857,9 @@ export async function getAgentKnowledgeFile(
 export interface ChatHistoryMessage {
   role: "user" | "assistant" | "tool";
   content?: string;
+  // Model's reasoning text (anthropic extended thinking) persisted on
+  // the assistant message; rendered as a collapsible block on reload.
+  thinking?: string;
   toolCalls?: { id: string; name: string; arguments: string }[];
   name?: string;
   toolCallId?: string;
@@ -1191,6 +1194,8 @@ export interface ChatStreamEvent {
     | "content"
     | "content_delta"
     | "stream_reset"
+    | "thinking"
+    | "thinking_delta"
     | "tool_call"
     | "tool_result"
     | "steer"

@@ -1216,6 +1216,12 @@ func webHistoryEntries(msgs []provider.Message) []map[string]any {
 				}
 				entry["toolCalls"] = calls
 			}
+			// Persisted model reasoning (anthropic extended thinking):
+			// 2026-11 thinking 流式的配套——不透传这个字段，网页刷新后
+			// 思考过程就只剩实时气泡、历史里消失。
+			if m.Thinking != "" {
+				entry["thinking"] = m.Thinking
+			}
 			// Surface persisted assistant-side metadata so the UI can
 			// re-render iteration-cap badges, etc. on history reload —
 			// without this, the badge only ever showed on the live turn.
