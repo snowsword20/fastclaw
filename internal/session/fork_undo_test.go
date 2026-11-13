@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -132,6 +133,52 @@ func TestForkSession_BranchAndBack(t *testing.T) {
 	// 栈空后 back 失败
 	if _, ok := m.SwitchBackSession("web", "", chatID); ok {
 		t.Fatal("back on empty stack should fail")
+	}
+}
+
+func TestForkSessionKeepFirst_BranchFromMiddle(t *testing.T) {
+	m := NewManager(t.TempDir())
+	const chatID = "chat-keepfirst"
+	s := m.Get("web", "", chatID, "")
+	// 5 条消息：user/assistant 交替
+	for i := 0; i < 5; i++ {
+		role := "user"
+		if i%2 == 1 {
+			role = "assistant"
+		}
+		s.Append(msg(role, fmt.Sprintf("m%d", i)))
+	}
+
+	// 保留前 3 条分叉（"从第 2 条回答分叉"）
+	forkKey, err := m.ForkSessionKeepFirst("web", "", chatID, 3)
+	if err != nil {
+		t.Fatalf("ForkSessionKeepFirst: %v", err)
+	}
+	fork := m.Get("web", "", chatID, "")
+	if fork.SessionKey() != forkKey {
+		t.Fatalf("Get should resolve to fork, got %q", fork.SessionKey())
+	}
+	if got := len(fork.GetMessages()); got != 3 {
+		t.Fatalf("fork should keep first 3 messages, got %d", got)
+	}
+	if last := fork.GetMessages()[2].Content; last != "m2" {
+		t.Fatalf("fork last message should be m2, got %q", last)
+	}
+	// 原线不受影响
+	if got := len(s.GetMessages()); got != 5 {
+		t.Fatalf("original line must stay 5 msgs, got %d", got)
+	}
+	// 越界 keepFirst = 全量。先切回原线（此刻活跃线是上面的分叉，
+	// 直接分叉会对着 3 条的分支做）
+	if _, ok := m.SwitchBackSession("web", "", chatID); !ok {
+		t.Fatal("switch back should succeed")
+	}
+	full, err := m.ForkSessionKeepFirst("web", "", chatID, 99)
+	if err != nil {
+		t.Fatalf("ForkSessionKeepFirst overflow: %v", err)
+	}
+	if got := len(m.GetByKey(full).GetMessages()); got != 5 {
+		t.Fatalf("overflow keepFirst should copy all 5, got %d", got)
 	}
 }
 

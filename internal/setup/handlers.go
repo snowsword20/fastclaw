@@ -1192,6 +1192,36 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 // handleChatSteer buffers a message into an in-flight turn for the
 // session. It does NOT open a stream or emit an event — the running
+// handleChatFork 从 web 会话的历史第 upTo 条（0 基）之后分叉出平行
+// 时间线（fork = 从这条回答另起一条分支，原始会话原样保留）。
+// Query: agentId, sessionId, upTo（可选；<=0 = 全量分叉）。
+// 200 {"sessionKey":"s-…"}：前端把会话切到该 key 即落在分支上。
+// 2026-11 配套 demo 前端的分叉按钮——此前分叉只有 IM 侧的 /fork 斜杠
+// 命令，web 面板没有程序化入口。
+func (s *Server) handleChatFork(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWritable(w, r) {
+		return
+	}
+	agentID := r.URL.Query().Get("agentId")
+	sessionID := r.URL.Query().Get("sessionId")
+	upTo, _ := strconv.Atoi(r.URL.Query().Get("upTo"))
+	ag := s.resolveAgent(r, agentID)
+	if ag == nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "agent not found"})
+		return
+	}
+	if sessionID == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "sessionId is required"})
+		return
+	}
+	key, err := ag.ForkWebSession(sessionID, upTo)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"sessionKey": key})
+}
+
 // turn (started by the earlier /api/chat/stream POST) folds the message
 // in between tool rounds and emits the "steer" event on its existing
 // SSE. 200 {"buffered":true} when a turn was active; 409

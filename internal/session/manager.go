@@ -456,7 +456,26 @@ func (m *Manager) ForkSession(channel, accountID, chatID string, keepLast int) (
 	if keepLast > 0 && keepLast < len(msgs) {
 		msgs = msgs[len(msgs)-keepLast:]
 	}
-	prevKey := cur.SessionKey()
+	return m.forkFrom(channel, accountID, chatID, msgs)
+}
+
+// ForkSessionKeepFirst 在"保留前 keepFirst 条消息"的语义上分叉——
+// 供"从某条历史回答分叉"的前端按钮使用：前端给出要保留到的位置，
+// 这里截取原始消息切片的前缀（工具结果等中间消息都随上下文带走）。
+// keepFirst >= len(msgs) 时等同全量分叉；keepFirst <= 0 时等同 OpenNewSession + 空历史。
+func (m *Manager) ForkSessionKeepFirst(channel, accountID, chatID string, keepFirst int) (string, error) {
+	cur := m.Get(channel, accountID, chatID, "")
+	msgs := cur.GetMessages()
+	if keepFirst >= 0 && keepFirst < len(msgs) {
+		msgs = msgs[:keepFirst]
+	}
+	return m.forkFrom(channel, accountID, chatID, msgs)
+}
+
+// forkFrom 是 ForkSession / ForkSessionKeepFirst 的公共尾段：新 key、
+// 来路栈、活跃覆盖、历史复制。调用方已算好要带走的消息切片。
+func (m *Manager) forkFrom(channel, accountID, chatID string, msgs []provider.Message) (string, error) {
+	prevKey := m.Get(channel, accountID, chatID, "").SessionKey()
 
 	newKey := m.OpenNewSession(channel, accountID, chatID)
 

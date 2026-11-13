@@ -1121,6 +1121,63 @@ func (a *Agent) WebChatHistoryPage(sessionId string, before int64, limit int) (h
 	return webHistoryEntries(msgs), start, hasMore, true
 }
 
+// ForkWebSession 从 web 会话的第 upTo 条历史（0 基）之后分叉出平行
+// 时间线，返回新会话的 session_key。upTo <= 0 表示全量分叉。
+//
+// 给 web 前端的"从这条回答分叉"按钮用：前端拿到的历史序是
+// webHistoryEntries 过滤后的条目序（与 /api/chat/history 的数组一致），
+// 而分叉要复制的是原始消息切片——历史条目与原始消息不是一一对应
+// （runtime 注入条目、空 assistant 条目不进历史），所以这里复刻
+// webHistoryEntries 的跳过规则把"第 upTo 条历史"换算回原始位置。
+// 换算规则必须与 webHistoryEntries 逐字对齐，两边同时改。
+func (a *Agent) ForkWebSession(sessionId string, upTo int) (string, error) {
+	if sessionId == "" {
+		sessionId = "web-ui"
+	}
+	resolved := a.sessions.ResolveSessionKey(sessionId)
+	sess := a.sessions.GetByKey(resolved)
+	msgs := sess.GetMessages()
+
+	keep := len(msgs)
+	if upTo > 0 {
+		kept := 0
+		keep = len(msgs) // upTo 超出历史长度时兜底为全量
+		for idx := range msgs {
+			m := &msgs[idx]
+			if m.Origin != provider.OriginUser {
+				continue
+			}
+			switch m.Role {
+			case "user":
+				if m.TextContent() == "" && !hasImageParts(m) {
+					continue
+				}
+			case "assistant":
+				if m.Content == "" && len(m.ToolCalls) == 0 {
+					continue
+				}
+			}
+			kept++
+			if kept >= upTo {
+				keep = idx + 1
+				break
+			}
+		}
+	}
+	return a.sessions.ForkSessionKeepFirst("web", "", resolved, keep)
+}
+
+// hasImageParts 报告消息的 ContentParts 里有没有 image_url 块——
+// ForkWebSession 的过滤换算用，规则与 webHistoryEntries 的 user 分支一致。
+func hasImageParts(m *provider.Message) bool {
+	for _, p := range m.ContentParts {
+		if p.Type == "image_url" && p.ImageURL != nil && p.ImageURL.URL != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // webHistoryEntries converts archived messages into the chat UI's
 // history shape, dropping runtime-injected and empty messages.
 func webHistoryEntries(msgs []provider.Message) []map[string]any {

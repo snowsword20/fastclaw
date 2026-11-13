@@ -45,6 +45,10 @@ type AgentHandle interface {
 	// WebChatHistoryPage pages the history in the database; ok=false
 	// means the caller should page WebChatHistory in memory instead.
 	WebChatHistoryPage(sessionId string, before int64, limit int) (history []map[string]any, start int64, hasMore, ok bool)
+	// ForkWebSession branches the web session at the upTo-th history
+	// entry (0-based; <=0 forks the full history) and returns the new
+	// session_key. Backs the chat panel's per-answer fork button.
+	ForkWebSession(sessionId string, upTo int) (string, error)
 	WebChatSessions() []session.WebSession
 	// SessionTurnActive reports a turn in flight in that session, from any channel.
 	SessionTurnActive(sessionKey string) bool
@@ -309,6 +313,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/chat/steer", auth(s.handleChatSteer))
 	mux.HandleFunc("GET /api/chats", auth(s.handleChats))
 	mux.HandleFunc("GET /api/chat/history", auth(s.handleChatHistory))
+	mux.HandleFunc("POST /api/chat/fork", auth(s.handleChatFork))
 	mux.HandleFunc("GET /api/chat/todo", auth(s.handleChatTodo))
 	mux.HandleFunc("GET /api/chat/sessions", auth(s.handleChatSessions))
 	mux.HandleFunc("PUT /api/chat/sessions/{key}", auth(s.handleRenameSession))
