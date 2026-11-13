@@ -1965,9 +1965,24 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	// Mirror the regular path's user-message construction so multimodal
 	// + IM-bridge payloads (PhotoURL / PhotoURLs) land in session
 	// history the same way they would on a non-plan turn.
+	// 回合开始前压撤销快照（2026-11 ⑤-1 快照栈）：恢复点=本回合之前
+	// 的状态，/undo 弹栈即回到这里；标签用人话（用户消息首行）。
+	sess.SnapshotLabeled(turnSnapshotLabel(msg.Text))
+
 	userMsg := buildUserMessage(msg)
 	applyInternalMessageMetadata(&userMsg, msg.Params)
 	sess.Append(userMsg)
+
+	// 入站安全扫描（security_guard.go）：2026-11 审查前 Scanner 只接在
+	// 保存记忆环节，消息链路不设防。命中时记日志 + 发 security_warning
+	// 状态事件；给模型的系统提示在消息组装完成后追加（in-flight 不落库）。
+	injectNotice, injectThreats := inboundInjectionNotice(msg.Text)
+	if len(injectThreats) > 0 {
+		slog.Warn("inbound message matched security patterns",
+			"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID,
+			"threats", len(injectThreats))
+		emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{"phase": "security_warning"}})
+	}
 
 	if a.provider == nil {
 		noProviderMsg := "Agent is not configured with a usable LLM provider. Check that cfg.Providers contains the prefix referenced by model `" + a.model + "`."
@@ -2003,6 +2018,11 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	// Tail-only, consistent with the main loop's cache-stable layout.
 	if ts := a.ctxBuilder.BuildTimeAnchorAs(chatterUID); ts != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: ts})
+	}
+	if injectNotice != "" {
+		// plan 路径的注入扫描提示：放在历史之后、PII 清洗之前，
+		// 与两条主路径一致（in-flight，不落库）。
+		messages = append(messages, provider.Message{Role: "system", Content: injectNotice})
 	}
 	if a.piiScrubEnabled {
 		messages = privacy.ScrubMessages(messages)
@@ -2585,9 +2605,24 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// buildUserMessage handles multi-image flatten + senderMetadata.
 	// `[SenderName]:` content-prefix policy lives there (group-only;
 	// DMs stay bare to avoid SOUL.md language-bias regressions).
+	// 回合开始前压撤销快照（2026-11 ⑤-1 快照栈）：恢复点=本回合之前
+	// 的状态，/undo 弹栈即回到这里；标签用人话（用户消息首行）。
+	sess.SnapshotLabeled(turnSnapshotLabel(msg.Text))
+
 	userMsg := buildUserMessage(msg)
 	applyInternalMessageMetadata(&userMsg, msg.Params)
 	sess.Append(userMsg)
+
+	// 入站安全扫描（security_guard.go）：2026-11 审查前 Scanner 只接在
+	// 保存记忆环节，消息链路不设防。命中时记日志 + 发 security_warning
+	// 状态事件；给模型的系统提示在消息组装完成后追加（in-flight 不落库）。
+	injectNotice, injectThreats := inboundInjectionNotice(msg.Text)
+	if len(injectThreats) > 0 {
+		slog.Warn("inbound message matched security patterns",
+			"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID,
+			"threats", len(injectThreats))
+		emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{"phase": "security_warning"}})
+	}
 
 	// Context compaction: check if session messages are too large
 	sessionMsgs := sess.GetMessages()
@@ -2617,6 +2652,11 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// caching every turn.
 	messages = append(messages, withConversationGapContext(modelMessagesWithRecentImages(sessionMsgs))...)
 	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem, connectorNote, agentsNote, localAgentsNote)
+	// 注入扫描命中时追加一次性系统提示（in-flight）：放在尾部上下文之后，
+	// 系统提示保持字节稳定，前缀缓存不受影响。
+	if injectNotice != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: injectNotice})
+	}
 
 	toolDefs := withoutGroupSideChannels(a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode)), msg)
 
@@ -2661,6 +2701,16 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// splits on it (AllowSplit=true) or collapses to newlines otherwise.
 	var replyParts []string
 	outputLimitRetries := 0
+	// continuedParts 累积"输出 token 被截断的纯文本回答"已写出的部分
+	//（output_limit.go isTruncatedTextAnswer）。模型被要求接着写，
+	// 最终内容按原序拼接 —— 2026-11 审查前这种回答会带着缺失的尾部
+	// 静默交付。
+	var continuedParts []string
+	// modelAttempt 计本次 LLM 调用的尝试次数（llmRetry 内部重试）。
+	// attempt>1 时先发 stream_reset：上一轮尝试流出的 content_delta
+	// 已作废，网页端收到该事件要清空流式气泡，否则重试文本会拼接在
+	// 废弃内容后面（重复/错乱）。
+	modelAttempt := 0
 
 	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit()}
 	loopWarned := false
@@ -2740,7 +2790,19 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		}
 			dumpLLMRequest(a.name, a.model, llmMessages, callTools)
 			llmStart := time.Now()
+			// 每次新的模型调用从 1 数起：modelAttempt>1 才代表
+			// llmRetry 在"同一次调用"内部重试，需要 stream_reset；
+			// 不归零的话，下一轮迭代（工具结果回填后的正常续问）的
+			// 首次调用会被误判成重试，把正常累积的气泡内容清掉。
+			modelAttempt = 0
 			resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+				modelAttempt++
+				if modelAttempt > 1 {
+					// 前一次尝试已经流出的 content_delta 作废：网页端
+					// 收到 stream_reset 后清空流式气泡，重试从零拼接。
+					// IM 渠道结尾才发全文，忽略该事件即可。
+					emitEvent(ctx, ChatEvent{Type: "stream_reset"})
+				}
 				return a.streamChatToResponse(ctx, llmMessages, callTools)
 			})
 
@@ -2768,10 +2830,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.meterTokens(ctx, sess.Key(), a.model, resp.Usage, time.Since(llmStart).Milliseconds())
 		a.maybeRecoverToolCalls(resp)
 
-		// A reply cut off at the output limit (typically one huge tool
-		// call) is dropped and the model asked again to work in smaller
-		// pieces, instead of running half-written arguments or ending
-		// the turn on an empty reply.
+		// A reply cut off at the output limit is handled two ways
+		// (output_limit.go): truncated TOOL CALLS or empty text are
+		// dropped and the model asked again to work in smaller pieces
+		// (half-written arguments must not run); a truncated TEXT answer
+		// is kept AND continued — the model picks up exactly where it
+		// stopped, and the parts are stitched below.
 		if cutOffAtOutputLimit(resp) && outputLimitRetries < maxOutputLimitRetries {
 			outputLimitRetries++
 			slog.Warn("model reply cut off at the output limit — retrying",
@@ -2780,9 +2844,25 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			i-- // the dropped reply doesn't use up a tool round
 			continue
 		}
+		if isTruncatedTextAnswer(resp) && outputLimitRetries < maxOutputLimitRetries {
+			outputLimitRetries++
+			continuedParts = append(continuedParts, resp.Content)
+			slog.Info("model reply cut off at the output limit — continuing",
+				"agent", a.name, "chars_so_far", len(resp.Content), "retry", outputLimitRetries)
+			// 截断的正文本身也要进 messages（LLM 需要看到它才能无缝续写），
+			// 但不落 session —— 最终拼接完成才落一条完整回答。
+			messages = append(messages, provider.Message{Role: "assistant", Content: resp.Content, Timestamp: time.Now().UnixMilli()})
+			messages = append(messages, outputLimitContinuationMessage())
+			i-- // continuation doesn't use up a tool round
+			continue
+		}
 
 		if !resp.HasToolCalls() {
-			if strings.TrimSpace(resp.Content) == "" {
+			content := resp.Content
+			if len(continuedParts) > 0 {
+				content = strings.Join(append(continuedParts, resp.Content), "")
+			}
+			if strings.TrimSpace(content) == "" {
 				emptyMsg := "model returned an empty response"
 				if resp.Truncated {
 					emptyMsg = "the model's reply was cut off at its output limit before it produced anything usable"
@@ -2792,12 +2872,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				emitEvent(ctx, ChatEvent{Type: "done"})
 				return emptyMsg
 			}
-			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
+			asst := provider.Message{Role: "assistant", Content: content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
 
 			sess.Append(asst)
-			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content, "metadata": knowledgeMeta}})
-			if resp.Content != "" {
-				replyParts = append(replyParts, resp.Content)
+			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": content, "metadata": knowledgeMeta}})
+			if content != "" {
+				replyParts = append(replyParts, content)
 			}
 			// End-of-turn steer race: a message buffered after the last
 			// between-rounds drain but before we declare the turn done.
@@ -2809,7 +2889,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				// assistant message is an invalid turn for Anthropic
 				// (an assistant turn needs a non-empty content block),
 				// and this is the only path that would re-send one.
-				if resp.Content != "" {
+				if content != "" {
 					messages = append(messages, asst)
 				}
 				messages = a.appendSteer(ctx, sess, messages, steer)
@@ -2819,6 +2899,17 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			a.runPostTurn(ctx, msg, messages, totalToolCalls, chatterMem)
 			return joinReplyParts(replyParts)
 		}
+
+		// Phase announcement (2026-11 事件粒度改造): the UI now KNOWS the
+		// turn entered tool execution — which round, how many calls —
+		// instead of inferring from the 8s heartbeat. Frontend renders
+		// this as a phase label; unknown-phase events stay harmless for
+		// older clients.
+		emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{
+			"phase": "tool_round",
+			"round": i + 1,
+			"calls": len(resp.ToolCalls),
+		}})
 
 		// Emit assistant content before tool calls if present
 		if resp.Content != "" {
@@ -3437,9 +3528,24 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	// Store raw user message — buildUserMessage handles multi-image
 	// flatten + senderMetadata. Group msgs keep their `[SenderName]:`
 	// prefix (applied in buildUserMessage); DMs stay bare.
+	// 回合开始前压撤销快照（2026-11 ⑤-1 快照栈）：恢复点=本回合之前
+	// 的状态，/undo 弹栈即回到这里；标签用人话（用户消息首行）。
+	sess.SnapshotLabeled(turnSnapshotLabel(msg.Text))
+
 	userMsg := buildUserMessage(msg)
 	applyInternalMessageMetadata(&userMsg, msg.Params)
 	sess.Append(userMsg)
+
+	// 入站安全扫描（security_guard.go）：2026-11 审查前 Scanner 只接在
+	// 保存记忆环节，消息链路不设防。命中时记日志 + 发 security_warning
+	// 状态事件；给模型的系统提示在消息组装完成后追加（in-flight 不落库）。
+	injectNotice, injectThreats := inboundInjectionNotice(msg.Text)
+	if len(injectThreats) > 0 {
+		slog.Warn("inbound message matched security patterns",
+			"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID,
+			"threats", len(injectThreats))
+		emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{"phase": "security_warning"}})
+	}
 
 	sessionMsgs := sess.GetMessages()
 	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
@@ -3465,6 +3571,11 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	// byte-stable for provider prompt caching.
 	messages = append(messages, withConversationGapContext(modelMessagesWithRecentImages(sessionMsgs))...)
 	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem)
+	// 注入扫描命中时追加一次性系统提示（in-flight）：放在尾部上下文之后，
+	// 系统提示保持字节稳定，前缀缓存不受影响。
+	if injectNotice != "" {
+		messages = append(messages, provider.Message{Role: "system", Content: injectNotice})
+	}
 
 	toolDefs := withoutGroupSideChannels(a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode)), msg)
 
@@ -3618,6 +3729,14 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			}()
 			return outReader
 		}
+
+		// Phase announcement: same tool_round event as HandleMessage, so
+		// API stream consumers see turn phases without heartbeats.
+		emitEvent(ctx, ChatEvent{Type: "status", Data: map[string]any{
+			"phase": "tool_round",
+			"round": i + 1,
+			"calls": len(resp.ToolCalls),
+		}})
 
 		// Tool calls - process concurrently via SDK engine
 		assistantMsg := provider.Message{

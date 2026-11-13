@@ -776,6 +776,11 @@ export function ChatScreen() {
   // Set while the backend is retrying a failed model call (status event,
   // phase "retrying"); cleared by the next real event of the turn.
   const [llmRetryStatus, setLlmRetryStatus] = useState<null | { attempt: number; max: number }>(null);
+  // Backend announces "now executing tools" (status event, phase
+  // "tool_round", with round + call count) — a phase label the chat can
+  // render as fact instead of guessing from the 8s tool_progress
+  // heartbeat. Cleared when the next model output / final answer arrives.
+  const [toolRoundStatus, setToolRoundStatus] = useState<null | { round: number; calls: number }>(null);
   const [subagentProgress, setSubagentProgress] = useState<null | {
     iteration?: number;
     max?: number;
@@ -1216,11 +1221,14 @@ export function ChatScreen() {
           // subagent_progress fields
           iteration?: number;
           max?: number;
-          phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up";
+          phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round";
           tools?: string[];
           // status fields (phase "retrying")
           attempt?: number;
           maxAttempts?: number;
+          // status fields (phase "tool_round")
+          round?: number;
+          calls?: number;
         };
       };
       try {
@@ -1252,14 +1260,29 @@ export function ChatScreen() {
         if (data.type === "status") {
           if (data.data?.phase === "retrying") {
             setLlmRetryStatus({ attempt: data.data.attempt ?? 0, max: data.data.maxAttempts ?? 0 });
+          } else if (data.data?.phase === "tool_round") {
+            setToolRoundStatus({ round: data.data.round ?? 0, calls: data.data.calls ?? 0 });
           }
           return;
         }
         setLlmRetryStatus(null);
         switch (data.type) {
+          case "stream_reset": {
+            // 上一次模型尝试流出的增量已作废（后端在重试前发本事件）：
+            // 移除流式气泡，让重试的 delta 从零重新创建，避免废弃
+            // 文本与重试文本拼接成重复/错乱的回答。
+            if (deltaBubbleId) {
+              const id = deltaBubbleId;
+              deltaBubbleId = null;
+              transientBubbleIdRef.current = null;
+              scopedMessages((prev) => prev.filter((message) => message.id !== id));
+            }
+            break;
+          }
           case "content_delta": {
             const delta = data.data?.delta;
             if (!delta) break;
+            setToolRoundStatus(null);
             if (!deltaBubbleId) deltaBubbleId = `resume-delta-${crypto.randomUUID()}`;
             const id = deltaBubbleId;
             transientBubbleIdRef.current = id;
@@ -2191,11 +2214,26 @@ export function ChatScreen() {
         if (evt.type === "status") {
           if (evt.data?.phase === "retrying") {
             setLlmRetryStatus({ attempt: evt.data.attempt ?? 0, max: evt.data.maxAttempts ?? 0 });
+          } else if (evt.data?.phase === "tool_round") {
+            setToolRoundStatus({ round: evt.data.round ?? 0, calls: evt.data.calls ?? 0 });
           }
           return;
         }
         setLlmRetryStatus(null);
         switch (evt.type) {
+          case "stream_reset": {
+            // 上一次模型尝试流出的增量已作废（后端在重试前发本事件）：
+            // 移除流式气泡，让重试的 delta 从零重新创建，避免废弃
+            // 文本与重试文本拼接成重复/错乱的回答。
+            if (streamingMsgIdRef.current) {
+              const id = streamingMsgIdRef.current;
+              streamingMsgIdRef.current = null;
+              streamRaw = "";
+              curContent = "";
+              setMessages((prev) => prev.filter((m) => m.id !== id));
+            }
+            break;
+          }
           case "content_delta": {
             // Incremental token chunk from the provider. Append to the
             // in-flight assistant bubble — create one on the first
@@ -2205,6 +2243,7 @@ export function ChatScreen() {
             // intact even though deltas aren't persisted.
             const delta = evt.data?.delta || "";
             if (!delta) break;
+            setToolRoundStatus(null);
             if (curCalls.length > 0 && !streamingMsgIdRef.current) {
               // Content after tool calls = new round; reset state so
               // the new bubble is its own message, not appended onto
@@ -3342,6 +3381,11 @@ export function ChatScreen() {
                     {llmRetryStatus && (
                       <span className="ml-2 text-xs text-muted-foreground">
                         {tr("Model request failed, retrying ({{attempt}}/{{max}})…", "模型请求失败，正在自动重试（{{attempt}}/{{max}}）…", { attempt: llmRetryStatus.attempt, max: llmRetryStatus.max })}
+                      </span>
+                    )}
+                    {toolRoundStatus && (
+                      <span className="ml-2 text-xs text-muted-foreground">
+                        {tr("Running tools (round {{round}}, {{calls}} calls)…", "正在执行工具（第 {{round}} 轮 · {{calls}} 个调用）…", { round: toolRoundStatus.round, calls: toolRoundStatus.calls })}
                       </span>
                     )}
                   </div>

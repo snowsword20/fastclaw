@@ -1188,6 +1188,7 @@ export interface ChatStreamEvent {
   type:
     | "content"
     | "content_delta"
+    | "stream_reset"
     | "tool_call"
     | "tool_result"
     | "steer"
@@ -1221,12 +1222,16 @@ export interface ChatStreamEvent {
     // subagent_progress payload — only populated when type === "subagent_progress".
     iteration?: number;
     max?: number;
-    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up";
+    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round";
     tools?: string[];
     // status payload (type === "status", phase "retrying"): the model call
     // failed and the backend is retrying it.
     attempt?: number;
     maxAttempts?: number;
+    // status payload (type === "status", phase "tool_round"): the turn
+    // entered tool execution — round number and call count.
+    round?: number;
+    calls?: number;
     // local_agent payload: run_local_agent on the person's computer.
     kind?: "progress" | "approval" | "approval_resolved" | "done";
     agent?: string;

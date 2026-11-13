@@ -19,6 +19,7 @@ type execArgs struct {
 	Timeout         int    `json:"timeout,omitempty"`           // seconds, default 120
 	Sandbox         bool   `json:"sandbox,omitempty"`           // force sandbox for this call
 	RunInBackground bool   `json:"run_in_background,omitempty"` // launch detached, return bash_id for bash_output / kill_shell
+	Force           bool   `json:"force,omitempty"`             // explicit confirmation for execConfirm-verdict commands (see exec_guard.go)
 }
 
 // MetaSandboxPrefix marks an exec result as having run inside a sandbox.
@@ -26,14 +27,6 @@ type execArgs struct {
 // tool_result event metadata and strip it from the content the model sees.
 // Uses the ASCII Unit Separator so it never collides with shell output.
 const MetaSandboxPrefix = "\x1fFC_META:sandbox\x1f\n"
-
-var dangerousCommands = []string{
-	"rm -rf /",
-	"mkfs",
-	"dd if=",
-	":(){:|:&};:",
-	"> /dev/sda",
-}
 
 // SandboxConfig holds sandbox settings passed to the exec tool registration.
 type SandboxConfig struct {
@@ -91,6 +84,10 @@ func registerExecFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 				"type":        "boolean",
 				"description": "Launch the command in the background and return a bash_id immediately. Use this for long-running processes (dev servers, build watchers, migrations). Read output later via bash_output(bash_id); terminate via kill_shell(bash_id). Background sessions live until killed or the agent shuts down.",
 			},
+			"force": map[string]interface{}{
+				"type":        "boolean",
+				"description": "Explicit confirmation for guarded commands (remote install pipes like `curl | bash`, persistence mechanisms like `schtasks`/`crontab`, `git push --force` / `git reset --hard`, shutdown/reboot, shell-config writes). The first attempt returns a confirmation prompt; only re-send WITH force=true when you are sure the task needs it. Irreversible destruction (recursive deletion of /, ~, system dirs, raw disk writes) is refused regardless.",
+			},
 		},
 		"required": []string{"command"},
 	}, makeExecToolFull(r, sbCfg, envProvider, skillDirs))
@@ -117,14 +114,6 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 
 		if args.Command == "" {
 			return "", fmt.Errorf("command is required")
-		}
-
-		// Check for dangerous commands
-		lower := strings.ToLower(args.Command)
-		for _, dc := range dangerousCommands {
-			if strings.Contains(lower, dc) {
-				return "", fmt.Errorf("dangerous command blocked: %s", args.Command)
-			}
 		}
 
 		timeout := 120
@@ -159,6 +148,19 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 		guest := r != nil && !r.callerIsAdmin
 		if guest {
 			useSandbox = true
+		}
+
+		// Dangerous-command gate (exec_guard.go), applied AFTER the
+		// sandbox decision so the verdict matches where the command will
+		// actually run: host-bound commands face the full two-tier gate
+		// (blocked / needs force=true); sandbox-bound commands only face
+		// tier-1, because the container already isolates the risky-but-
+		// reversible tier (curl|bash installs etc.). runSandboxedCommand
+		// re-checks tier-1 as defense in depth for the enforced path.
+		if v, why := classifyExecCommand(args.Command); v == execBlocked {
+			return "", execGateError(args.Command, v, why)
+		} else if v == execConfirm && !useSandbox && !args.Force {
+			return "", execGateError(args.Command, v, why)
 		}
 
 		// Background mode is host-only in v1. Sandbox-mode background
@@ -203,13 +205,13 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 		// but the model asked for the sandbox explicitly (sandbox:true).
 		// Resolve the per-session executor lazily — the container only
 		// starts when someone actually wants it.
-		if useSandbox && r != nil && r.sandboxProvider != nil {
-			ex, err := r.sandboxProvider(execCtx)
-			if err != nil {
-				return "", fmt.Errorf("sandbox unavailable: %w — the command was NOT run. Retry without sandbox:true to run it on the host instead, if host execution is acceptable", err)
+			if useSandbox && r != nil && r.sandboxProvider != nil {
+				ex, err := r.sandboxProvider(execCtx)
+				if err != nil {
+					return "", fmt.Errorf("sandbox unavailable: %w — the command was NOT run. Retry without sandbox:true to run it on the host instead, if host execution is acceptable", err)
+				}
+				return runSandboxedCommand(ctx, r.callerIsAdmin, ex, args, envProvider, skillDirs)
 			}
-			return runSandboxedCommand(ctx, ex, args, envProvider, skillDirs)
-		}
 		// Sandbox was requested but no executor is wired — refuse rather
 		// than running on the host shell. SetExecutor swaps this closure
 		// for the sandboxed variant on successful session bind, so we
@@ -334,6 +336,10 @@ func registerHostExec(r *Registry, envProvider SkillEnvProvider, skillDirs []str
 					"type":        "integer",
 					"description": "Timeout in seconds (default 120). Headless-browser workflows (camoufox-cli) need a longer ceiling for the first call — the daemon + browser cold-start can take 2-3 min when traffic is proxied; subsequent calls in the same session are sub-second.",
 				},
+				"force": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Explicit confirmation for guarded commands (remote install pipes, persistence mechanisms, git push --force, shutdown/reboot, shell-config writes). Re-send WITH force=true only when you are sure; irreversible destruction is refused regardless.",
+				},
 			},
 			"required": []string{"command"},
 		},
@@ -353,11 +359,13 @@ func registerHostExec(r *Registry, envProvider SkillEnvProvider, skillDirs []str
 			if args.Command == "" {
 				return "", fmt.Errorf("command is required")
 			}
-			lower := strings.ToLower(args.Command)
-			for _, dc := range dangerousCommands {
-				if strings.Contains(lower, dc) {
-					return "", fmt.Errorf("dangerous command blocked: %s", args.Command)
-				}
+			// Same two-tier guard as exec (exec_guard.go). host_exec is
+			// admin-only by the check above, so the confirm tier is a
+			// "say it twice" transcript record, not a security boundary.
+			if v, why := classifyExecCommand(args.Command); v == execBlocked {
+				return "", execGateError(args.Command, v, why)
+			} else if v == execConfirm && !args.Force {
+				return "", execGateError(args.Command, v, why)
 			}
 			timeout := 120
 			if args.Timeout > 0 {
@@ -419,7 +427,8 @@ func registerSandboxedExec(r *Registry, ex sandbox.Executor) {
 		if args.RunInBackground {
 			return "", fmt.Errorf("run_in_background is not yet supported in sandbox mode — use tmux inside the sandbox instead: exec({command: \"tmux new-session -d -s job '<your command>'\"}) to start, exec({command: \"tmux capture-pane -t job -p\"}) to read, exec({command: \"tmux kill-session -t job\"}) to stop")
 		}
-		return runSandboxedCommand(ctx, ex, args, envProvider, skillDirs)
+		rc := r.forContext(ctx)
+		return runSandboxedCommand(ctx, rc.callerIsAdmin, ex, args, envProvider, skillDirs)
 	})
 }
 
@@ -431,7 +440,21 @@ func registerSandboxedExec(r *Registry, ex sandbox.Executor) {
 // path (registerSandboxedExec, where exec ALWAYS lands here) and the
 // optional path (makeExecToolFull, where the model opted in with
 // sandbox:true).
-func runSandboxedCommand(ctx context.Context, ex sandbox.Executor, args execArgs, envProvider SkillEnvProvider, skillDirs []string) (string, error) {
+//
+// callerIsAdmin is the per-turn trust flag of whoever drove this call.
+// It only shapes the sandbox-absence hint text: a guest must never be
+// pointed at "retry WITHOUT sandbox:true" (their plain exec is refused
+// anyway, and a misleading hint makes the model flail); the operator
+// gets the escape-hatch hint as before.
+func runSandboxedCommand(ctx context.Context, callerIsAdmin bool, ex sandbox.Executor, args execArgs, envProvider SkillEnvProvider, skillDirs []string) (string, error) {
+	// Tier-1 guard as defense in depth: the host-bound paths gate before
+	// choosing, but the enforced path (registerSandboxedExec) lands here
+	// directly with no earlier gate. Inside the container the risky-but-
+	// reversible tier is allowed without force — the container isolates
+	// it — but irreversible destruction stays refused.
+	if v, why := classifyExecCommand(args.Command); v == execBlocked {
+		return "", execGateError(args.Command, v, why)
+	}
 	timeout := 120
 	if args.Timeout > 0 {
 		timeout = args.Timeout
@@ -488,7 +511,16 @@ func runSandboxedCommand(ctx context.Context, ex sandbox.Executor, args execArgs
 	if err != nil && looksLikeSandboxAbsence(err, out) {
 		switch {
 		case !buildinfo.IsSandboxEnforced():
-			err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine, retry WITHOUT sandbox:true — plain exec runs on the host here.]", err)
+			// 2026-11 复现后的修正：旧的提示对谁都说"retry WITHOUT
+			// sandbox:true — plain exec runs on the host here"。对访客
+			// 这是纯粹的误导（他们的 plain exec 本来就被强制沙箱拒绝），
+			// 还等于在教模型往宿主机方向试。按信任分叉：主人保留
+			// 逃逸提示（那是设计意图），访客明确告知此路不通。
+			if callerIsAdmin {
+				err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine, retry WITHOUT sandbox:true — plain exec runs on the host here.]", err)
+			} else {
+				err = fmt.Errorf("%w\n[hint: this command is not available in this conversation's sandbox. Host execution is NOT available to this chatter — do not retry outside the sandbox. Tell the user what is missing (binary/path) and let them decide how to proceed.]", err)
+			}
 		case buildinfo.IsHostExecAllowed():
 			err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine — e.g. `fastclaw upgrade`, `~/Downloads`, host CLI tools — retry with the `host_exec` tool instead.]", err)
 		default:

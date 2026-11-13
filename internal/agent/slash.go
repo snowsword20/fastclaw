@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,6 +89,9 @@ func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
 	case "/undo":
 		return a.slashUndo(msg)
 
+	case "/fork":
+		return a.slashFork(msg, args)
+
 	case "/compact":
 		return a.slashCompact(msg)
 
@@ -151,6 +155,7 @@ var writeSlashCommands = map[string]bool{
 	"/new":         true,
 	"/reset":       true,
 	"/undo":        true,
+	"/fork":        true,
 	"/retry":       true,
 	"/compact":     true,
 	"/model":       true,
@@ -276,7 +281,25 @@ func (a *Agent) slashRetry(msg bus.InboundMessage) slashResult {
 	}
 }
 
+// turnSnapshotLabel 生成回合快照的人话标签：用户消息首行前 40 字符，
+// 空/纯附件时给占位符。给 /undo 的回复和 SnapshotLabels 用。
+func turnSnapshotLabel(text string) string {
+	line := strings.TrimSpace(text)
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	if line == "" {
+		line = "(attachment/empty turn)"
+	}
+	if len(line) > 40 {
+		line = line[:40] + "…"
+	}
+	return line
+}
+
 // slashUndo reverts the last assistant response.
+// 2026-11 ⑤-1：快照栈化后支持连续多档撤销；无快照时的手动掐尾
+// 也会先压一档快照，保证撤销动作本身可再撤销。
 func (a *Agent) slashUndo(msg bus.InboundMessage) slashResult {
 	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
 
@@ -286,6 +309,8 @@ func (a *Agent) slashUndo(msg bus.InboundMessage) slashResult {
 		if len(msgs) < 2 {
 			return slashResult{handled: true, reply: "Nothing to undo."}
 		}
+		// Snapshot BEFORE trimming so this undo can itself be undone
+		sess.Snapshot()
 		// Trim trailing assistant messages + the user message before them
 		end := len(msgs)
 		for end > 0 && msgs[end-1].Role == "assistant" {
@@ -298,10 +323,49 @@ func (a *Agent) slashUndo(msg bus.InboundMessage) slashResult {
 		return slashResult{handled: true, reply: "↩️ Undid last turn."}
 	}
 
-	if sess.Undo() {
-		return slashResult{handled: true, reply: "↩️ Undid last action."}
+	if label, ok := sess.Undo(); ok {
+		return slashResult{handled: true, reply: fmt.Sprintf("↩️ Undid: %s\n(undo stack: %d left — /undo again to go further back)", label, len(sess.SnapshotLabels()))}
 	}
 	return slashResult{handled: true, reply: "Nothing to undo."}
+}
+
+// slashFork branches the conversation into a parallel timeline.
+// Usage: /fork          — branch with the full history;
+//        /fork N        — branch keeping only the last N messages;
+//        /fork back     — return to the previous branch.
+// 2026-11 ⑤-2：此前"换个问法重跑"只能作废已有历史（/retry 替换式、
+// /undo 单槽）；分叉让旧线原样保留。
+func (a *Agent) slashFork(msg bus.InboundMessage, args []string) slashResult {
+	arg := ""
+	if len(args) > 0 {
+		arg = strings.TrimSpace(args[0])
+	}
+	switch arg {
+	case "back", "main":
+		if key, ok := a.sessions.SwitchBackSession(msg.Channel, msg.AccountID, msg.ChatID); ok {
+			return slashResult{handled: true, reply: fmt.Sprintf("↩️ Back on the previous branch (%s). New messages continue there.", key)}
+		}
+		return slashResult{handled: true, reply: "No previous branch recorded in this process — branches created before a restart can't be switched back to from memory."}
+	default:
+		keepLast := 0
+		if arg != "" {
+			n, err := strconv.Atoi(arg)
+			if err != nil || n <= 0 {
+				return slashResult{handled: true, reply: "Usage: /fork [N|back]\n• /fork — branch with the full history\n• /fork 6 — branch keeping only the last 6 messages\n• /fork back — return to the previous branch"}
+			}
+			keepLast = n
+		}
+		key, err := a.sessions.ForkSession(msg.Channel, msg.AccountID, msg.ChatID, keepLast)
+		if err != nil {
+			return slashResult{handled: true, reply: "Fork failed: " + err.Error()}
+		}
+		reply := fmt.Sprintf("🌱 Forked (branch %s). This chat now continues on the new branch; the previous line is untouched.", key)
+		if keepLast > 0 {
+			reply += fmt.Sprintf(" Only the last %d messages were carried over.", keepLast)
+		}
+		reply += "\nUse /fork back to return."
+		return slashResult{handled: true, reply: reply}
+	}
 }
 
 func (a *Agent) slashCompact(msg bus.InboundMessage) slashResult {
@@ -587,7 +651,8 @@ func (a *Agent) slashHelp() string {
 Conversation
   /new, /reset    — Clear session history
   /retry          — Re-run last message
-  /undo           — Undo last turn
+  /undo           — Undo last turn (multi-level: repeat to go further back)
+  /fork [N|back]  — Branch into a parallel timeline (full history / last N msgs / return)
 
 Context
   /compact        — Compress context window

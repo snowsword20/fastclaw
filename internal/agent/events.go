@@ -8,7 +8,7 @@ import (
 
 // ChatEvent represents a real-time event emitted during the agent ReAct loop.
 type ChatEvent struct {
-	Type string         `json:"type"` // "content", "content_delta", "tool_call", "tool_result", "tool_progress", "status", "steer", "error", "done", "turn_pending", "subagent_progress"
+	Type string         `json:"type"` // "content", "content_delta", "stream_reset", "tool_call", "tool_result", "tool_progress", "status", "steer", "error", "done", "turn_pending", "subagent_progress"
 	Data map[string]any `json:"data,omitempty"`
 }
 
@@ -56,7 +56,11 @@ func emitEvent(ctx context.Context, evt ChatEvent) {
 	// no replay value: the trailing `content` event carries the full
 	// final text, so a refresh in the middle of a turn just rejoins
 	// the live hub and gets the final on completion.
-	persist := evt.Type != "content_delta"
+	//
+	// stream_reset 同理：它是"上一轮尝试的增量作废"的瞬时信号，
+	// 只对正盯着流式气泡的客户端有意义，重连/回放场景下没有价值
+	// （重连后要么拿到重试后的正文，要么拿到 done）。
+	persist := evt.Type != "content_delta" && evt.Type != "stream_reset"
 
 	if persist && stream != nil && stream.sink != nil && stream.userID != "" && stream.sessionKey != "" {
 		blob, _ := json.Marshal(evt.Data)

@@ -54,6 +54,12 @@ type Session struct {
 	provider string
 	model    string
 
+	// snapshots 是撤销快照栈（多档 /undo，2026-11 ⑤-1）。每个用户回合
+	// 开始时压入一个带标签的快照，Undo 弹出最新一档恢复。上限
+	// undoSnapshotLimit，超出丢最旧。旧实现是单槽字段 snapshot，
+	// 每次 /retry 都会覆盖上一档。
+	snapshots []sessionSnapshot
+
 	// Steering: turnDepth counts in-flight HandleMessage turns for this
 	// session (a counter, not a bool, so re-entrant/overlapping turns
 	// don't strand the active flag). steerBuf holds user messages that
@@ -167,12 +173,27 @@ type Manager struct {
 	store    SessionStore
 	userID   string
 	agentID  string
+	// forkStacks 记录每个 chat 三重的分叉来路（LIFO），/fork back 回切用。
+	// 进程内状态：重启后栈清空（分叉线本身仍在 store/文件里）。
+	forkStacks map[string][]string
+	// activeOverride 是 triple → 活跃 session_key 的内存覆盖表。分叉
+	// (/fork) 与回切 (/fork back) 时显式指定活跃线，不依赖
+	// updated_at 排序 —— 两次保存落在同一毫秒时排序会翻车。/new
+	// 开新线时清掉覆盖，解析回到正常规则。
+	activeOverride map[string]string
+}
+
+// tripleKey 是 fork 栈与覆盖表的键。
+func tripleKey(channel, accountID, chatID string) string {
+	return channel + "\x00" + accountID + "\x00" + chatID
 }
 
 func NewManager(dataDir string) *Manager {
 	return &Manager{
-		sessions: make(map[string]*Session),
-		dataDir:  dataDir,
+		sessions:       make(map[string]*Session),
+		dataDir:        dataDir,
+		forkStacks:     make(map[string][]string),
+		activeOverride: make(map[string]string),
 	}
 }
 
@@ -185,11 +206,13 @@ func NewManagerWithStoreForUser(dataDir string, st SessionStore, userID, agentID
 		fmt.Fprintf(os.Stderr, "session.NewManagerWithStoreForUser: empty userID for agent %q\n", agentID)
 	}
 	return &Manager{
-		sessions: make(map[string]*Session),
-		dataDir:  dataDir,
-		store:    st,
-		userID:   userID,
-		agentID:  agentID,
+		sessions:       make(map[string]*Session),
+		dataDir:        dataDir,
+		store:          st,
+		userID:         userID,
+		agentID:        agentID,
+		forkStacks:     make(map[string][]string),
+		activeOverride: make(map[string]string),
 	}
 }
 
@@ -242,6 +265,13 @@ func generateSessionKey() string {
 //     sessions, so the session_key has to be independent for `/new` to
 //     produce a sibling row.
 func (m *Manager) resolveOrMintKey(channel, accountID, chatID string) string {
+	// 分叉/回切的显式覆盖优先 —— 见 activeOverride 字段注释。
+	m.mu.Lock()
+	override := m.activeOverride[tripleKey(channel, accountID, chatID)]
+	m.mu.Unlock()
+	if override != "" {
+		return override
+	}
 	if m.store != nil {
 		if k, err := m.store.ResolveActiveSessionKey(m.ctx(), m.agentID, channel, accountID, chatID); err == nil && k != "" {
 			return k
@@ -392,6 +422,9 @@ func (m *Manager) OpenNewSession(channel, accountID, chatID string) string {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// /new 开的是全新对话线：清掉分叉覆盖，让解析回到正常规则，
+	// 否则上一条 /fork 的覆盖会让新线永远解析回分叉。
+	delete(m.activeOverride, tripleKey(channel, accountID, chatID))
 	s := &Session{
 		filePath:   filepath.Join(m.dataDir, key+".jsonl"),
 		store:      m.store,
@@ -404,6 +437,63 @@ func (m *Manager) OpenNewSession(channel, accountID, chatID string) string {
 	}
 	m.sessions[key] = s
 	return key
+}
+
+// ForkSession branches the active conversation for this triple into a
+// new session_key, copying the current history (or only the last
+// keepLast messages when keepLast > 0). The branch becomes the active
+// line for subsequent Get() calls via the active-override table; the
+// original line is untouched and reachable again through
+// SwitchBackSession.
+//
+// 2026-11 ⑤-2：对话分叉（平行时间线）。此前 fastclaw 只有单槽
+// /undo 和替换式 /retry —— 想从某个决策点换条路走，只能作废已有
+// 历史。分叉让"换个问法重跑"与"保留原线"并存，是编程/调研类
+// agent 的核心工作流。
+func (m *Manager) ForkSession(channel, accountID, chatID string, keepLast int) (string, error) {
+	cur := m.Get(channel, accountID, chatID, "")
+	msgs := cur.GetMessages()
+	if keepLast > 0 && keepLast < len(msgs) {
+		msgs = msgs[len(msgs)-keepLast:]
+	}
+	prevKey := cur.SessionKey()
+
+	newKey := m.OpenNewSession(channel, accountID, chatID)
+
+	// 记录来路 + 设活跃覆盖（先取锁再改两个 map，避免半状态）
+	m.mu.Lock()
+	k := tripleKey(channel, accountID, chatID)
+	m.forkStacks[k] = append(m.forkStacks[k], prevKey)
+	m.activeOverride[k] = newKey
+	m.mu.Unlock()
+
+	// 复制历史：走 Session.Append 的正规写入路径（store/文件两种模式
+	// 都对），而不是绕过它直接写存储。
+	s := m.getByKey(newKey, channel, accountID, chatID, "")
+	for _, msg := range msgs {
+		s.Append(msg)
+	}
+	return newKey, nil
+}
+
+// SwitchBackSession returns this chat to the previous conversation
+// branch (/fork back). The fork chain is a per-process stack: each
+// ForkSession pushed the previous key, so back = pop + re-activate it
+// via the active-override table. Returns the re-activated key; ok is
+// false when there is no recorded previous branch.
+func (m *Manager) SwitchBackSession(channel, accountID, chatID string) (string, bool) {
+	m.mu.Lock()
+	k := tripleKey(channel, accountID, chatID)
+	stack := m.forkStacks[k]
+	if len(stack) == 0 {
+		m.mu.Unlock()
+		return "", false
+	}
+	prevKey := stack[len(stack)-1]
+	m.forkStacks[k] = stack[:len(stack)-1]
+	m.activeOverride[k] = prevKey
+	m.mu.Unlock()
+	return prevKey, true
 }
 
 func (m *Manager) getByKey(key, channel, accountID, chatID, projectID string) *Session {
@@ -1039,32 +1129,72 @@ func (m *Manager) readSessionTitle(sessionId string) string {
 	return meta.Title
 }
 
-// Snapshot saves the current message list as a restore point (for undo).
-func (s *Session) Snapshot() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.snapshot = make([]provider.Message, len(s.Messages))
-	copy(s.snapshot, s.Messages)
+// sessionSnapshot 是一档撤销点：当时的消息副本 + 人话标签 + 时间。
+type sessionSnapshot struct {
+	messages []provider.Message
+	label    string
+	at       time.Time
 }
 
-// Undo restores the last snapshot. Returns false if no snapshot exists.
-func (s *Session) Undo() bool {
+// undoSnapshotLimit 限制快照栈深度 —— 每档都是全量消息副本，长会话里
+// 无限压栈会吃内存；10 档足够覆盖"连撤几次"的现实用法，超深的历史
+// 归 store 的 append-only 档案管。
+const undoSnapshotLimit = 10
+
+// SnapshotLabeled pushes a labelled undo snapshot onto the capped stack.
+// 2026-11 ⑤-1：旧实现是单槽覆盖式（只能撤一档，且每次 /retry 都覆盖
+// 上一次的存档）；栈化后 /undo 可以连续撤销多档。
+func (s *Session) SnapshotLabeled(label string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.snapshot == nil {
-		return false
+	cp := make([]provider.Message, len(s.Messages))
+	copy(cp, s.Messages)
+	s.snapshots = append(s.snapshots, sessionSnapshot{messages: cp, label: label, at: time.Now()})
+	if len(s.snapshots) > undoSnapshotLimit {
+		s.snapshots = s.snapshots[len(s.snapshots)-undoSnapshotLimit:]
 	}
-	s.Messages = make([]provider.Message, len(s.snapshot))
-	copy(s.Messages, s.snapshot)
-	s.snapshot = nil
+}
+
+// Snapshot keeps the old single-arg call sites working (slashRetry 等).
+func (s *Session) Snapshot() {
+	s.SnapshotLabeled("checkpoint")
+}
+
+// Undo pops and restores the newest snapshot. Returns the snapshot's
+// label (for the /undo reply) and true on success; "" and false when
+// the stack is empty.
+func (s *Session) Undo() (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.snapshots) == 0 {
+		return "", false
+	}
+	snap := s.snapshots[len(s.snapshots)-1]
+	s.snapshots = s.snapshots[:len(s.snapshots)-1]
+	s.Messages = make([]provider.Message, len(snap.messages))
+	copy(s.Messages, snap.messages)
 	s.LastConsolidated = 0
 	s.rewriteFile()
-	return true
+	return snap.label, true
 }
 
 // HasSnapshot returns true if an undo snapshot exists.
 func (s *Session) HasSnapshot() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.snapshot != nil
+	return len(s.snapshots) > 0
+}
+
+// SnapshotLabels describes the stack for humans (newest first), used by
+// /undo's reply and any future /undo list view.
+func (s *Session) SnapshotLabels() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.snapshots))
+	for i := len(s.snapshots) - 1; i >= 0; i-- {
+		snap := s.snapshots[i]
+		out = append(out, fmt.Sprintf("%s (%d msgs, %s)",
+			snap.label, len(snap.messages), snap.at.Format("01-02 15:04")))
+	}
+	return out
 }
