@@ -6,7 +6,7 @@ with them on the web. Built on the Connany
 connector service, adapted from fleet's connectors
 (`apps/web/docs/connectors-spec.md`).
 
-Status: reads, and **writes the person approves call by call**; **1:1 chats with your own agents** (web, and a product's end users over `/v1`).
+Status: reads, and **writes the person approves call by call**; **1:1 chats** (your own agents on the web, and any agent of a product for its end users over `/v1`).
 
 ## Configuration
 
@@ -71,15 +71,12 @@ The `connectors` tool is mounted (`Agent.mountConnectors`) only on:
 
 - a **web** turn whose **chatter owns the agent**; or
 - an app **end user's** own 1:1 turn (web or `/v1` API, `X-Fastclaw-End-User`)
-  on an agent of the app's account marked as theirs (`endUserOwner`, see
+  on **any** agent of the app's account (or their own; see
   `gateway.endUserConnectorGate`). Their subject is their own app_user id,
-  so accounts are theirs alone, usable across all of their agents — but not
-  on the app's other public agents, whose instructions are someone else's.
-  Exception: agents the app marks `endUserConnectors: true`
-  (`PUT /api/agents/{id}` or `/v1`, account callers only) — its own official
-  agents, whose instructions it vouches for — take every end user's
-  accounts. WeClaw marks the agents its staff created. The app
-  passes its own connect page as the turn param `__fastclawConnectorsURL`
+  so accounts are theirs alone: they authorized them, and only they read the
+  replies. (`endUserConnectors` on an agent is no longer needed: every app
+  agent is open.)
+  The app passes its own connect page as the turn param `__fastclawConnectorsURL`
   (hidden from the model's client-parameters note), and optionally
   `__fastclawConnectorsReturnURL`. The tool's request actions then mint a
   one-time authorization link (no ChatRef: an IM turn can't be woken) for
@@ -88,9 +85,8 @@ The `connectors` tool is mounted (`Agent.mountConnectors`) only on:
   app's own page, authorization returns there (`returnUrl` on
   `POST /api/connector-authorizations`, end-user callers only).
 
-Not in IM channels, groups, cron, or on someone else's agent — there the
-reader of the reply, or the author of the agent's instructions, isn't the
-account's owner. The tool is unregistered at the start of every turn, so a
+Not in Fastclaw's own IM channels, groups or cron — there the reader of the
+reply isn't the account's owner. The tool is unregistered at the start of every turn, so a
 mount never carries over to the next turn.
 
 ## The tool
@@ -150,10 +146,81 @@ turn waits.
    input — a runtime message, never shown as a user bubble — and a turn runs
    like a typed message (`Server.wakeConnectorChat`).
 
+## Custom MCP servers
+
+A person may also add MCP servers of their own (Connectors → Custom MCP;
+`internal/usermcp`). Each belongs to the one user who added it: only they
+use it, with every agent they chat with.
+
+| Route | |
+| --- | --- |
+| `GET /api/mcp-servers` | the caller's servers: `{servers:[{id,name,url,headerNames,toolCount,createdAt,auth,signIn}], max}` (`auth`: `oauth` or `headers`; `signIn`: their sign-in to an OAuth server, `ok`/`broken`/`none`) |
+| `POST /api/mcp-servers` | `{name, url, headers?}`: connects (initialize + tools/list) and saves only if it answers as MCP. One that asks for OAuth answers `oauth_required` |
+| `PATCH /api/mcp-servers/{id}` | `{name, url, headers?}`: the caller's own only. `headers` absent keeps them; otherwise it's the full set, and an empty value keeps that header's saved value. A new address or headers are checked again before saving |
+| `DELETE /api/mcp-servers/{id}` | the caller's own only; its sign-in goes with it |
+| `POST /api/mcp-servers/oauth/start` | `{name, url, redirectUri, clientName?}` adds an OAuth server by signing in; `{serverId, redirectUri}` signs in to one again → `{authorizeUrl}` |
+| `POST /api/mcp-servers/oauth/finish` | `{state, code}` from the redirect → `{server}`, as the person who started it: trades the code, checks the server with the token, saves it. The account's own key **without** an end user finishes it for whichever of its end users started it (a sign-in link opened from an IM chat, in a browser not signed in to the product) |
+
+Errors carry a closed `code`: `invalid_name`, `invalid_url`,
+`invalid_headers`, `name_taken`, `too_many` (20 per user), `not_found`,
+`unauthorized` (the server refused the headers), `unreachable`, `not_mcp`;
+for OAuth: `oauth_required` (add it by signing in), `oauth_unsupported` (no
+usable authorization server: no metadata, no dynamic client registration or
+no PKCE S256), `oauth_redirect_refused` (its registration only accepts
+certain apps' redirect URIs), `invalid_redirect`, `oauth_expired` (unknown,
+used, expired or someone else's state), `oauth_failed` (the code was
+refused), `reauth_required` (in a turn: sign in again).
+
+### OAuth servers
+
+A server that answers 401 and has OAuth metadata (MCP authorization spec
+2025-06-18: a `WWW-Authenticate: Bearer resource_metadata="…"` challenge;
+the older origin-as-authorization-server layout works too). A 401 without
+it is a wrong key (`unauthorized`).
+
+1. `POST /api/mcp-servers` answers `oauth_required`.
+2. `oauth/start` reads the protected-resource and authorization-server
+   metadata, registers a public client there (dynamic client registration,
+   `redirectUri` as its only redirect URI), and returns the authorization
+   URL (code flow, PKCE S256, `resource` = the server, the challenge's
+   `scope`). The state is bound to the caller, lasts 15 minutes and works
+   once.
+3. The person approves; the authorization server returns to `redirectUri`
+   with `code` and `state`, which the product passes to `oauth/finish`. The
+   server is saved (the row keeps the client) with their tokens
+   (`user_mcp_tokens`).
+
+Tokens never leave Fastclaw. An access token about to expire, or one the
+server refuses, is refreshed (once at a time; a token another replica
+already rotated is picked up from the database). When the refresh is
+refused the server shows `signIn: "broken"` and its calls answer
+`reauth_required`: the person signs in again from Connectors
+(`oauth/start` with `serverId`), or from the link the tool sends in the
+chat when the product names its redirect URI as the turn param
+`__fastclawMCPRedirectURI` (optionally `__fastclawMCPClientName`). An OAuth
+server can be renamed, not moved to another address. Servers saved before
+tokens had their own table kept them on the row: on start-up they move.
+
+- Streamable HTTP only (`https://`, no stdio). The client dials public
+  addresses only (checked again at dial time, no proxy, no redirects),
+  sends header values as given (no `$ENV` expansion) and caps responses.
+- Header values (API keys) are stored server-side (`user_mcp_servers`) and
+  never returned: the list shows header names only.
+- Mounted as one `custom_mcp` tool (`list_tools`, `call_tool`) with the
+  chatter's own servers, on exactly the turns that may use their connected
+  accounts (`ownAccountsTurn`), with a system note naming them. Nobody
+  else's turns, IM groups or cron ever see them.
+- A tool the server doesn't mark `readOnlyHint: true` runs only after the
+  person chatting approves it in the chat (same channel and session grants
+  as connector writes); where the turn can't ask, only read-only tools are
+  offered.
+
 ## Not yet
 
-- Writes where the turn can't ask (IM channels, cron), custom MCP servers.
+- Writes where the turn can't ask (IM channels, cron).
 - IM channels, groups, API end users.
 - Polling Connany's event stream: a revocation on the platform is noticed on
   the next call.
 - Multi-replica: caches and the 429 cooldown are per process.
+- Custom MCP header values and OAuth tokens are stored unencrypted in the
+  database (no at-rest key yet).

@@ -15,8 +15,9 @@ import (
 
 // EndUserConnectorGate reports whether chatterUID — an end user of the
 // account that owns agentID (X-Fastclaw-End-User) — may use their own
-// connected accounts on that agent: it is one of THEIR agents, so its
-// instructions are theirs. The gateway decides from the agent record.
+// connected accounts (and the custom MCP servers it offers) on that
+// agent. The gateway decides from the agent record: any agent of the
+// account.
 type EndUserConnectorGate func(ctx context.Context, agentID, chatterUID string) bool
 
 // ConnectorsURLParam is the turn param (set by the calling product's
@@ -36,14 +37,14 @@ const ConnectorsReturnURLParam = "__fastclawConnectorsReturnURL"
 // on those accounts for the system prompt ("" when nothing applies).
 //
 // Two cases, both a 1:1 conversation whose only reader is the accounts'
-// owner, on an agent whose instructions are theirs:
+// owner, who authorized them:
 //   - a web turn whose chatter owns this agent;
-//   - an end user's own turn (web or API) on an agent the account marked
-//     as theirs (EndUserConnectorGate), e.g. WeClaw's "my agents".
+//   - an end user's own turn (web or API) on one of the account's agents
+//     (EndUserConnectorGate), e.g. any WeClaw agent.
 //
-// IM channels, groups, cron and other people's agents never get them — an
-// agent someone else set up runs on their instructions and could carry
-// what it reads elsewhere (docs/connectors.md).
+// Fastclaw's own IM channels, groups and cron never get them: nobody
+// there is the single reader who authorized the accounts
+// (docs/connectors.md).
 func (a *Agent) mountConnectors(ctx context.Context, msg bus.InboundMessage, chatterUID, sessionKey string) string {
 	if a.registry == nil {
 		return ""
@@ -51,18 +52,8 @@ func (a *Agent) mountConnectors(ctx context.Context, msg bus.InboundMessage, cha
 	// A previous turn's mount (bound to that turn's chatter) never
 	// carries over: each turn decides afresh below.
 	a.registry.Unregister(tools.ConnectorsToolName)
-	if chatterUID == "" {
-		return ""
-	}
-	if msg.Source != bus.SourceUser && msg.Source != bus.SourceConnector {
-		return ""
-	}
-	var links *tools.ConnectLinks
-	switch {
-	case msg.Channel == "web" && chatterUID == a.trustOwnerID():
-	case a.endUserTurnMayUseConnectors(ctx, msg, chatterUID):
-		links = connectLinks(msg.Params)
-	default:
+	links, ok := a.ownAccountsTurn(ctx, msg, chatterUID)
+	if !ok {
 		return ""
 	}
 	// Their own Connany when they saved one, else the deployment's.
@@ -79,6 +70,25 @@ func (a *Agent) mountConnectors(ctx context.Context, msg bus.InboundMessage, cha
 	}
 	tools.RegisterConnectors(a.registry, svc, chatterUID, connectors.ChatRef{AgentID: a.name, SessionID: sessionKey}, platforms, links, a.connectorApprovals(ctx, chatterUID))
 	return connectorAccountsNote(cctx, svc, chatterUID, platforms)
+}
+
+// ownAccountsTurn reports whether this turn may use what the chatter
+// connected or added themselves (accounts, custom MCP servers): see
+// mountConnectors. links is set when their chat can't show cards.
+func (a *Agent) ownAccountsTurn(ctx context.Context, msg bus.InboundMessage, chatterUID string) (*tools.ConnectLinks, bool) {
+	if chatterUID == "" {
+		return nil, false
+	}
+	if msg.Source != bus.SourceUser && msg.Source != bus.SourceConnector {
+		return nil, false
+	}
+	switch {
+	case msg.Channel == "web" && chatterUID == a.trustOwnerID():
+		return nil, true
+	case a.endUserTurnMayUseConnectors(ctx, msg, chatterUID):
+		return connectLinks(msg.Params), true
+	}
+	return nil, false
 }
 
 // connectorApprovals is how the person approves a change to one of their

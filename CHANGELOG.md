@@ -5,6 +5,83 @@ action on upgrade — read those notes before deploying.
 
 ## [Unreleased]
 
+### Changed — skill layers: chatter > agent > owner > global
+
+The account that owns an agent (`agents.user_id`) now has its personal
+skills loaded into every conversation with that agent, between the
+agent's own and the global ones: a product whose agents belong to one
+account adds its skills there. They are also pushed to the sandbox's
+`/skills` (agent > owner > global), so their scripts run. A chatter's own
+skills now rank above the agent's (they affect only that person) and may
+take any name, global ones included; they still never reach `/skills` or
+any keys. `GET /api/skills?scope=user` returns the merged chain, each
+with a `source` (`mine`, `product`, `system`); `name_reserved` is gone.
+The console's own-skills view lists only `mine`.
+
+### Added — personal skills for end users (`/api/skills?scope=user`)
+
+Anyone signed in, including a product's end users (`X-Fastclaw-End-User`),
+can upload skills of their own through the console's routes with
+`?scope=user` (`GET /api/skills`, `POST /api/skills/upload`,
+`DELETE /api/skills/{name}`). A skill lands in their personal layer, so
+it is used in their own conversations only, with any agent. An upload is
+the folder of the zip's shallowest SKILL.md, kept whole (templates, images
+and scripts included; `.git/` and OS clutter skipped). Its files don't
+reach the sandbox yet, so scripts can be read but not run. The
+limits are 20 skills, 200 files and 10 MB each, and global skill names are
+reserved. `load_skill` points a personal skill's files at `skills/<name>/…`,
+which `read_file` reaches. See docs/personal-skills.md.
+
+### Security — a skill's keys reach only its own script
+
+In the sandbox, a skill's configured keys (`skills.entries` env such as
+`REPLICATE_API_TOKEN`) were exported in front of the whole command the
+model wrote, so a chatter could have them printed
+(`python /skills/<skill>/x.py; printenv …`). Now a command that gets keys
+must run the skill's script alone (`<python|node|bash|sh> /skills/<name>/<script> args`,
+optionally fed by `echo '<text>' |`), and only that process gets them
+(`K=v cmd`). Anything else is refused with what to change. Commands that
+get no keys run as before.
+
+This raises the bar; it can't stop a chatter with root in the sandbox who
+rewrites the script first. Keys a chatter must never see belong to skills
+that run outside the chatter's sandbox, or to server-side tools.
+
+### Changed — custom MCP sign-ins live in their own table
+
+An OAuth custom MCP server keeps its client on the row and the adder's
+tokens in the new table `user_mcp_tokens` (moved there at boot). The list
+shows `signIn` (`ok`/`broken`/`none`) instead of `needsReauth`. When a
+sign-in stops working, the agent sends the person a new sign-in link in
+their chat if the product names its redirect URI as the turn param
+`__fastclawMCPRedirectURI`; `oauth/finish` with the account's own key and
+no end user finishes it for the end user who started it.
+
+An app's end users may now use their own connected accounts on **any** of
+the app's agents in their 1:1 chats, not only their own and the ones marked
+`endUserConnectors` (which no longer matters).
+
+### Added — OAuth for custom MCP servers
+
+A custom MCP server that asks for OAuth (401 with a `resource_metadata`
+challenge, MCP authorization spec) is now added through the authorization
+code flow: `POST /api/mcp-servers` answers `oauth_required`, then
+`POST /api/mcp-servers/oauth/start` (dynamic client registration + PKCE,
+the caller's `redirectUri`) and `POST /api/mcp-servers/oauth/finish`
+(`{state, code}`). Tokens are kept with the server and refreshed; a server
+whose refresh is refused shows `needsReauth`. Adds the column
+`user_mcp_servers.oauth` and the table `user_mcp_oauth_pending` at boot.
+
+### Added — custom MCP servers per person
+
+People can add their own Streamable HTTP MCP servers (`GET/POST
+/api/mcp-servers`, `PATCH`/`DELETE /api/mcp-servers/{id}`, end users included).
+A server is checked as MCP before it is saved, belongs only to the person
+who added it, and is offered to their own turns as the `custom_mcp` tool,
+on the same turns as their connected accounts. Tools the server doesn't
+mark read-only run only after the person approves them in the chat. New
+table `user_mcp_servers` is created at boot. See `docs/connectors.md`.
+
 ### Added — macOS privacy prompts name the product, not agl
 
 `POST /v1/machines/pairing` takes an optional `appName` (the product's

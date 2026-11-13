@@ -1948,6 +1948,7 @@ func buildToolCatalogForPlan(toolDefs []provider.Tool) string {
 func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) string {
 	chatterUID := a.chatterUserID(msg)
 	ctx = sandbox.WithUserID(ctx, chatterUID)
+	ctx = sandbox.WithSkillOwner(ctx, a.agentOwnerID)
 	ctx = store.WithChatterUserID(ctx, chatterUID)
 	ctx = store.WithChannel(ctx, msg.Channel)
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
@@ -2515,6 +2516,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// (where `npx skills add -g -y` writes). Tagging happens before
 	// any sandbox.Get call below so attachments + exec inherit it.
 	ctx = sandbox.WithUserID(ctx, chatterUID)
+	ctx = sandbox.WithSkillOwner(ctx, a.agentOwnerID)
 	// Tag ctx with the chatter so DBStore session writes stamp the
 	// chatter_user_id column (sessions / session_messages /
 	// session_events). user_id stays = UserSpace owner so admin views
@@ -2563,6 +2565,8 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// The chatter's connected third-party accounts (internal/connectors):
 	// mounted only where they may be used; see mountConnectors.
 	connectorNote := a.mountConnectors(ctx, msg, chatterUID, sess.SessionKey())
+	// MCP servers the chatter added themselves: same turns as their accounts.
+	customMCPNote := a.mountCustomMCP(ctx, msg, chatterUID)
 	// The person's own computers (agl): run_local_agent on 1:1 IM turns
 	// of the person the chat belongs to; see mountLocalAgents.
 	localAgentsNote := a.mountLocalAgents(ctx, msg)
@@ -2657,12 +2661,14 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		messages = append(messages, provider.Message{Role: "system", Content: hints})
 	}
 	// Volatile per-turn context (sender / client params / connector and
-	// agent mounts / persistence reminder / NOW line) is appended AFTER
-	// the history in ONE tail message — see buildTurnTailContext. It
-	// used to be interleaved here as system messages, which broke prefix
-	// caching every turn.
+	// agent mounts / custom MCP mounts / persistence reminder / NOW
+	// line) is appended AFTER the history in ONE tail message — see
+	// buildTurnTailContext. It used to be interleaved here as system
+	// messages, which broke prefix caching every turn. 上游新引入的
+	// customMCPNote 同样并入尾部消息（随 appendTurnTailContext 的
+	// extraNotes 传递），不回到内联插设的老路。
 	messages = append(messages, withConversationGapContext(modelMessagesWithRecentImages(sessionMsgs))...)
-	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem, connectorNote, agentsNote, localAgentsNote)
+	messages = a.appendTurnTailContext(messages, msg, chatterUID, chatterMem, connectorNote, customMCPNote, agentsNote, localAgentsNote)
 	// 注入扫描命中时追加一次性系统提示（in-flight）：放在尾部上下文之后，
 	// 系统提示保持字节稳定，前缀缓存不受影响。
 	if injectNotice != "" {
@@ -3515,6 +3521,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 
 	chatterUID := a.chatterUserID(msg)
 	ctx = sandbox.WithUserID(ctx, chatterUID)
+	ctx = sandbox.WithSkillOwner(ctx, a.agentOwnerID)
 	// Tag ctx so DBStore session writes stamp chatter_user_id — see
 	// the HandleMessage path for the rationale.
 	ctx = store.WithChatterUserID(ctx, chatterUID)
@@ -4423,6 +4430,7 @@ func (a *Agent) refreshSkillsFromStore(userID string) {
 	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.homePath, "", a.skillsCfg, a.globalSkillsCfg).
 		WithObjectStore(a.workspaceStore, a.agentID).
 		WithUserID(userID).
+		WithOwnerID(a.agentOwnerID).
 		WithSandbox(buildinfo.IsSandboxEnforced())
 	skills := loader.LoadSkills()
 	summary := loader.BuildSkillsSummary(skills)
@@ -4456,6 +4464,7 @@ func (a *Agent) ReloadWorkspaceFiles() {
 	// post-boot on this one) become visible.
 	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.homePath, "", a.skillsCfg, a.globalSkillsCfg).
 		WithUserID(a.ownerUserID).
+		WithOwnerID(a.agentOwnerID).
 		WithSandbox(buildinfo.IsSandboxEnforced())
 	if a.workspaceStore != nil {
 		loader.WithObjectStore(a.workspaceStore, a.agentID)
