@@ -1222,7 +1222,7 @@ export interface ChatStreamEvent {
     // subagent_progress payload — only populated when type === "subagent_progress".
     iteration?: number;
     max?: number;
-    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round";
+    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round" | "security_warning";
     tools?: string[];
     // status payload (type === "status", phase "retrying"): the model call
     // failed and the backend is retrying it.

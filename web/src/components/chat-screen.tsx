@@ -784,7 +784,7 @@ export function ChatScreen() {
   const [subagentProgress, setSubagentProgress] = useState<null | {
     iteration?: number;
     max?: number;
-    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up";
+    phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round" | "security_warning";
     tools?: string[];
   }>(null);
   // run_local_agent working on the person's computer: progress and, when
@@ -1221,7 +1221,7 @@ export function ChatScreen() {
           // subagent_progress fields
           iteration?: number;
           max?: number;
-          phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round";
+          phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round" | "security_warning";
           tools?: string[];
           // status fields (phase "retrying")
           attempt?: number;
@@ -5279,7 +5279,7 @@ function releaseChatBottomStick() {
 }
 
 export type ToolCallEntry = NonNullable<ChatMessage["toolCalls"]>[number];
-type ToolSubagentProgress = { iteration?: number; max?: number; phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up"; tools?: string[] };
+type ToolSubagentProgress = { iteration?: number; max?: number; phase?: "thinking" | "running" | "final-delivery" | "done" | "retrying" | "wrap_up" | "tool_round" | "security_warning"; tools?: string[] };
 export type ToolActivityItem = { kind: "tool"; tc: ToolCallEntry } | { kind: "note"; id: string; text: string };
 
 // message_agent calls render as private-message cards, not tool lines.
