@@ -208,6 +208,11 @@ type StreamChunk struct {
 	Content   string
 	ToolCalls []ToolCall
 	Done      bool
+	// ThinkingDelta is emitted per thinking_delta SSE event (anthropic
+	// extended thinking / compatible endpoints) so consumers can stream
+	// the thinking live. The accumulated full text still arrives on the
+	// final Done chunk in Thinking for persistence and replay.
+	ThinkingDelta string
 	// Thinking is emitted once at message_stop (if the model produced any)
 	// so callers can persist it alongside the final assistant message —
 	// required so the next turn can echo content[].thinking back to

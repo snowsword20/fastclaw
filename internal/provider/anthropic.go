@@ -733,6 +733,18 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 					case "thinking_delta":
 						if bs, ok := blocks[cbd.Index]; ok {
 							bs.thinking.WriteString(cbd.Delta.Thinking)
+							// thinking-delta: forward progressively so web chat
+							// consumers can stream the thinking live instead of
+							// waiting for the whole block at message_stop. The
+							// full text still arrives on the Done chunk for
+							// persistence/authority.
+							if cbd.Delta.Thinking != "" {
+								select {
+								case ch <- StreamChunk{ThinkingDelta: cbd.Delta.Thinking}:
+								case <-ctx.Done():
+									return
+								}
+							}
 						}
 					case "signature_delta":
 						if bs, ok := blocks[cbd.Index]; ok {

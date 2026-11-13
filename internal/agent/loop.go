@@ -823,6 +823,17 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 		if !ok {
 			break
 		}
+		if chunk.ThinkingDelta != "" && emitDeltas {
+			// thinking-delta: stream the model's thinking to web chat
+			// consumers live (thinking precedes the answer text). The
+			// full per-round text still arrives on the Done chunk and is
+			// emitted as the authoritative "thinking" event by the
+			// caller, so consumers can reconcile.
+			emitEvent(ctx, ChatEvent{
+				Type: "thinking_delta",
+				Data: map[string]any{"delta": chunk.ThinkingDelta},
+			})
+		}
 		if chunk.Content != "" {
 			contentBuilder.WriteString(chunk.Content)
 			if emitDeltas {
@@ -2875,6 +2886,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			asst := provider.Message{Role: "assistant", Content: content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
 
 			sess.Append(asst)
+			if resp.Thinking != "" {
+				emitEvent(ctx, ChatEvent{
+					Type: "thinking",
+					Data: map[string]any{"content": resp.Thinking},
+				})
+			}
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": content, "metadata": knowledgeMeta}})
 			if content != "" {
 				replyParts = append(replyParts, content)
@@ -2910,6 +2927,21 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			"round": i + 1,
 			"calls": len(resp.ToolCalls),
 		}})
+
+		// Surface the model's thinking once the provider round completes:
+		// anthropic-style thinking arrives with the Done chunk (not as
+		// incremental deltas), so web/CLI consumers get one "thinking"
+		// event carrying the full text per round. Emitted unconditionally
+		// (thinking can exist without content) and BEFORE the content
+		// event, matching the thinking-precedes-answer order; 移植自 WSL
+		// 的 thinking-stream WIP，并修掉了原稿在 content 非空时双发
+		// thinking 的瑕疵。
+		if resp.Thinking != "" {
+			emitEvent(ctx, ChatEvent{
+				Type: "thinking",
+				Data: map[string]any{"content": resp.Thinking},
+			})
+		}
 
 		// Emit assistant content before tool calls if present
 		if resp.Content != "" {
