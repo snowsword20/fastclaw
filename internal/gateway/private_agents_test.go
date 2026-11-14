@@ -44,7 +44,7 @@ func TestMessageAgentStaysWithinOwner(t *testing.T) {
 	ctx := context.Background()
 	mb := bus.New()
 
-	alice, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil)
+	alice, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestMessageAgentStaysWithinOwner(t *testing.T) {
 
 	// The account's own space is unchanged: platform agents reach each
 	// other and never an end-user's private agent.
-	app, err := loadUserSpace(ctx, "app", mb, st, nil, nil, nil, nil, nil, nil)
+	app, err := loadUserSpace(ctx, "app", mb, st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestPrivateAgentBackgroundWorkBelongsToOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	mb := bus.New()
-	alice, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil)
+	alice, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestPrivateAgentBackgroundWorkBelongsToOwner(t *testing.T) {
 		t.Fatalf("cron-bound private agent must stay loaded in its owner's space: pinned=%v loaded=%v",
 			alice.IsPinned("agt_a1"), alice.Agents.Names())
 	}
-	app, err := loadUserSpace(ctx, "app", mb, st, nil, nil, nil, nil, nil, nil)
+	app, err := loadUserSpace(ctx, "app", mb, st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestMessageAgentReachesMarkedAccountAgents(t *testing.T) {
 		}
 	}
 	mb := bus.New()
-	alice, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil)
+	alice, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

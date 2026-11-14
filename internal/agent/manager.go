@@ -52,6 +52,7 @@ type managerOpts struct {
 	sessionStore    session.SessionStore
 	memoryStore     MemoryStore
 	workspaceStore  workspace.Store
+	historyBackend  workspace.HistoryBackend
 	dataStore       store.Store
 	meter           usage.Meter
 	quotaStore      usage.QuotaStore
@@ -131,6 +132,17 @@ func WithUserID(userID string) ManagerOption {
 // shared storage instead of pod-local filesystem.
 func WithWorkspaceStore(ws workspace.Store) ManagerOption {
 	return func(o *managerOpts) { o.workspaceStore = ws }
+}
+
+// WithHistoryBackend installs the workspace version history backend on
+// every agent (turn-boundary snapshots, fork restore, REST history).
+// The gateway picks the implementation from the deployment shape — git
+// repos for LocalFS stores, content-addressed cloud snapshots for
+// object stores (see gateway/history_backend.go). Without it, agents
+// fall back to the git backend under FASTCLAW_HOME (standalone/test
+// builds only).
+func WithHistoryBackend(hb workspace.HistoryBackend) ManagerOption {
+	return func(o *managerOpts) { o.historyBackend = hb }
 }
 
 // WithDataStore exposes the platform's relational store to agents. The
@@ -313,6 +325,13 @@ func (m *Manager) buildAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider
 		// NewAgent pass loaded only the filesystem, missing anything that
 		// lives only in OSS.
 		ag.ReloadWorkspaceFiles()
+	}
+	if m.opts.historyBackend != nil {
+		// The gateway picked the backend from the deployment shape (git
+		// repos vs cloud snapshots). Overriding here beats the git
+		// fallback NewAgentWithSkillsCfg built — that fallback is only
+		// for standalone/test builds without a manager.
+		ag.history = m.opts.historyBackend
 	}
 	ag.endUserConnectors = m.opts.endUserConnectors
 	if m.opts.dataStore != nil {

@@ -43,6 +43,22 @@ type S3Config struct {
 // NewS3 builds an S3 Store. Returns a wrapped error instead of panicking so
 // the gateway can fall back to LocalFS on misconfiguration without crashing.
 func NewS3(cfg S3Config) (*S3, error) {
+	client, err := newMinioClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &S3{
+		client: client,
+		bucket: cfg.Bucket,
+		prefix: strings.Trim(cfg.Prefix, "/"),
+	}, nil
+}
+
+// newMinioClient builds the shared compatibility-layer client from a
+// config block. Used by the workspace Store itself and by the history
+// blob/manifest store (history_object.go) so both talk to the same
+// endpoint with the same credentials.
+func newMinioClient(cfg S3Config) (*minio.Client, error) {
 	if cfg.Endpoint == "" || cfg.Bucket == "" || cfg.AccessKey == "" || cfg.SecretKey == "" {
 		return nil, fmt.Errorf("s3 config requires endpoint/bucket/accessKey/secretKey")
 	}
@@ -54,11 +70,7 @@ func NewS3(cfg S3Config) (*S3, error) {
 	if err != nil {
 		return nil, fmt.Errorf("s3 client: %w", err)
 	}
-	return &S3{
-		client: client,
-		bucket: cfg.Bucket,
-		prefix: strings.Trim(cfg.Prefix, "/"),
-	}, nil
+	return client, nil
 }
 
 // key is <prefix>/<agentID>[/projects/<pid>[/<sid>]|/sessions/<sid>]/<path>,

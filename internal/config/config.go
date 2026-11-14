@@ -249,11 +249,22 @@ type RateLimitCfg struct {
 }
 
 // WorkspaceHistoryCfg toggles the opt-in per-session workspace version
-// history (git snapshots committed at turn boundary). LocalFS-backed
-// workspaces only — S3-backed stores skip history entirely. Known
-// limitation: no retention policy yet — every dirty turn adds a commit.
+// history (whole-tree snapshots committed at turn boundary). LocalFS
+// stores snapshot through git bare repos under FASTCLAW_HOME;
+// S3-compatible stores snapshot through the cloud backend (content-
+// addressed blobs in the object store, manifests in the SQL store or
+// the object store — see gateway/history_backend.go), so history works
+// across pods. Known limitation: no retention policy yet — every dirty
+// turn adds a snapshot.
 type WorkspaceHistoryCfg struct {
 	Enabled bool `json:"enabled"`
+	// ManifestStore picks where cloud snapshots' manifests live when
+	// the object store is S3-compatible: ""/"auto" (default) = the SQL
+	// store (sqlite or postgres — D2), "object" = the object store
+	// itself (D1). Blob payloads always live in the object store
+	// regardless. LocalFS deployments ignore this — they always use the
+	// git backend.
+	ManifestStore string `json:"manifestStore,omitempty"`
 }
 
 type MemoryCfg struct {

@@ -111,6 +111,10 @@ type Server struct {
 	apikeys        *users.APIKeys
 	dataStore      store.Store
 	workspaceStore workspace.Store
+	// historyBackend backs the workspace version-history REST endpoints.
+	// Nil (standalone/test servers) falls back to the git backend under
+	// FASTCLAW_HOME for LocalFS stores; cloud stores then 503 as before.
+	historyBackend workspace.HistoryBackend
 	webChan        *channels.WebChannel
 	pushClient     *push.APNSClient
 	// chatEvents fans live agent chat events out to subscribed SSE
@@ -180,6 +184,14 @@ func (s *Server) SetStore(st store.Store) {
 // SetWorkspaceStore installs the blob store used for agent-generated artifacts.
 func (s *Server) SetWorkspaceStore(ws workspace.Store) {
 	s.workspaceStore = ws
+}
+
+// SetHistoryBackend installs the workspace version-history backend the
+// history/restore endpoints serve from. The gateway passes the same
+// instance its agents snapshot through, so a snapshot taken by one pod
+// is listable and restorable from every pod.
+func (s *Server) SetHistoryBackend(hb workspace.HistoryBackend) {
+	s.historyBackend = hb
 }
 
 // SetUsageMeter installs the per-tenant resource counter.

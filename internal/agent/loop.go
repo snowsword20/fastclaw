@@ -91,7 +91,7 @@ type Agent struct {
 	piiScrubEnabled         bool
 	memoryCfg               config.MemoryCfg
 	workspaceHistoryEnabled bool
-	history                 *workspace.History
+	history                 workspace.HistoryBackend
 	// splitReplies is the per-agent multi-bubble toggle. Gates the
 	// per-turn system-prompt hint that advertises SplitMessageMarker
 	// to the LLM (see renderChannelHints) AND stamps
@@ -3666,32 +3666,45 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	}
 
 	// Workspace version history: snapshot the session workspace at turn
-	// boundary (opt-in; LocalFS only — S3-backed stores skip). Commit
-	// here, not per tool write, because sandbox exec writes via the bind
-	// mount are invisible to this process; the turn boundary is the one
-	// consistency point that covers file tools, exec and uploads.
+	// boundary (opt-in). Commit here, not per tool write, because sandbox
+	// exec writes via the bind mount are invisible to this process; the
+	// turn boundary is the one consistency point that covers file tools,
+	// exec and uploads.
+	//
+	// LocalFS stores snapshot their on-disk scope dir through the git
+	// backend; object stores snapshot the store's durable state through
+	// the cloud backend, so any pod can snapshot any scope (multi-pod).
 	//
 	// Commit message carries the working-set size ("turn msgs=<n>") so a
 	// fork can pick the snapshot AT its fork point (forkWorkspaceFiles):
 	// workspace scope follows the resolved session key for web chats, the
 	// same rule bindSession uses — a fork branch snapshots its own tree.
 	if a.workspaceHistoryEnabled && a.history != nil {
+		turnSess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+		wsScope := a.workspaceScopeFor(msg.Channel, msg.ChatID, turnSess.Key())
+		histScope := workspace.HistScope{
+			AgentID:   a.agentID,
+			ProjectID: a.registry.ProjectID(),
+			Session:   wsScope,
+		}
+		msgCount := len(turnSess.GetMessages())
+		var src workspace.TreeSource
 		if ls, ok := a.workspaceStore.(workspace.LocalScoper); ok {
-			turnSess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
-			wsScope := a.workspaceScopeFor(msg.Channel, msg.ChatID, turnSess.Key())
-			scope := wsScope
-			if pid := a.registry.ProjectID(); pid != "" {
-				scope = pid + "-" + wsScope
+			if dir, _ := ls.LocalScopeDir(a.agentID, histScope.ProjectID, wsScope); dir != "" {
+				src = workspace.NewDirSource(dir)
 			}
-			workTree, _ := ls.LocalScopeDir(a.agentID, a.registry.ProjectID(), wsScope)
-			msgCount := len(turnSess.GetMessages())
+		} else if a.workspaceStore != nil {
+			src = workspace.NewStoreSource(a.workspaceStore, a.agentID, histScope.ProjectID, wsScope)
+		}
+		if src != nil {
 			go func() {
 				// context.Background(): the turn ctx is cancelled when the HTTP
 				// handler returns, and a killed git leaves index.lock behind,
 				// silently breaking every later snapshot of this scope.
-				// runGit has its own 30s timeout as the bound.
-				if err := a.history.Commit(context.Background(), scope, workTree, fmt.Sprintf("turn msgs=%d", msgCount)); err != nil {
-					slog.Warn("workspace history commit failed", "agent", a.name, "scope", scope, "error", err)
+				// Both backends bound their own work (runGit's 30s timeout;
+				// per-object store calls the store client's timeouts).
+				if err := a.history.Commit(context.Background(), histScope, src, fmt.Sprintf("turn msgs=%d", msgCount)); err != nil {
+					slog.Warn("workspace history commit failed", "agent", a.name, "scope", histScope.Key(), "error", err)
 				}
 			}()
 		}
