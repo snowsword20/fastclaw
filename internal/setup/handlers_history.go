@@ -15,39 +15,69 @@ import (
 // agent loop); reading and restoring existing history needs no toggle —
 // rollback is a deliberate user action.
 //
-// Scope keys mirror the agent loop's commit path: chatID for loose chats,
-// "<projectID>-<chatID>" for project chats.
+// All four endpoints serve from the injected HistoryBackend
+// (SetHistoryBackend) — the same instance the agents snapshot through,
+// so a snapshot taken on pod A lists and restores from pod B. Standalone
+// servers without an injected backend fall back to the git backend
+// under FASTCLAW_HOME; on object stores that fallback 503s as before.
 
-// workspaceHistoryScope resolves the URL sessionId to the history scope key
-// and the on-disk worktree. Only LocalFS-backed workspaces have on-disk
-// scope dirs (probed via the LocalScoper marker, so a Metered wrapper still
-// counts), so S3 deployments get a stable 503 (never a 404 that looks
-// like "no history yet").
-func (s *Server) workspaceHistoryScope(w http.ResponseWriter, r *http.Request, agentID, urlToken string) (scope, workTree string, ok bool) {
-	ls, isLocal := s.workspaceStore.(workspace.LocalScoper)
-	if !isLocal {
-		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "workspace history requires a local workspace store"})
-		return "", "", false
+// historyBackendFor resolves the backend to serve with: the injected one,
+// or the git-backend fallback for standalone LocalFS servers.
+func (s *Server) historyBackendFor(w http.ResponseWriter) workspace.HistoryBackend {
+	if s.historyBackend != nil {
+		return s.historyBackend
 	}
-	// Resolved like the file list: the caller's own session, or for the
-	// agent's owner any session of the agent (e.g. an API end-user's).
+	if _, isLocal := s.workspaceStore.(workspace.LocalScoper); !isLocal {
+		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "workspace history requires a workspace history backend"})
+		return nil
+	}
+	root, err := s.workspaceHistoryRoot()
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return nil
+	}
+	return workspace.NewHistory(root)
+}
+
+// workspaceHistoryScope resolves the URL sessionId to the history scope.
+// Authorization mirrors the file list (the caller's own session, or for
+// the agent's owner any session of the agent), but the scope keeps the
+// RAW session id: snapshots are committed under the resolved session key
+// so a fork branch owns its own history, while workspaceFolderScope's
+// chatID merge maps a fork branch back to its origin chat — the file
+// browser's coordinate, not the history's. For web chats the URL
+// sessionId IS the session key; for IM chats it is the chatID — both
+// match what the agent loop committed under.
+func (s *Server) workspaceHistoryScope(w http.ResponseWriter, r *http.Request, agentID, urlToken string) (scope workspace.HistScope, ok bool) {
+	if s.historyBackend == nil {
+		// Standalone fallback still requires a local workspace store —
+		// object stores have no history there, and the error must not
+		// look like a 404 "no history yet".
+		if _, isLocal := s.workspaceStore.(workspace.LocalScoper); !isLocal {
+			jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "workspace history requires a workspace history backend"})
+			return workspace.HistScope{}, false
+		}
+	}
 	projectID, chatID, found := s.workspaceFolderScope(r, agentID, urlToken, "")
 	if !found || chatID == "" {
 		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "session not found"})
-		return "", "", false
+		return workspace.HistScope{}, false
 	}
-	scope, workTree = historyScopeFor(ls, agentID, projectID, chatID)
-	return scope, workTree, true
+	return workspace.HistScope{AgentID: agentID, ProjectID: projectID, Session: strings.TrimSpace(urlToken)}, true
 }
 
-// historyScopeFor maps a chat folder to its history scope key and worktree.
-func historyScopeFor(ls workspace.LocalScoper, agentID, projectID, chatID string) (scope, workTree string) {
-	scope = chatID
-	if projectID != "" {
-		scope = projectID + "-" + chatID
+// historySink picks where a restored snapshot lands: the chat's on-disk
+// scope dir on LocalFS stores, the store scope itself on object stores.
+func (s *Server) historySink(scope workspace.HistScope) workspace.TreeSink {
+	if ls, isLocal := s.workspaceStore.(workspace.LocalScoper); isLocal {
+		if dir, _ := ls.LocalScopeDir(scope.AgentID, scope.ProjectID, scope.Session); dir != "" {
+			return workspace.NewDirSink(dir)
+		}
 	}
-	workTree, _ = ls.LocalScopeDir(agentID, projectID, chatID)
-	return scope, workTree
+	if s.workspaceStore != nil {
+		return workspace.NewStoreSink(s.workspaceStore, scope.AgentID, scope.ProjectID, scope.Session)
+	}
+	return nil
 }
 
 // parseChatFolder reads a chat folder given as an agent-relative path —
@@ -69,23 +99,23 @@ func parseChatFolder(dir string) (projectID, chatID string, ok bool) {
 
 // workspaceFolderHistoryScope resolves ?dir= (or the restore body's dir)
 // for the agent-wide file view, which only the agent's owner may use.
-func (s *Server) workspaceFolderHistoryScope(w http.ResponseWriter, r *http.Request, agentID, dir string) (scope, workTree string, ok bool) {
-	ls, isLocal := s.workspaceStore.(workspace.LocalScoper)
-	if !isLocal {
-		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "workspace history requires a local workspace store"})
-		return "", "", false
+func (s *Server) workspaceFolderHistoryScope(w http.ResponseWriter, r *http.Request, agentID, dir string) (scope workspace.HistScope, ok bool) {
+	if s.historyBackend == nil {
+		if _, isLocal := s.workspaceStore.(workspace.LocalScoper); !isLocal {
+			jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "workspace history requires a workspace history backend"})
+			return workspace.HistScope{}, false
+		}
 	}
 	if !s.callerOwnsAgent(r, agentID) {
 		jsonResponse(w, http.StatusForbidden, map[string]any{"error": "only the agent's owner can browse its whole workspace"})
-		return "", "", false
+		return workspace.HistScope{}, false
 	}
 	projectID, chatID, valid := parseChatFolder(dir)
 	if !valid {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "dir must be sessions/<chat> or projects/<project>/<chat>"})
-		return "", "", false
+		return workspace.HistScope{}, false
 	}
-	scope, workTree = historyScopeFor(ls, agentID, projectID, chatID)
-	return scope, workTree, true
+	return workspace.HistScope{AgentID: agentID, ProjectID: projectID, Session: chatID}, true
 }
 
 // handleAgentFolderHistory lists one chat folder's snapshots by path
@@ -96,7 +126,7 @@ func (s *Server) handleAgentFolderHistory(w http.ResponseWriter, r *http.Request
 	if !s.requireAgentReadable(w, r, id) {
 		return
 	}
-	scope, _, ok := s.workspaceFolderHistoryScope(w, r, id, r.URL.Query().Get("dir"))
+	scope, ok := s.workspaceFolderHistoryScope(w, r, id, r.URL.Query().Get("dir"))
 	if !ok {
 		return
 	}
@@ -121,11 +151,11 @@ func (s *Server) handleAgentFolderHistoryRestore(w http.ResponseWriter, r *http.
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "invalid json: " + err.Error()})
 		return
 	}
-	scope, workTree, ok := s.workspaceFolderHistoryScope(w, r, id, body.Dir)
+	scope, ok := s.workspaceFolderHistoryScope(w, r, id, body.Dir)
 	if !ok {
 		return
 	}
-	s.restoreHistory(w, r, scope, workTree, body.Commit)
+	s.restoreHistory(w, r, scope, body.Commit)
 }
 
 func (s *Server) workspaceHistoryRoot() (string, error) {
@@ -136,27 +166,26 @@ func (s *Server) workspaceHistoryRoot() (string, error) {
 	return filepath.Join(home, "workspace-history"), nil
 }
 
-// handleAgentSessionHistory lists the snapshot commits of one chat's
-// workspace, newest first: {"history": [{hash, message, time}]}.
+// handleAgentSessionHistory lists the snapshots of one chat's workspace,
+// newest first: {"history": [{hash, message, time, msgs}]}.
 func (s *Server) handleAgentSessionHistory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !s.requireAgentReadable(w, r, id) {
 		return
 	}
-	scope, _, ok := s.workspaceHistoryScope(w, r, id, r.PathValue("sessionId"))
+	scope, ok := s.workspaceHistoryScope(w, r, id, r.PathValue("sessionId"))
 	if !ok {
 		return
 	}
 	s.writeHistoryList(w, r, scope)
 }
 
-func (s *Server) writeHistoryList(w http.ResponseWriter, r *http.Request, scope string) {
-	root, err := s.workspaceHistoryRoot()
-	if err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+func (s *Server) writeHistoryList(w http.ResponseWriter, r *http.Request, scope workspace.HistScope) {
+	hb := s.historyBackendFor(w)
+	if hb == nil {
 		return
 	}
-	entries, err := workspace.NewHistory(root).List(r.Context(), scope)
+	entries, err := hb.List(r.Context(), scope)
 	if err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -168,7 +197,7 @@ func (s *Server) writeHistoryList(w http.ResponseWriter, r *http.Request, scope 
 }
 
 // handleAgentSessionHistoryRestore checks the chat's workspace out to one
-// snapshot commit. The commit hash is validated in workspace.History.
+// snapshot. The snapshot id is validated by the backend.
 func (s *Server) handleAgentSessionHistoryRestore(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWritable(w, r) {
 		return
@@ -177,7 +206,7 @@ func (s *Server) handleAgentSessionHistoryRestore(w http.ResponseWriter, r *http
 	if !s.requireAgentReadable(w, r, id) {
 		return
 	}
-	scope, workTree, ok := s.workspaceHistoryScope(w, r, id, r.PathValue("sessionId"))
+	scope, ok := s.workspaceHistoryScope(w, r, id, r.PathValue("sessionId"))
 	if !ok {
 		return
 	}
@@ -188,16 +217,20 @@ func (s *Server) handleAgentSessionHistoryRestore(w http.ResponseWriter, r *http
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "invalid json: " + err.Error()})
 		return
 	}
-	s.restoreHistory(w, r, scope, workTree, body.Commit)
+	s.restoreHistory(w, r, scope, body.Commit)
 }
 
-func (s *Server) restoreHistory(w http.ResponseWriter, r *http.Request, scope, workTree, commit string) {
-	root, err := s.workspaceHistoryRoot()
-	if err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+func (s *Server) restoreHistory(w http.ResponseWriter, r *http.Request, scope workspace.HistScope, commit string) {
+	hb := s.historyBackendFor(w)
+	if hb == nil {
 		return
 	}
-	if err := workspace.NewHistory(root).Restore(r.Context(), scope, workTree, commit); err != nil {
+	sink := s.historySink(scope)
+	if sink == nil {
+		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "workspace history restore requires a workspace store"})
+		return
+	}
+	if err := hb.Restore(r.Context(), scope, commit, sink); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}

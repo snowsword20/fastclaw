@@ -723,7 +723,7 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 // by the resulting UserSpace. Pass nil when sandbox is disabled at
 // system scope; agents will run with path-only file roots in that
 // case.
-func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, quotaStore usage.QuotaStore, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager, projectRuntime *coderuntime.Manager) (*UserSpace, error) {
+func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, quotaStore usage.QuotaStore, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager, projectRuntime *coderuntime.Manager, historyBackend workspace.HistoryBackend) (*UserSpace, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("loadUserSpace: userID required")
 	}
@@ -920,6 +920,9 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	if ws != nil {
 		managerOpts = append(managerOpts, agent.WithWorkspaceStore(ws))
 	}
+	if historyBackend != nil {
+		managerOpts = append(managerOpts, agent.WithHistoryBackend(historyBackend))
+	}
 	if meter != nil {
 		managerOpts = append(managerOpts, agent.WithMeter(meter))
 	}
@@ -1114,6 +1117,10 @@ type userSpaceRegistry struct {
 	// construction (the manager is built later in boot than the
 	// registry), hence the mutable field + mutex rather than a ctor arg.
 	projectRuntime *coderuntime.Manager
+	// historyBackend is the workspace version history implementation
+	// (git repos vs cloud snapshots — picked from the deployment shape
+	// at gateway boot). Same late-attach story as projectRuntime.
+	historyBackend workspace.HistoryBackend
 }
 
 // setProjectRuntime records the manager so subsequent loadUserSpace calls
@@ -1121,6 +1128,15 @@ type userSpaceRegistry struct {
 func (r *userSpaceRegistry) setProjectRuntime(m *coderuntime.Manager) {
 	r.mu.Lock()
 	r.projectRuntime = m
+	r.mu.Unlock()
+}
+
+// setHistoryBackend records the workspace history implementation so
+// subsequent loadUserSpace calls attach it to every agent manager.
+// Guarded by mu — same late-attach race as setProjectRuntime.
+func (r *userSpaceRegistry) setHistoryBackend(hb workspace.HistoryBackend) {
+	r.mu.Lock()
+	r.historyBackend = hb
 	r.mu.Unlock()
 }
 
@@ -1178,7 +1194,7 @@ func (r *userSpaceRegistry) getOrLoad(ctx context.Context, userID string) (*User
 		e.lastUsed = time.Now()
 		return e.space, nil
 	}
-	sp, err := loadUserSpace(ctx, userID, r.bus, r.store, r.workspace, r.meter, r.quotaStore, r.systemSandboxPool, r.pluginMgr, r.projectRuntime)
+	sp, err := loadUserSpace(ctx, userID, r.bus, r.store, r.workspace, r.meter, r.quotaStore, r.systemSandboxPool, r.pluginMgr, r.projectRuntime, r.historyBackend)
 	if err != nil {
 		return nil, err
 	}

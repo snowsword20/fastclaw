@@ -8,14 +8,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// History is an opt-in per-scope version history for workspace directories,
-// backed by git bare repositories stored OUTSIDE the workspace (default
-// ~/.fastclaw/workspace-history/<scope>.git).
+// History is the git-backed HistoryBackend: per-scope bare git repos
+// stored OUTSIDE the workspace (default ~/.fastclaw/workspace-history/
+// <scope>.git). It serves single-host deployments where the workspace
+// store is LocalFS. Cloud (object-store) deployments use CloudHistory —
+// see history_cloud.go.
 //
 // Design notes (why this shape):
 //   - A .git directory inside the workspace would be visible to the agent
@@ -33,9 +36,6 @@ import (
 // Known limitation: there is no retention policy — every dirty turn adds a
 // commit, so binary-heavy workspaces grow the repo unbounded. A git gc /
 // retention window is future work.
-//
-// Rollback is manual for now (git --git-dir=<repo> --work-tree=<dir> log /
-// checkout); a workspace-panel entry can come later.
 type History struct {
 	root string
 	// locks serializes commits per scope: two overlapping turns of the same
@@ -44,33 +44,43 @@ type History struct {
 	locks sync.Map // scope -> *sync.Mutex
 }
 
-// NewHistory returns a History storing bare repositories under root
-// (one <scope>.git per workspace scope).
+// NewHistory returns the git-backed HistoryBackend, storing bare
+// repositories under root (one <scope>.git per workspace scope).
 func NewHistory(root string) *History {
 	return &History{root: root}
 }
+
+// Compile-time proof History satisfies the backend contract.
+var _ HistoryBackend = (*History)(nil)
 
 func (h *History) lockFor(scope string) *sync.Mutex {
 	lock, _ := h.locks.LoadOrStore(scope, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 
-// Commit snapshots workTree into the scope's bare repository. The first
-// call initializes the repo; clean trees are skipped (no empty commits).
-// Any error is returned for the caller to log — never fatal.
-func (h *History) Commit(ctx context.Context, scope, workTree, message string) error {
-	if scope == "" || workTree == "" {
-		return fmt.Errorf("workspace history: scope and workTree required")
+// Commit snapshots the source tree into the scope's bare repository. The
+// source must be a DirSource — git needs a host worktree; cloud (object
+// store) scopes belong to CloudHistory. The first call initializes the
+// repo; clean trees are skipped (no empty commits). Any error is returned
+// for the caller to log — never fatal.
+func (h *History) Commit(ctx context.Context, scope HistScope, src TreeSource, message string) error {
+	ds, ok := src.(*DirSource)
+	if !ok || ds.Root == "" {
+		return fmt.Errorf("workspace history: git backend requires a directory source, got %T", src)
 	}
-	info, err := os.Stat(workTree)
+	if scope.Session == "" {
+		return fmt.Errorf("workspace history: scope required")
+	}
+	key := scope.Key()
+	info, err := os.Stat(ds.Root)
 	if err != nil || !info.IsDir() {
 		return nil // nothing to snapshot
 	}
-	lock := h.lockFor(scope)
+	lock := h.lockFor(key)
 	lock.Lock()
 	defer lock.Unlock()
 
-	repo := h.RepoPath(scope)
+	repo := h.RepoPath(key)
 	if _, err := os.Stat(repo); os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
 			return err
@@ -83,7 +93,7 @@ func (h *History) Commit(ctx context.Context, scope, workTree, message string) e
 		}
 	}
 	gitDir := "--git-dir=" + repo
-	workTreeArg := "--work-tree=" + workTree
+	workTreeArg := "--work-tree=" + ds.Root
 	if out, err := runGit(ctx, gitDir, workTreeArg, "add", "-A"); err != nil {
 		return fmt.Errorf("git add: %s: %w", out, err)
 	}
@@ -101,21 +111,26 @@ func (h *History) Commit(ctx context.Context, scope, workTree, message string) e
 	if err != nil {
 		return fmt.Errorf("git commit: %s: %w", out, err)
 	}
-	slog.Info("workspace history committed", "scope", scope, "repo", repo)
+	slog.Info("workspace history committed", "scope", key, "repo", repo)
 	return nil
 }
 
-// Entry is one snapshot commit, newest first when returned by List.
+// Entry is one snapshot, newest first when returned by List. Hash is the
+// git commit hash on the git backend and an opaque snapshot id on the
+// cloud backend — the REST layer treats it as a pass-through handle.
+// Msgs is the turn coordinate parsed from the commit message
+// ("turn msgs=<n>"); 0 when the message carries none.
 type Entry struct {
 	Hash    string `json:"hash"`
 	Message string `json:"message"`
 	Time    int64  `json:"time"`
+	Msgs    int    `json:"msgs,omitempty"`
 }
 
 // List returns the scope's snapshot commits, newest first. No history
 // yields an empty slice (not an error).
-func (h *History) List(ctx context.Context, scope string) ([]Entry, error) {
-	repo := h.RepoPath(scope)
+func (h *History) List(ctx context.Context, scope HistScope) ([]Entry, error) {
+	repo := h.RepoPath(scope.Key())
 	if _, err := os.Stat(repo); os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -135,27 +150,59 @@ func (h *History) List(ctx context.Context, scope string) ([]Entry, error) {
 		}
 		var t int64
 		fmt.Sscanf(parts[2], "%d", &t)
-		entries = append(entries, Entry{Hash: parts[0], Message: parts[1], Time: t})
+		entries = append(entries, Entry{
+			Hash:    parts[0],
+			Message: parts[1],
+			Time:    t,
+			Msgs:    entryMsgs(parts[1]),
+		})
 	}
 	return entries, nil
 }
 
-// Restore checks the whole worktree out to the given commit. The commit
-// hash is validated to prevent flag injection.
-func (h *History) Restore(ctx context.Context, scope, workTree, commit string) error {
-	if !isHexHash(commit) {
+// Restore checks the whole worktree out to the given snapshot into dst.
+// The git backend requires a DirSink. The snapshot id is validated to
+// prevent flag injection.
+func (h *History) Restore(ctx context.Context, scope HistScope, id string, dst TreeSink) error {
+	ds, ok := dst.(*DirSink)
+	if !ok || ds.Root == "" {
+		return fmt.Errorf("workspace history: git backend requires a directory sink, got %T", dst)
+	}
+	if !isHexHash(id) {
 		return fmt.Errorf("workspace history: invalid commit hash")
 	}
-	repo := h.RepoPath(scope)
+	repo := h.RepoPath(scope.Key())
 	if _, err := os.Stat(repo); os.IsNotExist(err) {
-		return fmt.Errorf("workspace history: no history for scope %q", scope)
+		return fmt.Errorf("workspace history: no history for scope %q", scope.Key())
 	}
-	out, err := runGit(ctx, "--git-dir="+repo, "--work-tree="+workTree, "checkout", commit, "--", ".")
+	out, err := runGit(ctx, "--git-dir="+repo, "--work-tree="+ds.Root, "checkout", id, "--", ".")
 	if err != nil {
 		return fmt.Errorf("git checkout: %s: %w", out, err)
 	}
-	slog.Info("workspace history restored", "scope", scope, "commit", commit)
+	slog.Info("workspace history restored", "scope", scope.Key(), "commit", id)
 	return nil
+}
+
+// ParseTurnMsgs reads "turn msgs=<n>" (optionally with legacy
+// "turn <RFC3339>" prefixes) from a snapshot message. Exported because
+// the fork path in the agent package matches snapshots by this
+// coordinate as a fallback for entries with no structured Msgs.
+func ParseTurnMsgs(message string) (int, bool) {
+	for _, field := range strings.Fields(message) {
+		if v, ok := strings.CutPrefix(field, "msgs="); ok {
+			n, err := strconv.Atoi(v)
+			if err == nil {
+				return n, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// entryMsgs is ParseTurnMsgs with the not-found case collapsing to 0.
+func entryMsgs(message string) int {
+	n, _ := ParseTurnMsgs(message)
+	return n
 }
 
 func isHexHash(s string) bool {

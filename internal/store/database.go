@@ -203,6 +203,9 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateMachinesAddSettings(ctx); err != nil {
 		return fmt.Errorf("migrate machines settings: %w", err)
 	}
+	if err := d.migrateWorkspaceHistory(ctx); err != nil {
+		return fmt.Errorf("migrate workspace history: %w", err)
+	}
 	return nil
 }
 

@@ -38,7 +38,7 @@ func TestHistoryCommitSnapshotsWorkTree(t *testing.T) {
 	}
 	h := NewHistory(filepath.Join(root, "history"))
 
-	if err := h.Commit(context.Background(), "s1", workTree, "turn 1"); err != nil {
+	if err := h.Commit(context.Background(), HistScope{Session: "s1"}, NewDirSource(workTree), "turn 1"); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -67,10 +67,10 @@ func TestHistorySkipsEmptyCommit(t *testing.T) {
 	}
 	h := NewHistory(filepath.Join(root, "history"))
 
-	if err := h.Commit(context.Background(), "s1", workTree, "turn 1"); err != nil {
+	if err := h.Commit(context.Background(), HistScope{Session: "s1"}, NewDirSource(workTree), "turn 1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Commit(context.Background(), "s1", workTree, "turn 2"); err != nil {
+	if err := h.Commit(context.Background(), HistScope{Session: "s1"}, NewDirSource(workTree), "turn 2"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,13 +96,13 @@ func TestHistorySecondCommitCapturesModificationAndRollback(t *testing.T) {
 	}
 	h := NewHistory(filepath.Join(root, "history"))
 
-	if err := h.Commit(context.Background(), "s1", workTree, "turn 1"); err != nil {
+	if err := h.Commit(context.Background(), HistScope{Session: "s1"}, NewDirSource(workTree), "turn 1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(file, []byte("v2-corrupted"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Commit(context.Background(), "s1", workTree, "turn 2"); err != nil {
+	if err := h.Commit(context.Background(), HistScope{Session: "s1"}, NewDirSource(workTree), "turn 2"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,17 +138,17 @@ func TestHistoryListAndRestore(t *testing.T) {
 	if err := os.WriteFile(file, []byte("v1"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Commit(ctx, "s1", workTree, "turn 1"); err != nil {
+	if err := h.Commit(ctx, HistScope{Session: "s1"}, NewDirSource(workTree), "turn 1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(file, []byte("v2"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Commit(ctx, "s1", workTree, "turn 2"); err != nil {
+	if err := h.Commit(ctx, HistScope{Session: "s1"}, NewDirSource(workTree), "turn 2"); err != nil {
 		t.Fatal(err)
 	}
 
-	entries, err := h.List(ctx, "s1")
+	entries, err := h.List(ctx, HistScope{Session: "s1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,11 +159,11 @@ func TestHistoryListAndRestore(t *testing.T) {
 		t.Fatalf("newest entry first with timestamp: %+v", entries[0])
 	}
 	// 无历史的 scope 返回空列表而非错误
-	if empty, err := h.List(ctx, "nope"); err != nil || len(empty) != 0 {
+	if empty, err := h.List(ctx, HistScope{Session: "nope"}); err != nil || len(empty) != 0 {
 		t.Fatalf("missing scope should list empty: %v %v", empty, err)
 	}
 
-	if err := h.Restore(ctx, "s1", workTree, entries[1].Hash); err != nil {
+	if err := h.Restore(ctx, HistScope{Session: "s1"}, entries[1].Hash, NewDirSink(workTree)); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(file)
@@ -178,7 +178,7 @@ func TestHistoryListAndRestore(t *testing.T) {
 func TestHistoryRestoreRejectsBadHash(t *testing.T) {
 	gitAvailable(t)
 	h := NewHistory(t.TempDir())
-	if err := h.Restore(context.Background(), "s1", t.TempDir(), "main; rm -rf /"); err == nil {
+	if err := h.Restore(context.Background(), HistScope{Session: "s1"}, "main; rm -rf /", NewDirSink(t.TempDir())); err == nil {
 		t.Fatal("invalid hash must be rejected")
 	}
 }
@@ -205,7 +205,7 @@ func TestHistoryConcurrentCommitsAreSerialized(t *testing.T) {
 				done <- err
 				return
 			}
-			done <- h.Commit(ctx, "s1", workTree, "turn "+name)
+			done <- h.Commit(ctx, HistScope{Session: "s1"}, NewDirSource(workTree), "turn "+name)
 		}(i)
 	}
 	for i := 0; i < n; i++ {

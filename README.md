@@ -26,6 +26,7 @@ A lightweight AI Agent runtime written in Go.
 - **思考过程流式**：`thinking` / `thinking_delta` 事件实时透传到 web 聊天，思考文本随历史持久化并在前端渲染
 - **回答多版本（重新生成）**：‹n/m› 变体切换器，`POST /api/chat/retry`、`POST /api/chat/variant`；激活段是 LLM 唯一上下文，档案 append-only 保留全部版本，末轮冻结守卫防污染
 - **Web 会话分叉**：`POST /api/chat/fork` 按档案条目 id（entryId）定位分叉点，工作区文件按回合快照随分叉落盘；分叉后显式 session key 路由防消息串线
+- **工作区版本历史云模式**：多实例部署下快照改为内容寻址——blob 入对象存储、清单入 SQL 库（D2，默认）或对象存储（D1），跨 pod 可见可恢复；本地单实例保持 git 裸仓库后端不变（[docs/workspace-history.md](docs/workspace-history.md)）
 - **exec 安全闸两级化**：不可逆破坏直接拒绝、危险操作需 `force` 确认；附带入站注入扫描、回合阶段事件、多档撤销
 - **杂项**：feedgrab 沙箱镜像构建、math-practice 出题技能、cron 渠道重绑孤立任务迁移、Postgres 计划任务时区修复、微信 cron 推送静默失败可见化
 

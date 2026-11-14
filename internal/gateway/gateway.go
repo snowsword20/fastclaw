@@ -226,6 +226,7 @@ type Gateway struct {
 	store       store.Store
 	accounts    *users.Accounts
 	workspace   workspace.Store
+	history     workspace.HistoryBackend
 	sandboxPool sandbox.ExecutorPool
 	usage       usage.Meter
 	quotaStore  usage.QuotaStore
@@ -283,6 +284,21 @@ func (g *Gateway) WebChannel() *channels.WebChannel { return g.webChan }
 
 // Workspace returns the durable artifact store.
 func (g *Gateway) Workspace() workspace.Store { return g.workspace }
+
+// History returns the workspace version history backend (git repos on
+// single-host, cloud snapshots on object stores). Nil only when the
+// cloud assembly failed at boot — agents then run without history.
+func (g *Gateway) History() workspace.HistoryBackend { return g.history }
+
+// SetHistoryBackend attaches the backend to the user-space registry so
+// agents loaded afterwards snapshot through it. Called by New(); also
+// the seam tests use to install in-memory backends.
+func (g *Gateway) SetHistoryBackend(hb workspace.HistoryBackend) {
+	g.history = hb
+	if g.users != nil {
+		g.users.setHistoryBackend(hb)
+	}
+}
 
 // Usage returns the per-tenant resource meter.
 func (g *Gateway) Usage() usage.Meter { return g.usage }
@@ -461,6 +477,12 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 	// refused to run with "sandbox required but no executor available".
 	systemSandboxPool := buildSystemSandboxPool(readSystemSandboxCfg(st), ws)
 
+	// Workspace history backend — git repos on single-host, content-
+	// addressed cloud snapshots when the object store is S3-compatible.
+	// Built once here and attached to the user-space registry (agents)
+	// and, via main.go, the setup server (REST endpoints).
+	hist := buildHistoryBackend(st, osCfg, homeDir, readSystemWorkspaceHistory(st))
+
 	// Accounts service is used by the inbound routing loop to lazy-mint
 	// per-(channel, IM-sender) app_user rows so each chatter on an IM
 	// channel ends up with their own stable fastclaw u_xxx id (and thus
@@ -475,6 +497,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		store:       st,
 		accounts:    accts,
 		workspace:   ws,
+		history:     hist,
 		usage:       meter,
 		quotaStore:  quotaStore,
 		sandboxPool: systemSandboxPool,
@@ -485,6 +508,9 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		webhookSrv:  webhookSrv,
 		pluginMgr:   pluginMgr,
 		envCfg:      env,
+	}
+	if hist != nil {
+		g.users.setHistoryBackend(hist)
 	}
 
 	if webhookSrv != nil {

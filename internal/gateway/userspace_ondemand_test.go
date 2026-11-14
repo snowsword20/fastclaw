@@ -66,7 +66,7 @@ func TestOnDemandUserSpace(t *testing.T) {
 	}
 
 	mb := bus.New()
-	sp, err := loadUserSpace(ctx, "app", mb, st, nil, nil, nil, nil, nil, nil)
+	sp, err := loadUserSpace(ctx, "app", mb, st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestEagerUserSpaceUnderLimit(t *testing.T) {
 	ctx := context.Background()
 	mustUser(t, st, "solo", users.RoleUser, "")
 	mustAgent(t, st, "agt_only", "solo")
-	sp, err := loadUserSpace(ctx, "solo", bus.New(), st, nil, nil, nil, nil, nil, nil)
+	sp, err := loadUserSpace(ctx, "solo", bus.New(), st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestAppUserSpaceOwnsAppAgents(t *testing.T) {
 	}
 
 	mb := bus.New()
-	sp, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil)
+	sp, err := loadUserSpace(ctx, "u_alice", mb, st, nil, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

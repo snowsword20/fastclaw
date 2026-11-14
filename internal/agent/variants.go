@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
@@ -435,64 +434,73 @@ func (a *Agent) workspaceScopeFor(channel, chatID, resolvedKey string) string {
 // forkWorkspaceFiles materializes the source session's workspace files
 // into the fork branch's workspace, restored to the FORK POINT state.
 //
-// Accuracy comes from the workspace git history (workspace.History, one
-// bare repo per scope, a commit at every turn boundary whose message is
-// "turn msgs=<messageCount>"): the newest commit with msgs <= keep is
-// exactly the file state as of the fork point. When history is disabled
-// or no such commit exists, an exact restore is impossible — a full fork
-// (keep >= all messages) falls back to copying the live directory, while
+// Accuracy comes from the workspace history (HistoryBackend, a snapshot
+// at every turn boundary whose message is "turn msgs=<messageCount>"):
+// the newest snapshot with msgs <= keep is exactly the file state as of
+// the fork point. When history is disabled or no such snapshot exists,
+// an exact restore is impossible — a full fork (keep >= all messages)
+// falls back to copying the live tree (directory or store scope), while
 // a mid-history fork deliberately copies nothing rather than leak files
 // from after the fork point.
+//
+// LocalFS stores work through host directories (git backend + dir
+// source/sink); object stores work through the workspace store itself
+// (cloud backend + store source/sink), so fork restore works from any
+// pod in a multi-pod deployment.
 func (a *Agent) forkWorkspaceFiles(ctx context.Context, chatID, projectID, srcKey, newKey string, keep, totalMsgs int) {
 	if a.workspaceStore == nil {
 		return
 	}
-	ls, ok := a.workspaceStore.(workspace.LocalScoper)
-	if !ok {
-		return // S3-backed stores: no host tree to copy
-	}
-	srcScope := a.workspaceScopeFor("web", chatID, srcKey)
-	dstScope := a.workspaceScopeFor("web", chatID, newKey)
-	if projectID != "" {
-		srcScope = projectID + "-" + srcScope
-		dstScope = projectID + "-" + dstScope
-	}
-	srcDir, ok := ls.LocalScopeDir(a.name, projectID, srcKey)
-	if !ok || srcDir == "" {
-		return
-	}
-	dstDir, ok := ls.LocalScopeDir(a.name, projectID, newKey)
-	if !ok || dstDir == "" || dstDir == srcDir {
-		return
-	}
+	srcScope := workspace.HistScope{AgentID: a.name, ProjectID: projectID, Session: srcKey}
 
-	// Commit the live tree first so "now" is snapshotted — but tag it
-	// with the FULL message count: it represents the fork moment, which
-	// is only the right state for a full-history fork.
-	syncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if a.workspaceHistoryEnabled && a.history != nil {
-		if err := a.history.Commit(syncCtx, srcScope, srcDir, fmt.Sprintf("turn msgs=%d", totalMsgs)); err != nil {
-			slog.Debug("fork pre-copy commit failed", "scope", srcScope, "error", err)
+	var srcDir, dstDir string
+	ls, isLocal := a.workspaceStore.(workspace.LocalScoper)
+	if isLocal {
+		srcDir, _ = ls.LocalScopeDir(a.name, projectID, srcKey)
+		dstDir, _ = ls.LocalScopeDir(a.name, projectID, newKey)
+		if srcDir == "" || dstDir == "" || dstDir == srcDir {
+			return
 		}
 	}
 
+	// Trees flow through the same medium file tools use in this
+	// deployment: directories on LocalFS, store scopes on object stores.
+	var srcTree workspace.TreeSource
+	var dstSink workspace.TreeSink
+	if isLocal {
+		srcTree = workspace.NewDirSource(srcDir)
+		dstSink = workspace.NewDirSink(dstDir)
+	} else {
+		srcTree = workspace.NewStoreSource(a.workspaceStore, a.name, projectID, srcKey)
+		dstSink = workspace.NewStoreSink(a.workspaceStore, a.name, projectID, newKey)
+	}
+
+	syncCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	if a.workspaceHistoryEnabled && a.history != nil {
+		// Commit the live tree first so "now" is snapshotted — but tag it
+		// with the FULL message count: it represents the fork moment, which
+		// is only the right state for a full-history fork.
+		if err := a.history.Commit(syncCtx, srcScope, srcTree, fmt.Sprintf("turn msgs=%d", totalMsgs)); err != nil {
+			slog.Debug("fork pre-copy commit failed", "scope", srcScope.Key(), "error", err)
+		}
+
 		if entries, err := a.history.List(syncCtx, srcScope); err == nil {
 			// newest first; first entry with msgs <= keep wins
 			for _, e := range entries {
-				msgs, ok := parseTurnMsgs(e.Message)
-				if !ok || msgs > keep {
+				msgs := e.Msgs
+				if n, ok := parseTurnMsgs(e.Message); ok && (msgs == 0 || n < msgs) {
+					msgs = n
+				}
+				if msgs <= 0 || msgs > keep {
 					continue
 				}
-				if err := os.MkdirAll(dstDir, 0o755); err != nil {
+				if err := a.history.Restore(syncCtx, srcScope, e.Hash, dstSink); err != nil {
+					slog.Warn("fork workspace restore failed", "scope", srcScope.Key(), "snapshot", e.Hash, "error", err)
 					return
 				}
-				if err := a.history.Restore(syncCtx, srcScope, dstDir, e.Hash); err != nil {
-					slog.Warn("fork workspace restore failed", "scope", srcScope, "commit", e.Hash, "error", err)
-					return
-				}
-				slog.Info("fork workspace restored to turn snapshot", "scope", srcScope, "commit", e.Hash, "msgs", msgs)
+				slog.Info("fork workspace restored to turn snapshot", "scope", srcScope.Key(), "snapshot", e.Hash, "msgs", msgs)
 				return
 			}
 		}
@@ -501,26 +509,46 @@ func (a *Agent) forkWorkspaceFiles(ctx context.Context, chatID, projectID, srcKe
 	// No usable snapshot: exact restore impossible.
 	if keep >= totalMsgs {
 		// Full fork — the live tree IS the fork point; copy it.
-		if err := copyDir(syncCtx, srcDir, dstDir); err != nil {
-			slog.Warn("fork workspace copy failed", "src", srcDir, "dst", dstDir, "error", err)
+		if isLocal {
+			if err := copyDir(syncCtx, srcDir, dstDir); err != nil {
+				slog.Warn("fork workspace copy failed", "src", srcDir, "dst", dstDir, "error", err)
+			}
+			return
+		}
+		if err := copyStoreScope(syncCtx, a.workspaceStore, a.name, projectID, srcKey, newKey); err != nil {
+			slog.Warn("fork workspace copy failed", "scope", srcScope.Key(), "error", err)
 		}
 		return
 	}
-	slog.Info("fork workspace: no snapshot at fork point, branch starts with an empty workspace", "scope", srcScope, "keep", keep)
+	slog.Info("fork workspace: no snapshot at fork point, branch starts with an empty workspace", "scope", srcScope.Key(), "keep", keep)
 }
 
 // parseTurnMsgs reads "turn msgs=<n>" (optionally with legacy
-// "turn <RFC3339>" prefixes) from a history commit message.
+// "turn <RFC3339>" prefixes) from a history snapshot message.
 func parseTurnMsgs(message string) (int, bool) {
-	for _, field := range strings.Fields(message) {
-		if v, ok := strings.CutPrefix(field, "msgs="); ok {
-			n, err := strconv.Atoi(v)
-			if err == nil {
-				return n, true
-			}
+	return workspace.ParseTurnMsgs(message)
+}
+
+// copyStoreScope copies every object from one workspace scope to
+// another — the cloud full-fork fallback, where the store is the only
+// "live tree" there is.
+func copyStoreScope(ctx context.Context, st workspace.Store, agentID, projectID, srcSession, dstSession string) error {
+	objs, err := st.List(ctx, agentID, projectID, srcSession)
+	if err != nil {
+		return err
+	}
+	for _, o := range objs {
+		rc, err := st.Get(ctx, agentID, projectID, srcSession, o.Path)
+		if err != nil {
+			return err
+		}
+		err = st.Put(ctx, agentID, projectID, dstSession, o.Path, rc, o.Size, "")
+		rc.Close()
+		if err != nil {
+			return err
 		}
 	}
-	return 0, false
+	return nil
 }
 
 // copyDir recursively copies src into dst (dst created as needed).
