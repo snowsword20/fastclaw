@@ -463,12 +463,25 @@ func (m *Manager) ForkSession(channel, accountID, chatID string, keepLast int) (
 // 供"从某条历史回答分叉"的前端按钮使用：前端给出要保留到的位置，
 // 这里截取原始消息切片的前缀（工具结果等中间消息都随上下文带走）。
 // keepFirst >= len(msgs) 时等同全量分叉；keepFirst <= 0 时等同 OpenNewSession + 空历史。
+//
+// 注意复制源是 m.Get(triple) —— 分叉后 activeOverride 会把这条 triple
+// 指向分支，再次 fork 会从**当前活跃线**复制。web 面板的按回答分叉
+// 需要"从指定会话的指定前缀"复制，别用它：走 ForkSessionFromMessages。
 func (m *Manager) ForkSessionKeepFirst(channel, accountID, chatID string, keepFirst int) (string, error) {
 	cur := m.Get(channel, accountID, chatID, "")
 	msgs := cur.GetMessages()
 	if keepFirst >= 0 && keepFirst < len(msgs) {
 		msgs = msgs[:keepFirst]
 	}
+	return m.forkFrom(channel, accountID, chatID, msgs)
+}
+
+// ForkSessionFromMessages 在调用方给定的消息集上分叉出平行时间线。
+// web 面板的"从这条回答分叉"专用：源会话 key 可能已被更早一次 fork 的
+// activeOverride 挡住（m.Get(triple) 会返回分支而非调用者选中的会话），
+// 所以复制源必须由调用方显式解析并切好，这里只负责起新线、记来路、
+// 复制消息 —— 与 ForkSessionKeepFirst 共用 forkFrom 尾段。
+func (m *Manager) ForkSessionFromMessages(channel, accountID, chatID string, msgs []provider.Message) (string, error) {
 	return m.forkFrom(channel, accountID, chatID, msgs)
 }
 

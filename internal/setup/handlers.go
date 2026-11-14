@@ -1439,6 +1439,176 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleChatRetry is the SSE twin of handleChatStream for the web
+// panel's "regenerate" button: trims the last turn (PrepareWebRetry
+// archives the old answer as an inactive variant) and re-runs the
+// question through the normal stream path with the variant stamp in
+// Params — every message the new turn appends lands in the new variant
+// segment. Connection handling is identical to handleChatStream; only
+// the agent-goroutine body differs.
+func (s *Server) handleChatRetry(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWritable(w, r) {
+		return
+	}
+	var req chatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	ag := s.resolveAgent(r, req.AgentID)
+	if ag == nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "agent not found"})
+		return
+	}
+	uid := s.effectiveUserID(r)
+	if uid == "" {
+		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+	if req.SessionID == "" {
+		req.SessionID = "web-ui"
+	}
+	agentCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), agentTurnTimeout)
+	streamSessionID := s.chatEventSessionID(r, ag.Name(), req.SessionID)
+	key := teamRunKey{uid, ag.Name(), streamSessionID}
+	if !s.beginChatTurn(key, cancel) {
+		cancel()
+		jsonResponse(w, http.StatusConflict, map[string]any{"error": "this topic is already running"})
+		return
+	}
+	failed := false
+	defer func() { s.endChatTurn(key, agentCtx, failed); cancel() }()
+
+	// Trim + tag BEFORE opening the SSE so failures are clean 4xx JSON,
+	// not a stream that dies mid-handshake.
+	plan, err := ag.PrepareWebRetry(agentCtx, req.SessionID)
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	params := req.Params
+	if params == nil {
+		params = make(map[string]any)
+	}
+	for k, v := range plan.Params {
+		params[k] = v
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": "streaming unsupported"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	// Defeat nginx / Cloudflare buffering — see handleChatStream.
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher.Flush()
+
+	hub := s.chatEventHub()
+	agentID := ag.Name()
+	queue, unsubscribe := hub.SubscribeQueue(uid, agentID, streamSessionID)
+	defer unsubscribe()
+	turn := &turnForwarder{
+		ctx: r.Context(), events: s.dataStore, userID: uid, agentID: agentID, sessionKey: streamSessionID,
+		lastSeq: -1, forward: func(env agent.EventEnvelope) { forwardEvent(w, flusher, env) }, failed: &failed,
+	}
+	if s.dataStore != nil {
+		if latest, err := s.dataStore.LatestSessionEventSeq(r.Context(), uid, agentID, streamSessionID); err == nil {
+			turn.lastSeq = latest
+		}
+	}
+	agentCtx = agent.ContextWithStream(agentCtx, nil, s.dataStore, hub, uid, agentID, streamSessionID)
+	agentCtx = agent.ContextWithLocalAgentsUser(agentCtx, uid)
+
+	agentDone := make(chan struct{})
+	go func() {
+		defer close(agentDone)
+		_ = ag.HandleWebChatStream(agentCtx, req.SessionID, req.ProjectID, uid, plan.Text, plan.ImageURLs, params, nil)
+	}()
+
+	keepalive := time.NewTicker(30 * time.Second)
+	defer keepalive.Stop()
+
+	clientGone := r.Context().Done()
+	for {
+		select {
+		case <-clientGone:
+			// Client dropped; the agent goroutine keeps running (detached
+			// ctx) and persists every event — same contract as the stream
+			// handler. A reload picks the tail up via /api/chat/subscribe.
+			clientGone = nil
+		case <-agentDone:
+			for _, env := range queue.Take() {
+				if turn.deliver(env) {
+					return
+				}
+			}
+			if !turn.turnPending && turn.recoverTail() {
+				return
+			}
+			if turn.turnPending {
+				agentDone = nil
+				continue
+			}
+			if !turn.forwardedAny {
+				forwardSyntheticEvent(w, flusher, agent.ChatEvent{
+					Type: "error",
+					Data: map[string]any{"message": "agent finished without emitting a response"},
+				})
+			}
+			return
+		case <-agentCtx.Done():
+			return
+		case <-keepalive.C:
+			fmt.Fprintf(w, ": ping\n\n")
+			flusher.Flush()
+		case <-queue.Ready():
+			for _, env := range queue.Take() {
+				if turn.deliver(env) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// handleChatVariant activates another stored variant of the last turn's
+// answer group: the working set is spliced so the LLM context and the
+// follow-up conversation continue from the chosen answer. Body:
+// {agentId, sessionId, group, index}. The client reloads history after
+// this to re-render the switcher.
+func (s *Server) handleChatVariant(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWritable(w, r) {
+		return
+	}
+	var req struct {
+		AgentID   string `json:"agentId,omitempty"`
+		SessionID string `json:"sessionId"`
+		Group     string `json:"group"`
+		Index     int    `json:"index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	ag := s.resolveAgent(r, req.AgentID)
+	if ag == nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "agent not found"})
+		return
+	}
+	if req.SessionID == "" || req.Group == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "sessionId and group are required"})
+		return
+	}
+	if err := ag.SetVariant(r.Context(), req.SessionID, req.Group, req.Index); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "group": req.Group, "active": req.Index})
+}
+
 // forwardEvent writes one EventEnvelope to the SSE response. Includes
 // seq inline in the JSON payload (in addition to the SSE `id:` line)
 // so the fetch-based parser used by the frontend's POST sendChatStream

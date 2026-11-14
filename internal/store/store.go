@@ -214,6 +214,11 @@ type Store interface {
 	// untouched by compaction. DeleteSession cascades to clean these up.
 	AppendSessionMessage(ctx context.Context, userID, agentID, sessionKey string, msg SessionMessage) error
 	ListSessionMessages(ctx context.Context, userID, agentID, sessionKey string) ([]SessionMessage, error)
+	// UpdateSessionMessagesMeta merges patch into the metadata JSON of the
+	// given archived rows (by seq). Read-modify-write per row — callers
+	// keep the seq list short (one answer variant, ~a dozen rows). Used by
+	// the answer-variant feature to tag / re-tag variant groups.
+	UpdateSessionMessagesMeta(ctx context.Context, userID, agentID, sessionKey string, seqs []int64, patch map[string]interface{}) error
 	// ListSessionMessagesPage returns the archived rows with seq in
 	// [start, before), where start is the seq of a user turn chosen so
 	// the page holds about limit rows and never splits a turn. before <
@@ -574,6 +579,12 @@ type SessionMessage struct {
 	// and on rows written before this column existed.
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
+	// Seq is the per-session archive position assigned at INSERT time.
+	// Populated only on reads (ListSessionMessages / ListSessionMessagesPage);
+	// appenders leave it zero — the column default via
+	// COALESCE(MAX(seq),-1)+1 picks it. Callers use it to address rows
+	// back to UpdateSessionMessagesMeta (answer-variant re-tagging).
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // SessionEventRecord is one row of session_events — a single delta the

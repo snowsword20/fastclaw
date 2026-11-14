@@ -3479,7 +3479,7 @@ func (d *DBStore) LatestSessionEventSeq(ctx context.Context, userID, agentID, se
 // to sessions.messages should check len() and decide.
 func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sessionKey string) ([]SessionMessage, error) {
 	rows, err := d.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, provider, model
+		fmt.Sprintf(`SELECT seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, provider, model
 			FROM session_messages
 			WHERE user_id = %s AND agent_id = %s AND session_key = %s
 			ORDER BY seq ASC`, d.ph(1), d.ph(2), d.ph(3)),
@@ -3488,6 +3488,58 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 		return nil, err
 	}
 	return scanSessionMessages(rows)
+}
+
+// UpdateSessionMessagesMeta merges patch into the metadata JSON of the
+// archived rows addressed by seq. Read-modify-write per row inside one
+// transaction: callers pass a short seq list (one answer variant, about
+// a dozen rows at most). Backs the answer-variant feature — variant
+// group/index/active flags live on the message metadata, so flipping
+// the active variant is exactly a metadata re-tag of the two segments.
+func (d *DBStore) UpdateSessionMessagesMeta(ctx context.Context, userID, agentID, sessionKey string, seqs []int64, patch map[string]interface{}) error {
+	if userID == "" || agentID == "" || sessionKey == "" {
+		return errors.New("store: UpdateSessionMessagesMeta requires user_id, agent_id, session_key")
+	}
+	if len(seqs) == 0 || len(patch) == 0 {
+		return nil
+	}
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, seq := range seqs {
+		var raw string
+		if err := tx.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT metadata FROM session_messages
+				WHERE user_id = %s AND agent_id = %s AND session_key = %s AND seq = %s`,
+				d.ph(1), d.ph(2), d.ph(3), d.ph(4)),
+			userID, agentID, sessionKey, seq).Scan(&raw); err != nil {
+			return err
+		}
+		var meta map[string]interface{}
+		if raw != "" && raw != "null" {
+			_ = json.Unmarshal([]byte(raw), &meta)
+		}
+		if meta == nil {
+			meta = make(map[string]interface{})
+		}
+		for k, v := range patch {
+			meta[k] = v
+		}
+		merged, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf(`UPDATE session_messages SET metadata = %s
+				WHERE user_id = %s AND agent_id = %s AND session_key = %s AND seq = %s`,
+				d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5)),
+			string(merged), userID, agentID, sessionKey, seq); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ListSessionMessagesPage reads one page of the archive without loading
@@ -3536,7 +3588,7 @@ func (d *DBStore) ListSessionMessagesPage(ctx context.Context, userID, agentID, 
 	}
 
 	rows, err := d.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, provider, model
+		fmt.Sprintf(`SELECT seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, provider, model
 			%s AND seq >= %s AND seq < %s ORDER BY seq ASC`, scope, d.ph(4), d.ph(5)),
 		userID, agentID, sessionKey, start.Int64, before)
 	if err != nil {
@@ -3559,7 +3611,7 @@ func scanSessionMessages(rows *sql.Rows) ([]SessionMessage, error) {
 	for rows.Next() {
 		var m SessionMessage
 		var contentParts, toolCalls, metadata, rawAssistant string
-		if err := rows.Scan(&m.Role, &m.Content, &contentParts, &toolCalls, &m.ToolCallID, &m.Name, &metadata, &m.Thinking, &rawAssistant, &m.Origin, &m.Timestamp, &m.Provider, &m.Model); err != nil {
+		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &contentParts, &toolCalls, &m.ToolCallID, &m.Name, &metadata, &m.Thinking, &rawAssistant, &m.Origin, &m.Timestamp, &m.Provider, &m.Model); err != nil {
 			return nil, err
 		}
 		if contentParts != "" && contentParts != "null" {

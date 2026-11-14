@@ -578,6 +578,16 @@ func (a *Agent) HandleWebChatStream(ctx context.Context, sessionId, projectIDHin
 	if projectID == "" {
 		projectID = projectIDHint
 	}
+	// 显式 session key：web 面板的 sessionId 是用户在侧栏里选定的会话，
+	// 必须原样生效——fork 之后 activeOverride 会把 triple 指向分支，没有
+	// 这个标记，用户切回原会话发消息会被静默路由进分支（消息凭空"搬
+	// 家"）。新会话首条消息（key 尚不存在）不带标记，走 triple 解析。
+	if a.sessions.SessionExists(sessionId) {
+		if params == nil {
+			params = make(map[string]any)
+		}
+		params[ParamKeySession] = sessionId
+	}
 	msg := bus.InboundMessage{
 		Channel:   channel,
 		AccountID: accountID,
@@ -1121,42 +1131,96 @@ func (a *Agent) WebChatHistoryPage(sessionId string, before int64, limit int) (h
 	return webHistoryEntries(msgs), start, hasMore, true
 }
 
-// ForkWebSession 从 web 会话的第 upTo 条历史（0 基）之后分叉出平行
-// 时间线，返回新会话的 session_key。upTo <= 0 表示全量分叉。
+// visibleWebChain 把档案消息过滤成"前端所见激活链"——web 面板渲染、
+// upTo 计数共同使用的坐标系：
+//   - 跳过 runtime 注入消息（Origin != OriginUser，同 webHistoryEntries）
+//   - 跳过非激活变体段（重新生成的旧回答；激活段保留）
+//   - 跳过变体链中的重发重复 user：档案 append-only，每次重试重发的
+//     提问会永久留在档案里；与最近一条已入链提问同文本、且两者之间
+//     没有真正的（非变体）回答时视为重发，只保留第一条（与前端
+//     historyToMessages 的去重规则逐字对齐，两边同时改）
 //
-// 给 web 前端的"从这条回答分叉"按钮用：前端拿到的历史序是
-// webHistoryEntries 过滤后的条目序（与 /api/chat/history 的数组一致），
-// 而分叉要复制的是原始消息切片——历史条目与原始消息不是一一对应
-// （runtime 注入条目、空 assistant 条目不进历史），所以这里复刻
-// webHistoryEntries 的跳过规则把"第 upTo 条历史"换算回原始位置。
-// 换算规则必须与 webHistoryEntries 逐字对齐，两边同时改。
+// 工作集（sessions.messages）不能当换算/复制源：重试掐尾、变体切换
+// 都会让它偏离这条链（长短都可能不一致）。
+func visibleWebChain(msgs []provider.Message) []provider.Message {
+	var out []provider.Message
+	hasVariants := false
+	for _, m := range msgs {
+		if _, _, active, tagged := variantOf(m); tagged {
+			// 任何变体标记都证明这条链经历过重新生成——非激活段虽然
+			// 不进链（历史渲染时归组抽离），但置位必须在 continue 之前，
+			// 否则紧跟其后的重发提问去重不会触发。
+			hasVariants = true
+			if !active {
+				continue
+			}
+		}
+		if m.Origin != provider.OriginUser {
+			continue
+		}
+		switch m.Role {
+		case "user":
+			if m.TextContent() == "" && !hasImageParts(&m) {
+				continue
+			}
+		case "assistant":
+			if m.Content == "" && len(m.ToolCalls) == 0 {
+				continue
+			}
+		}
+		if m.Role == "user" && hasVariants && m.TextContent() != "" {
+			lastUserIdx := -1
+			for i := len(out) - 1; i >= 0; i-- {
+				if out[i].Role == "user" {
+					lastUserIdx = i
+					break
+				}
+			}
+			if lastUserIdx >= 0 && out[lastUserIdx].TextContent() == m.TextContent() {
+				realAnswer := false
+				for _, p := range out[lastUserIdx+1:] {
+					if p.Role == "assistant" {
+						if _, _, _, tagged := variantOf(p); !tagged {
+							realAnswer = true
+							break
+						}
+					}
+				}
+				if !realAnswer {
+					continue
+				}
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// ForkWebSession 从 web 会话的第 upTo 条激活链历史（0 基）之后分叉出
+// 平行时间线，返回新会话的 session_key。upTo <= 0 表示全量分叉。
+//
+// 给 web 前端的"从这条回答分叉"按钮用。换算与复制都在**档案**的
+// visibleWebChain（前端所见激活链）上做：前端 historyIndex 就是这条
+// 链的条目下标（合并回合取回合末条），两边坐标系一致——工作集不行，
+// 重试掐尾/变体切换会让它与档案激活链长短不一致（实测过整体漂移）。
+// 复制集 = 激活链前缀：非激活变体段与重复提问不带进分支（上下文干净；
+// fork 是"换条路走"，重试历史不必跟随）。
+//
+// 分叉同时把源会话工作区文件落到新分支目录，并尽量精确恢复到分叉时点
+// （forkWorkspaceFiles：按 workspace.History 的回合快照选 commit）。
 func (a *Agent) ForkWebSession(sessionId string, upTo int) (string, error) {
 	if sessionId == "" {
 		sessionId = "web-ui"
 	}
 	resolved := a.sessions.ResolveSessionKey(sessionId)
 	sess := a.sessions.GetByKey(resolved)
-	msgs := sess.GetMessages()
+	chain := visibleWebChain(sess.ArchivedMessages())
 
-	keep := len(msgs)
+	keep := len(chain)
 	if upTo > 0 {
 		kept := 0
-		keep = len(msgs) // upTo 超出历史长度时兜底为全量
-		for idx := range msgs {
-			m := &msgs[idx]
-			if m.Origin != provider.OriginUser {
-				continue
-			}
-			switch m.Role {
-			case "user":
-				if m.TextContent() == "" && !hasImageParts(m) {
-					continue
-				}
-			case "assistant":
-				if m.Content == "" && len(m.ToolCalls) == 0 {
-					continue
-				}
-			}
+		keep = len(chain) // upTo 超出历史长度时兜底为全量
+		for idx := range chain {
 			kept++
 			if kept >= upTo {
 				keep = idx + 1
@@ -1164,7 +1228,21 @@ func (a *Agent) ForkWebSession(sessionId string, upTo int) (string, error) {
 			}
 		}
 	}
-	return a.sessions.ForkSessionKeepFirst("web", "", resolved, keep)
+	branchMsgs := chain[:keep]
+	newKey, err := a.sessions.ForkSessionFromMessages("web", "", resolved, branchMsgs)
+	if err != nil {
+		return "", err
+	}
+	// 工作区文件快照跟随：分支从分叉时点的文件状态起步（web-only；
+	// forkFrom 只复制消息，目录靠这里落）。chatID 对分支行仍是原 chatID，
+	// workspace scope 用解析后的 key（见 workspaceScopeFor / bindSession）。
+	projectID := a.sessions.LookupSessionProject(resolved)
+	chatID := resolved
+	if _, _, ci, err := a.sessions.LookupSessionTriple(resolved); err == nil && ci != "" {
+		chatID = ci
+	}
+	a.forkWorkspaceFiles(context.Background(), chatID, projectID, resolved, newKey, keep, len(chain))
+	return newKey, nil
 }
 
 // hasImageParts 报告消息的 ContentParts 里有没有 image_url 块——
@@ -2595,6 +2673,16 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID, "user", chatterUID)
 	a.refreshSkillsFromStore(chatterUID)
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+	// 显式 session key 优先（web 面板选定的会话）：fork 的 activeOverride
+	// 会把 triple 解析劫持到分支——没有这段，用户切回原会话发消息会被
+	// 静默写进分支（消息在界面上"搬家"）。见 HandleWebChatStream 注入。
+	if key, _ := msg.Params[ParamKeySession].(string); key != "" {
+		if resolved := a.sessions.ResolveSessionKey(key); resolved != "" {
+			if s := a.sessions.GetByKey(resolved); s != nil {
+				sess = s
+			}
+		}
+	}
 	ctx = withMeterSession(ctx, sess.Key())
 	// Bind chatter onto sess. Session.ctx() builds its own
 	// context.Background-rooted ctx for store calls, so the
@@ -2609,8 +2697,10 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// Bind the registry to this chat's session so workspace.Store reads
 	// + writes get session-scoped paths and (when a sandbox pool is
 	// wired) the executor used by exec/read_file/list_dir is tied to a
-	// session-private container.
-	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	// session-private container. Web chats scope by the RESOLVED session
+	// key: fork branch rows keep the original chatId, and without this
+	// the branch would share the source session's workspace tree.
+	a.bindSession(ctx, msg.Channel, msg.AccountID, a.workspaceScopeFor(msg.Channel, msg.ChatID, sess.Key()), msg.ProjectID)
 	// Flag whether this turn's chatter is the agent owner / channel
 	// admin. File tools use this to refuse identity-file reads from
 	// regular chatters (SOUL/IDENTITY/BOOTSTRAP/... leak as verbatim
@@ -2953,6 +3043,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				return emptyMsg
 			}
 			asst := provider.Message{Role: "assistant", Content: content, Thinking: resp.Thinking, Metadata: knowledgeMeta, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
+			tagVariantFromParams(&asst, msg.Params)
 
 			sess.Append(asst)
 			if resp.Thinking != "" {
@@ -3036,6 +3127,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			Timestamp:    time.Now().UnixMilli(),
 			RawAssistant: resp.RawAssistant,
 		}
+		tagVariantFromParams(&assistantMsg, msg.Params)
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
 
@@ -3209,6 +3301,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				Name:       r.toolName,
 				Metadata:   meta,
 			}
+			tagVariantFromParams(&toolMsg, msg.Params)
 			sess.Append(toolMsg)
 			messages = append(messages, toolMsg)
 
@@ -3251,6 +3344,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			loopWarned = true
 			loopDetector.Reset()
 			warnMsg := repeatedToolCallWarning(loopWarningText)
+			tagVariantFromParams(&warnMsg, msg.Params)
 			sess.Append(warnMsg)
 			messages = append(messages, warnMsg)
 		}
@@ -3287,6 +3381,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	}
 	finalContent += stop.notice(msg.Channel)
 	capMeta := mergeMetadata(stop.metadata(), knowledgeMeta)
+	capMeta = mergeMetadata(variantMetaFromParams(msg.Params), capMeta)
 	sess.Append(provider.Message{
 		Role:      "assistant",
 		Content:   finalContent,
@@ -3534,19 +3629,27 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	// here, not per tool write, because sandbox exec writes via the bind
 	// mount are invisible to this process; the turn boundary is the one
 	// consistency point that covers file tools, exec and uploads.
+	//
+	// Commit message carries the working-set size ("turn msgs=<n>") so a
+	// fork can pick the snapshot AT its fork point (forkWorkspaceFiles):
+	// workspace scope follows the resolved session key for web chats, the
+	// same rule bindSession uses — a fork branch snapshots its own tree.
 	if a.workspaceHistoryEnabled && a.history != nil {
 		if ls, ok := a.workspaceStore.(workspace.LocalScoper); ok {
-			scope := msg.ChatID
+			turnSess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+			wsScope := a.workspaceScopeFor(msg.Channel, msg.ChatID, turnSess.Key())
+			scope := wsScope
 			if pid := a.registry.ProjectID(); pid != "" {
-				scope = pid + "-" + msg.ChatID
+				scope = pid + "-" + wsScope
 			}
-			workTree, _ := ls.LocalScopeDir(a.agentID, a.registry.ProjectID(), msg.ChatID)
+			workTree, _ := ls.LocalScopeDir(a.agentID, a.registry.ProjectID(), wsScope)
+			msgCount := len(turnSess.GetMessages())
 			go func() {
 				// context.Background(): the turn ctx is cancelled when the HTTP
 				// handler returns, and a killed git leaves index.lock behind,
 				// silently breaking every later snapshot of this scope.
 				// runGit has its own 30s timeout as the bound.
-				if err := a.history.Commit(context.Background(), scope, workTree, "turn "+time.Now().Format(time.RFC3339)); err != nil {
+				if err := a.history.Commit(context.Background(), scope, workTree, fmt.Sprintf("turn msgs=%d", msgCount)); err != nil {
 					slog.Warn("workspace history commit failed", "agent", a.name, "scope", scope, "error", err)
 				}
 			}()
@@ -3602,7 +3705,8 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		prov, mdl := provider.SplitProviderModel(a.model)
 		sess.SetProviderModel(prov, mdl)
 	}
-	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	// Web chats scope by the resolved session key — see HandleMessage.
+	a.bindSession(ctx, msg.Channel, msg.AccountID, a.workspaceScopeFor(msg.Channel, msg.ChatID, sess.Key()), msg.ProjectID)
 	a.registry.SetCallerIsAdmin(a.isTrustedTurn(msg))
 	a.registry.SetGoalSessionKey(sess.SessionKey())
 	// Per-user file writes (USER.md / MEMORY.md) need to land in the
@@ -3850,6 +3954,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			Timestamp:    time.Now().UnixMilli(),
 			RawAssistant: resp.RawAssistant,
 		}
+		tagVariantFromParams(&assistantMsg, msg.Params)
 		sess.Append(assistantMsg)
 		messages = append(messages, assistantMsg)
 
@@ -3914,6 +4019,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			loopWarned = true
 			loopDetector.Reset()
 			warnMsg := repeatedToolCallWarning(loopWarningText)
+			tagVariantFromParams(&warnMsg, msg.Params)
 			sess.Append(warnMsg)
 			messages = append(messages, warnMsg)
 		}
