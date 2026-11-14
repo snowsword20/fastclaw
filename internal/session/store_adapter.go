@@ -264,6 +264,10 @@ func providerMessageFromStored(m store.SessionMessage) provider.Message {
 		Origin:       m.Origin,
 		Provider:     m.Provider,
 		Model:        m.Model,
+		// Archive row position: the stable id behind history entry ids
+		// and fork's entryId anchor. Only archive reads have it — the
+		// working set never learns row seqs.
+		Seq: m.Seq,
 	}
 	if m.ToolCalls != nil {
 		if raw, err := json.Marshal(m.ToolCalls); err == nil {

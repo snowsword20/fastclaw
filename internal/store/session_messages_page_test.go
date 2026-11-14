@@ -57,8 +57,15 @@ func TestListSessionMessagesPage(t *testing.T) {
 		}
 		pages = append([][]SessionMessage{msgs}, pages...)
 		if !hasMore {
-			if start != 0 {
-				t.Errorf("last page start = %d, want 0", start)
+			// New sessions number archive rows from 1 (1-based seq, see
+			// AppendSessionMessage), so the oldest page's cursor is 1.
+			// Clients stop on the next empty page — there is no 0
+			// sentinel.
+			if start != 1 {
+				t.Errorf("last page start = %d, want 1", start)
+			}
+			if end, _, _, err := db.ListSessionMessagesPage(ctx, uid, agent, key, start, 5); err != nil || len(end) != 0 {
+				t.Errorf("paging past the oldest row: msgs=%d err=%v, want empty", len(end), err)
 			}
 			break
 		}

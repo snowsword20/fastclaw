@@ -1137,8 +1137,9 @@ func (a *Agent) WebChatHistoryPage(sessionId string, before int64, limit int) (h
 //   - 跳过非激活变体段（重新生成的旧回答；激活段保留）
 //   - 跳过变体链中的重发重复 user：档案 append-only，每次重试重发的
 //     提问会永久留在档案里；与最近一条已入链提问同文本、且两者之间
-//     没有真正的（非变体）回答时视为重发，只保留第一条（与前端
-//     historyToMessages 的去重规则逐字对齐，两边同时改）
+//     没有真正的（非变体）回答时视为重发，只保留第一条。前端渲染
+//     有同样的去重（纯展示一致性）；分叉已改按档案行 id（entryId）
+//     定位，不再依赖前端复算链条数，两侧计数漂移不再影响 fork。
 //
 // 工作集（sessions.messages）不能当换算/复制源：重试掐尾、变体切换
 // 都会让它偏离这条链（长短都可能不一致）。
@@ -1228,6 +1229,34 @@ func (a *Agent) ForkWebSession(sessionId string, upTo int) (string, error) {
 			}
 		}
 	}
+	return a.forkWebSessionFromChain(resolved, chain, keep)
+}
+
+// ForkWebSessionAtEntry 按档案条目 id（session_messages.seq，随
+// /api/chat/history 条目的 id 字段下发）定位分叉点：保留激活链中该
+// 条目及其之前的全部内容。upTo 下标要求前端复算可见链的条目序（跳过
+// runtime 注入/非激活变体段/重发提问，两侧规则逐字对齐）；条目 id 直指
+// 档案行，坐标系只存在于服务端这一处，前端不再参与对齐。entryId 找
+// 不到说明前端拿着过期历史（分叉点已被变体切换或新回合挪动）——宁可
+// 报错让前端刷新，也不静默错位分叉。
+func (a *Agent) ForkWebSessionAtEntry(sessionId string, entryId int64) (string, error) {
+	if sessionId == "" {
+		sessionId = "web-ui"
+	}
+	resolved := a.sessions.ResolveSessionKey(sessionId)
+	sess := a.sessions.GetByKey(resolved)
+	chain := visibleWebChain(sess.ArchivedMessages())
+	for idx := range chain {
+		if entryId > 0 && chain[idx].Seq == entryId {
+			return a.forkWebSessionFromChain(resolved, chain, idx+1)
+		}
+	}
+	return "", fmt.Errorf("entry %d not found in session %q's visible chain — history is stale, reload and retry", entryId, resolved)
+}
+
+// forkWebSessionFromChain 是 ForkWebSession / ForkWebSessionAtEntry 的
+// 共用尾部：复制激活链前缀为新会话，并把工作区文件按回合快照落到分支。
+func (a *Agent) forkWebSessionFromChain(resolved string, chain []provider.Message, keep int) (string, error) {
 	branchMsgs := chain[:keep]
 	newKey, err := a.sessions.ForkSessionFromMessages("web", "", resolved, branchMsgs)
 	if err != nil {
@@ -1304,6 +1333,12 @@ func webHistoryEntries(msgs []provider.Message) []map[string]any {
 				continue
 			}
 			entry := map[string]any{"role": "user", "content": text}
+			// 档案行位序 = 稳定条目 id：前端拿它做 fork 的 entryId 定位，
+			// 不再复算可见链下标（upTo 坐标系退役）。档案读取才有值，
+			// 工作集兜底时为 0 —— 0 不下发，前端按"没有 id"处理。
+			if m.Seq > 0 {
+				entry["id"] = m.Seq
+			}
 			if m.Timestamp > 0 {
 				entry["timestamp"] = m.Timestamp
 			}
@@ -1333,6 +1368,9 @@ func webHistoryEntries(msgs []provider.Message) []map[string]any {
 			entry := map[string]any{"role": "assistant"}
 			if groupTurnID != "" {
 				entry["groupTurnId"] = groupTurnID
+			}
+			if m.Seq > 0 {
+				entry["id"] = m.Seq
 			}
 			if m.Timestamp > 0 {
 				entry["timestamp"] = m.Timestamp
@@ -1374,6 +1412,9 @@ func webHistoryEntries(msgs []provider.Message) []map[string]any {
 				"content":    m.Content,
 				"name":       m.Name,
 				"toolCallId": m.ToolCallID,
+			}
+			if m.Seq > 0 {
+				entry["id"] = m.Seq
 			}
 			if m.Timestamp > 0 {
 				entry["timestamp"] = m.Timestamp

@@ -89,6 +89,17 @@ type Message struct {
 	// and billing audit trails.
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
+
+	// Seq is the message's row position in the session_messages archive.
+	// Populated ONLY on archive reads (StoreAdapter.ListMessages /
+	// ListMessagesPage — the ArchivedMessages / history paths); appends
+	// and the in-memory working set leave it zero, because the row seq is
+	// assigned by the store at INSERT time and never flows back into the
+	// working set. Consumers: webHistoryEntries surfaces it as the stable
+	// history entry id, and ForkWebSessionAtEntry resolves the fork
+	// anchor by it — an index-free coordinate that lets frontends stop
+	// recounting the visible chain (the old upTo alignment contract).
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // TextContent returns the message's user-visible text. Falls back to

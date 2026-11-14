@@ -48,12 +48,18 @@ type AgentHandle interface {
 	// ForkWebSession branches the web session at the upTo-th history
 	// entry (0-based; <=0 forks the full history) and returns the new
 	// session_key. Backs the chat panel's per-answer fork button.
+	// ForkWebSessionAtEntry is the index-free variant: the anchor is the
+	// archive row seq surfaced as the history entry's id field, so
+	// frontends stop recounting the visible chain.
 	ForkWebSession(sessionId string, upTo int) (string, error)
+	ForkWebSessionAtEntry(sessionId string, entryId int64) (string, error)
 	// PrepareWebRetry trims the last turn for a "regenerate" retry and
 	// archives the old answer as an inactive variant. The handler re-sends
 	// the returned text through HandleWebChatStream; the turn's messages
-	// land in the new variant segment. Backs the retry button.
-	PrepareWebRetry(ctx context.Context, sessionId string) (*agent.WebRetryPlan, error)
+	// land in the new variant segment. Backs the retry button. entryId
+	// (0 = skip) is the client's anchor: a value that no longer sits on
+	// the last turn means a stale view and fails the retry cleanly.
+	PrepareWebRetry(ctx context.Context, sessionId string, entryId int64) (*agent.WebRetryPlan, error)
 	// SetVariant activates another stored variant of the last answer
 	// group (splices it back into the working set). Backs the ‹n/m›
 	// variant switcher.

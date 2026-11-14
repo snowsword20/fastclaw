@@ -1945,8 +1945,9 @@ func (d *DBStore) migrationSQL() []string {
 		// stores the original full history so UI / audit / multi-tenant
 		// recovery has a source of truth that compaction never touches.
 		// seq is a per-session monotonic counter assigned at INSERT time
-		// via COALESCE(MAX(seq), -1)+1 so callers don't need a separate
-		// SELECT round-trip. Composite PK doubles as the natural order.
+		// via COALESCE(MAX(seq), 0)+1 (1-based; see AppendSessionMessage)
+		// so callers don't need a separate SELECT round-trip. Composite
+		// PK doubles as the natural order.
 		`CREATE TABLE IF NOT EXISTS session_messages (
 			user_id TEXT NOT NULL,
 			agent_id TEXT NOT NULL,
@@ -3328,11 +3329,16 @@ func (d *DBStore) DeleteSession(ctx context.Context, userID, agentID, sessionKey
 
 // AppendSessionMessage writes one message to the per-session archive.
 // seq is computed atomically inside the INSERT via
-// `COALESCE(MAX(seq), -1) + 1`, so two concurrent appenders racing on
-// the same session can't collide on the unique key — the second insert
-// reads MAX after the first commits. Multi-pod safety relies on the
-// engine's write serialization (sqlite global, postgres MVCC + the
-// composite PK uniqueness check on commit).
+// `COALESCE(MAX(seq), 0) + 1` — 1-based so seq 0 never occurs on new
+// sessions (provider.Message.Seq keeps 0 as its "not from the archive"
+// sentinel, and history entry ids / fork anchors depend on the
+// distinction). Sessions created before the 1-based switch keep their
+// 0-based seqs; MAX(seq)+1 continues them unchanged, and their first
+// row's id is simply omitted from history output. Two concurrent
+// appenders racing on the same session can't collide on the unique
+// key — the second insert reads MAX after the first commits. Multi-pod
+// safety relies on the engine's write serialization (sqlite global,
+// postgres MVCC + the composite PK uniqueness check on commit).
 func (d *DBStore) AppendSessionMessage(ctx context.Context, userID, agentID, sessionKey string, msg SessionMessage) error {
 	if userID == "" {
 		return errors.New("store: AppendSessionMessage requires user_id")
@@ -3350,7 +3356,7 @@ func (d *DBStore) AppendSessionMessage(ctx context.Context, userID, agentID, ses
 		_, err := d.db.ExecContext(ctx,
 			`INSERT INTO session_messages
 				(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id, provider, model)
-			SELECT $1, $2, $3, COALESCE(MAX(seq), -1) + 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+			SELECT $1, $2, $3, COALESCE(MAX(seq), 0) + 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
 				FROM session_messages
 				WHERE user_id = $1 AND agent_id = $2 AND session_key = $3`,
 			userID, agentID, sessionKey,
@@ -3362,7 +3368,7 @@ func (d *DBStore) AppendSessionMessage(ctx context.Context, userID, agentID, ses
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO session_messages
 			(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id, provider, model)
-		SELECT ?, ?, ?, COALESCE(MAX(seq), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		SELECT ?, ?, ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 			FROM session_messages
 			WHERE user_id = ? AND agent_id = ? AND session_key = ?`,
 		userID, agentID, sessionKey,

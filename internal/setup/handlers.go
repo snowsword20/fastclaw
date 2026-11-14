@@ -1070,6 +1070,12 @@ type chatRequest struct {
 	// want the bytes shown directly to a vision model.
 	Attachments []attachmentRequest `json:"attachments,omitempty"`
 	Params      map[string]any      `json:"params,omitempty"`
+	// EntryID is the archive seq (history entry id) of the answer the
+	// client believes it is retrying. 0 = unchecked (legacy clients).
+	// When set, PrepareWebRetry verifies it still sits on the session's
+	// last turn — a mismatch means the client's view is stale and the
+	// retry would target a different turn than the one on screen.
+	EntryID int64 `json:"entryId,omitempty"`
 }
 
 // attachmentRequest is the wire form of a single attachment. URL is the
@@ -1205,6 +1211,10 @@ func (s *Server) handleChatFork(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agentId")
 	sessionID := r.URL.Query().Get("sessionId")
 	upTo, _ := strconv.Atoi(r.URL.Query().Get("upTo"))
+	// entryId = 档案行 seq（history 条目的 id 字段）：优先于 upTo。
+	// upTo 依赖前端复算可见链条目序（旧坐标系）；id 直指档案行，
+	// 传了就按它定位，找不到报 400 让前端刷新历史。
+	entryId, _ := strconv.ParseInt(r.URL.Query().Get("entryId"), 10, 64)
 	ag := s.resolveAgent(r, agentID)
 	if ag == nil {
 		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "agent not found"})
@@ -1214,9 +1224,15 @@ func (s *Server) handleChatFork(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "sessionId is required"})
 		return
 	}
-	key, err := ag.ForkWebSession(sessionID, upTo)
+	var key string
+	var err error
+	if entryId > 0 {
+		key, err = ag.ForkWebSessionAtEntry(sessionID, entryId)
+	} else {
+		key, err = ag.ForkWebSession(sessionID, upTo)
+	}
 	if err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"sessionKey": key})
@@ -1481,7 +1497,7 @@ func (s *Server) handleChatRetry(w http.ResponseWriter, r *http.Request) {
 
 	// Trim + tag BEFORE opening the SSE so failures are clean 4xx JSON,
 	// not a stream that dies mid-handshake.
-	plan, err := ag.PrepareWebRetry(agentCtx, req.SessionID)
+	plan, err := ag.PrepareWebRetry(agentCtx, req.SessionID, req.EntryID)
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return

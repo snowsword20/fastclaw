@@ -182,11 +182,41 @@ type WebRetryPlan struct {
 //     false (metadata re-tag via UpdateSessionMessagesMeta);
 //   - the working set drops it entirely (ReplaceMessages) so the LLM
 //     context never sees two answers to the same question.
-func (a *Agent) PrepareWebRetry(ctx context.Context, sessionId string) (*WebRetryPlan, error) {
+func (a *Agent) PrepareWebRetry(ctx context.Context, sessionId string, entryId int64) (*WebRetryPlan, error) {
 	resolved := a.sessions.ResolveSessionKey(sessionId)
 	sess := a.sessions.GetByKey(resolved)
 	if sess == nil {
 		return nil, fmt.Errorf("session %q not found", sessionId)
+	}
+	// Stale-view guard: when the client anchors the retry at a specific
+	// archived answer (entryId = its archive seq, surfaced as the history
+	// entry id), verify that entry still sits on the LAST turn of the
+	// visible chain. Newer turns may have landed since the client
+	// rendered (another window, another channel) — without this check
+	// the retry would silently target a different turn than the one on
+	// screen. Retry is last-turn-only by design; a stale anchor is the
+	// client's cue to reload.
+	if entryId > 0 {
+		chain := visibleWebChain(sess.ArchivedMessages())
+		last := -1
+		for i := len(chain) - 1; i >= 0; i-- {
+			if chain[i].Role == "user" {
+				last = i
+				break
+			}
+		}
+		onLastTurn := false
+		if last >= 0 {
+			for _, m := range chain[last+1:] {
+				if m.Seq == entryId {
+					onLastTurn = true
+					break
+				}
+			}
+		}
+		if !onLastTurn {
+			return nil, errors.New("anchored answer is no longer the last turn — newer turns exist, reload history and retry")
+		}
 	}
 	msgs := sess.GetMessages()
 	prefix, _, ok := lastUserTurn(msgs)
@@ -312,6 +342,25 @@ func (a *Agent) SetVariant(ctx context.Context, sessionId, group string, index i
 	prefix, segment, ok := lastUserTurn(msgs)
 	if !ok {
 		return errors.New("no previous message to retry")
+	}
+
+	// Guard: variant groups only exist on the LAST user turn — retries
+	// (the only thing that creates a group) target the final turn, so a
+	// group that no longer sits on it is frozen once any follow-up turn
+	// exists. Switching a frozen group must go through fork. Without
+	// this gate a stale client can splice an old archived segment after
+	// the CURRENT last question: lastUserTurn slices at that question,
+	// so the rebuild lands the segment in the wrong position — duplicated
+	// context the LLM sees next turn, plus a flipped archive pointer.
+	frozen := true
+	for _, m := range segment {
+		if g, _, _, tagged := variantOf(m); tagged && g == group {
+			frozen = false
+			break
+		}
+	}
+	if frozen {
+		return fmt.Errorf("variant group %q belongs to an earlier turn: later turns exist, fork the session instead", group)
 	}
 
 	// Split the working-set segment into the active variant rows (they
