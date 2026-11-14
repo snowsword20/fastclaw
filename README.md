@@ -16,6 +16,21 @@ A lightweight AI Agent runtime written in Go.
 
 ---
 
+## 本 Fork 相对上游的增量（snowsword20）
+
+`dev` 分支 = 上游 `fastclaw-ai/fastclaw` 的 dev + 以下自有改动（完整清单随时
+`git log origin/dev..dev --oneline` 一览；维护纪律与双副本同步见
+[docs/fork-maintenance.zh.md](docs/fork-maintenance.zh.md)）：
+
+- **Prompt 缓存稳定化**：系统提示词逐字节稳定（时间戳等易变内容挪进每轮尾部消息）、尾部上下文注入、工具列表排序、Anthropic 缓存断点与 `message_delta` 真实用量解析
+- **思考过程流式**：`thinking` / `thinking_delta` 事件实时透传到 web 聊天，思考文本随历史持久化并在前端渲染
+- **回答多版本（重新生成）**：‹n/m› 变体切换器，`POST /api/chat/retry`、`POST /api/chat/variant`；激活段是 LLM 唯一上下文，档案 append-only 保留全部版本，末轮冻结守卫防污染
+- **Web 会话分叉**：`POST /api/chat/fork` 按档案条目 id（entryId）定位分叉点，工作区文件按回合快照随分叉落盘；分叉后显式 session key 路由防消息串线
+- **exec 安全闸两级化**：不可逆破坏直接拒绝、危险操作需 `force` 确认；附带入站注入扫描、回合阶段事件、多档撤销
+- **杂项**：feedgrab 沙箱镜像构建、math-practice 出题技能、cron 渠道重绑孤立任务迁移、Postgres 计划任务时区修复、微信 cron 推送静默失败可见化
+
+---
+
 <p align="center">
   <img src="previews/chat-support.png" alt="FastClaw web chat: a Support Assistant agent drafting a customer reply" width="900">
   <br>
