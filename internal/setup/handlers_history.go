@@ -40,8 +40,14 @@ func (s *Server) historyBackendFor(w http.ResponseWriter) workspace.HistoryBacke
 }
 
 // workspaceHistoryScope resolves the URL sessionId to the history scope.
-// Scope resolution mirrors the agent loop's commit path: the caller's own
-// session, or for the agent's owner any session of the agent.
+// Authorization mirrors the file list (the caller's own session, or for
+// the agent's owner any session of the agent), but the scope keeps the
+// RAW session id: snapshots are committed under the resolved session key
+// so a fork branch owns its own history, while workspaceFolderScope's
+// chatID merge maps a fork branch back to its origin chat — the file
+// browser's coordinate, not the history's. For web chats the URL
+// sessionId IS the session key; for IM chats it is the chatID — both
+// match what the agent loop committed under.
 func (s *Server) workspaceHistoryScope(w http.ResponseWriter, r *http.Request, agentID, urlToken string) (scope workspace.HistScope, ok bool) {
 	if s.historyBackend == nil {
 		// Standalone fallback still requires a local workspace store —
@@ -57,7 +63,7 @@ func (s *Server) workspaceHistoryScope(w http.ResponseWriter, r *http.Request, a
 		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "session not found"})
 		return workspace.HistScope{}, false
 	}
-	return workspace.HistScope{AgentID: agentID, ProjectID: projectID, Session: chatID}, true
+	return workspace.HistScope{AgentID: agentID, ProjectID: projectID, Session: strings.TrimSpace(urlToken)}, true
 }
 
 // historySink picks where a restored snapshot lands: the chat's on-disk

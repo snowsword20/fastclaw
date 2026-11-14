@@ -241,6 +241,14 @@ var settingNamespaces = []settingNamespace{
 			}
 			return map[string]interface{}{"list": c.Bindings}
 		}},
+	// workspaceHistory: enabled + manifestStore (D1 object vs D2 SQL).
+	// The gateway reads the system row at boot (readSystemWorkspaceHistory)
+	// to pick the cloud history manifest backend; without this entry the
+	// namespace never persisted and manifestStore was unconfigurable via
+	// the API.
+	{namespace: "workspaceHistory",
+		dst:     func(c *config.Config) interface{} { return &c.WorkspaceHistory },
+		collect: func(c *config.Config) map[string]interface{} { return toMap(c.WorkspaceHistory) }},
 }
 
 type settingNamespace struct {
