@@ -1,0 +1,121 @@
+# WSL local multi-instance simulation — same topology as
+# docker-compose.yaml (2 pods + shared Postgres + shared object store), with
+# host ports remapped to avoid clashes on this machine:
+#   18953 (running host fastclaw gateway) → pods use 18963/18964
+#   9000/9001 (lobe-network RustFS)       → this stack's RustFS uses 19000/19001
+#
+# Object store is RustFS (S3-compatible; the minio/minio image is
+# unreachable from this network), reached by the pods as a generic "s3"
+# backend with an explicit endpoint.
+#
+# The pods do NOT build the official Dockerfile (Docker Hub metadata
+# resolution times out on this network). Instead each pod is a plain
+# alpine:3.21 running the statically-linked binary built on the host by
+# `make`-equivalent: CGO_ENABLED=0 go build -o tmp/multi-sim/fastclaw
+# ./cmd/fastclaw (web assets already embedded under internal/setup/web).
+# Host certs/zoneinfo are bind-mounted so TLS and TZ= work.
+#
+# Rebuild the binary after code changes:
+#   CGO_ENABLED=0 go build -ldflags "-s -w" -o tmp/multi-sim/fastclaw ./cmd/fastclaw
+#   docker compose -f deploy/multi-pod/docker-compose.wsl.yaml up -d --force-recreate pod-a pod-b
+#
+# Run:
+#   docker compose -f deploy/multi-pod/docker-compose.wsl.yaml up -d
+#
+#   pod A           http://localhost:18963  (admin token: dev-admin-token)
+#   pod B           http://localhost:18964  (same state, different pod)
+#   RustFS console  http://localhost:19001  (minioadmin / minioadmin)
+#   Postgres        postgres://fastclaw:fastclaw@localhost:5432/fastclaw
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fastclaw
+      POSTGRES_PASSWORD: fastclaw
+      POSTGRES_DB: fastclaw
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastclaw"]
+      interval: 2s
+      timeout: 1s
+      retries: 20
+
+  objectstore:
+    image: rustfs/rustfs:latest
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_CONSOLE_ENABLE: "true"
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - rustfsdata:/data
+
+  # The "fastclaw" bucket is NOT created by a container: aws-cli can't be
+  # installed here (alpine CDN unreachable) and in-container clients get
+  # 502'd by the injected clash proxy. Create it from the host instead:
+  #   python3 deploy/multi-pod/bootstrap-bucket.py
+  # (stdlib-only SigV4 PutBucket → the objectstore's published port 19000).
+
+  pod-a: &pod
+    image: alpine:3.21
+    entrypoint: ["/usr/local/bin/fastclaw"]
+    command: ["gateway"]
+    environment: &podenv
+      TZ: Asia/Shanghai
+      # Listen on 0.0.0.0 — default "loopback" is unreachable through the
+      # docker port mapping.
+      FASTCLAW_BIND: all
+      # Keep the operator's clash proxy for LLM traffic, but bypass it for
+      # compose-network peers — the injected proxy 502s on internal IPs.
+      NO_PROXY: "localhost,127.0.0.1,::1,db,objectstore,172.16.0.0/12,10.0.0.0/8"
+      no_proxy: "localhost,127.0.0.1,::1,db,objectstore,172.16.0.0/12,10.0.0.0/8"
+      FASTCLAW_HOME: /data/.fastclaw
+      FASTCLAW_STORAGE_TYPE: postgres
+      FASTCLAW_STORAGE_DSN: postgres://fastclaw:fastclaw@db:5432/fastclaw?sslmode=disable
+      FASTCLAW_MODE: cloud
+      FASTCLAW_AUTH_TOKEN: dev-admin-token
+      FASTCLAW_OBJECT_STORE_TYPE: minio
+      FASTCLAW_OBJECT_STORE_ENDPOINT: objectstore:9000
+      FASTCLAW_OBJECT_STORE_BUCKET: fastclaw
+      FASTCLAW_OBJECT_STORE_ACCESSKEY: minioadmin
+      FASTCLAW_OBJECT_STORE_SECRETKEY: minioadmin
+      FASTCLAW_OBJECT_STORE_USESSL: "false"
+    # DB migrations race when both pods start together (pq duplicate key
+    # on pg_type), so pod-b waits until pod-a's gateway actually serves.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:18953/ || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    volumes:
+      - ../../tmp/multi-sim/fastclaw:/usr/local/bin/fastclaw:ro
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
+    ports:
+      - "18963:18953"
+
+  pod-b:
+    <<: *pod
+    environment:
+      <<: *podenv
+    depends_on:
+      db:
+        condition: service_healthy
+      objectstore:
+        condition: service_started
+      pod-a:
+        condition: service_healthy
+    ports:
+      - "18964:18953"
+
+volumes:
+  pgdata:
+  rustfsdata:

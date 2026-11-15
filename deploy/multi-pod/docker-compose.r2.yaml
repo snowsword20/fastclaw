@@ -1,0 +1,84 @@
+# Multi-pod topology with Cloudflare R2 as the object store — same shape
+# as docker-compose.wsl.yaml (2 pods + shared Postgres on this machine)
+# minus the local objectstore container: pods talk straight to R2's
+# S3-compatible endpoint over TLS.
+#
+# BEFORE `docker compose up`:
+#   fill in deploy/multi-pod/.env.r2 (gitignored) — R2 API token keys.
+#   Mint the token: dashboard → R2 → Manage R2 API Tokens → Create API
+#   Token (Object Read & Write, scope to the fastclaw bucket only).
+#
+#   docker compose -f deploy/multi-pod/docker-compose.r2.yaml up -d
+#   pod A  http://localhost:18963   pod B  http://localhost:18964
+#
+# What lands in R2:
+#   - workspace files        <prefix>/<agent>/...
+#   - snapshot blobs         <prefix>/history/blobs/<sha256>   (fork/版本快照)
+#   - snapshot manifests stay in the shared Postgres below — the gateway's
+#     default "auto"/D2 mode (workspaceHistory.manifestStore unset). SQL
+#     keeps history listings off R2 request paths; setting "object" moves
+#     them to the bucket if you ever want a SQL-free history store.
+# Rebuild the pod binary after code changes (see docker-compose.wsl.yaml).
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fastclaw
+      POSTGRES_PASSWORD: fastclaw
+      POSTGRES_DB: fastclaw
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastclaw"]
+      interval: 2s
+      timeout: 1s
+      retries: 20
+
+  pod-a: &pod
+    image: alpine:3.21
+    entrypoint: ["/usr/local/bin/fastclaw"]
+    command: ["gateway"]
+    env_file:
+      - .env.r2
+    environment: &podenv
+      TZ: Asia/Shanghai
+      FASTCLAW_BIND: all
+      # clash proxy for external HTTPS (LLM + R2), bypass for compose peers.
+      NO_PROXY: "localhost,127.0.0.1,::1,db,objectstore,172.16.0.0/12,10.0.0.0/8"
+      no_proxy: "localhost,127.0.0.1,::1,db,objectstore,172.16.0.0/12,10.0.0.0/8"
+      FASTCLAW_HOME: /data/.fastclaw
+      FASTCLAW_STORAGE_TYPE: postgres
+      FASTCLAW_STORAGE_DSN: postgres://fastclaw:fastclaw@db:5432/fastclaw?sslmode=disable
+      FASTCLAW_MODE: cloud
+      FASTCLAW_AUTH_TOKEN: dev-admin-token
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:18953/ || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    volumes:
+      - ../../tmp/multi-sim/fastclaw:/usr/local/bin/fastclaw:ro
+      - /etc/ssl/certs:/etc/ssl/certs:ro
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "18963:18953"
+
+  pod-b:
+    <<: *pod
+    depends_on:
+      db:
+        condition: service_healthy
+      pod-a:
+        condition: service_healthy
+    ports:
+      - "18964:18953"
+
+volumes:
+  pgdata:

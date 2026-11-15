@@ -6,6 +6,9 @@
 *.so
 *.dylib
 
+# Local tooling state (wrangler runs from the repo root)
+/.wrangler/
+
 # Build output
 /bin/
 /dist/
