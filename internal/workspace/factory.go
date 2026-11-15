@@ -41,6 +41,28 @@ type Factory struct {
 	AliyunIntern bool   // prefer OSS internal endpoint (no egress fee for in-region ACK)
 }
 
+// ResolveS3 normalises a raw S3Config the same way Factory.New does before
+// building its store: computes the preset endpoint when unset and
+// force-enables TLS for managed providers. Callers building a SECOND store
+// from the same config block (gateway/history_backend.go builds the
+// snapshot blob store from the ObjectStoreCfg the factory also consumes)
+// must run this first — the factory resolves into a local copy, so the
+// caller's config still carries a blank endpoint for preset types like
+// cloudflare-r2 whose endpoint is derived, never stored.
+func ResolveS3(providerType string, cfg S3Config, accountID string, aliyunInternal bool) (S3Config, error) {
+	if cfg.Endpoint == "" {
+		ep, err := defaultEndpoint(providerType, cfg.Region, accountID, aliyunInternal)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Endpoint = ep
+	}
+	if providerType != "minio" && !cfg.UseSSL {
+		cfg.UseSSL = true
+	}
+	return cfg, nil
+}
+
 // New returns the Store described by f. Unknown types fall back to the
 // local filesystem so misconfiguration degrades gracefully instead of
 // blowing up at startup.
@@ -53,19 +75,9 @@ func (f Factory) New(defaultLocalDir string) (Store, error) {
 		}
 		return NewLocalFS(filepath.Clean(root)), nil
 	case "aws-s3", "cloudflare-r2", "backblaze-b2", "aliyun-oss", "minio", "s3":
-		s3 := f.S3
-		if s3.Endpoint == "" {
-			ep, err := defaultEndpoint(f.Type, s3.Region, f.AccountID, f.AliyunIntern)
-			if err != nil {
-				return nil, err
-			}
-			s3.Endpoint = ep
-		}
-		// AWS S3 and most managed providers strictly require SSL; only
-		// local MinIO typically runs plaintext. Auto-enable unless the
-		// operator explicitly said otherwise in the "minio" preset.
-		if f.Type != "minio" && !s3.UseSSL {
-			s3.UseSSL = true
+		s3, err := ResolveS3(f.Type, f.S3, f.AccountID, f.AliyunIntern)
+		if err != nil {
+			return nil, err
 		}
 		return NewS3(s3)
 	default:

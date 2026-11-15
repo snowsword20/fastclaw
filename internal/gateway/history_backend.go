@@ -48,7 +48,12 @@ func buildHistoryBackend(st store.Store, osCfg config.ObjectStoreCfg, homeDir st
 		return workspace.NewHistory(filepath.Join(homeDir, "workspace-history"))
 	}
 
-	blobs, err := workspace.NewObjectHistoryStore(workspace.S3Config{
+	// ResolveS3 mirrors what workspace.Factory just did for the workspace
+	// store: fill in the preset-derived endpoint (cloudflare-r2 etc. derive
+	// it from AccountID — osCfg.S3.Endpoint is still blank here) and force
+	// TLS for managed providers. Without this the blob store builds a
+	// client against an empty endpoint and history silently disables.
+	s3cfg, err := workspace.ResolveS3(osCfg.Type, workspace.S3Config{
 		Endpoint:  osCfg.S3.Endpoint,
 		Region:    osCfg.S3.Region,
 		Bucket:    osCfg.S3.Bucket,
@@ -56,11 +61,12 @@ func buildHistoryBackend(st store.Store, osCfg config.ObjectStoreCfg, homeDir st
 		AccessKey: osCfg.S3.AccessKey,
 		SecretKey: osCfg.S3.SecretKey,
 		UseSSL:    osCfg.S3.UseSSL,
-	})
+	}, osCfg.AccountID, osCfg.AliyunIntern)
 	if err != nil {
 		slog.Error("workspace history: object store unavailable, history disabled", "error", err)
 		return nil
 	}
+	blobs, err := workspace.NewObjectHistoryStore(s3cfg)
 
 	var manifests workspace.ManifestStore
 	switch mode := defaultStr(whCfg.ManifestStore, "auto"); mode {
