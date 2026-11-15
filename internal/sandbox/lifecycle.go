@@ -172,6 +172,16 @@ func (p *LifecyclePool) evictIdle() {
 	}
 }
 
+// remoteStoreMount reports whether the sandbox's on-host bind mount does
+// NOT double as the durable workspace.Store — i.e. the store is remote
+// (S3, R2) while docker's /workspace is a local dir. Container writes
+// then only reach store readers through syncSnapshot/mirrorSandboxWrite.
+// With a local-FS store the mount IS the store, so container writes are
+// already visible to readers and syncing would be pure churn.
+func (p *LifecyclePool) remoteStoreMount() bool {
+	return p.workspace != nil && !workspace.LocalStore(p.workspace)
+}
+
 // flushIfSupported snapshots the sandbox workspace and uploads anything
 // that isn't already in the durable store. Skips silently when the backend
 // doesn't implement WorkspaceSnapshotter (docker is the only current
@@ -334,16 +344,15 @@ func (l *lazyExecutor) Exec(ctx context.Context, command string, timeout time.Du
 	out, execErr := ex.Exec(ctx, command, timeout)
 	// The sandbox ran the command (a non-zero exit is still sandbox time).
 	l.meter(ctx, "exec", started)
-	// Post-exec sync only for cloud sandboxes (RemoteWorkspace marker).
-	// Docker's /workspace is bind-mounted to host so files appear
-	// instantly with no sync needed; rerunning the snapshot+Put cycle
-	// after every exec would just churn the workspace.Store
-	// (especially expensive when it's S3-backed). E2B's /workspace
-	// lives inside the cloud sandbox; without this pull, files the
-	// skill writes (image-tool's /workspace/gen_xxx.webp) never
-	// reach the host and the UI shows broken images.
+	// Post-exec sync for remote sandboxes (E2B: /workspace lives in the
+	// cloud VM) AND for local sandboxes (docker) backed by a remote
+	// workspace store. Docker's /workspace is bind-mounted to host, so
+	// when the store is the local FS readers see container writes
+	// instantly and syncing after every exec would just churn the store —
+	// but with an S3/R2 store the mount is NOT the store: without this
+	// pull, exec-produced files only reach the UI at idle eviction.
 	// Best-effort — never overrides the exec result.
-	if _, remote := ex.(RemoteWorkspace); remote {
+	if _, remote := ex.(RemoteWorkspace); remote || l.pool.remoteStoreMount() {
 		l.pool.syncSnapshot(ctx, l.scope, ex, "post-exec")
 	}
 	return out, execErr
@@ -381,18 +390,18 @@ func (l *lazyExecutor) WriteFile(ctx context.Context, path, content string) (str
 	if writeErr == nil {
 		l.meter(ctx, "write_file", started)
 	}
-	// Mirror writes to the durable store on cloud sandboxes — same
-	// reasoning as the post-exec sync above. Without this, write_file
-	// (and apply_patch) calls that fall through to ex.WriteFile (any
-	// absolute /workspace path — see file.go's isWorkspacePath, which
-	// rejects abs paths) only land in the E2B sandbox and disappear on
-	// idle eviction, never reaching the host workspace.Store the UI and
-	// signed URLs read from. Targeted single-file Put rather than
-	// syncSnapshot: we already have the bytes in memory, no need for a
-	// full tar round-trip per write. Best-effort — never overrides the
-	// write result.
+	// Mirror writes to the durable store on remote sandboxes AND on
+	// docker when the store is remote (S3/R2) — same reasoning as the
+	// post-exec sync above. Without this, write_file (and apply_patch)
+	// calls that fall through to ex.WriteFile (any absolute /workspace
+	// path — see file.go's isWorkspacePath, which rejects abs paths)
+	// only land in the sandbox view and reach the workspace.Store the
+	// UI reads from only at idle eviction. Targeted single-file Put
+	// rather than syncSnapshot: we already have the bytes in memory,
+	// no need for a full tar round-trip per write. Best-effort — never
+	// overrides the write result.
 	if writeErr == nil {
-		if _, remote := ex.(RemoteWorkspace); remote {
+		if _, remote := ex.(RemoteWorkspace); remote || l.pool.remoteStoreMount() {
 			l.pool.mirrorSandboxWrite(ctx, l.scope, path, content)
 		}
 	}

@@ -105,6 +105,25 @@ type LocalScoper interface {
 	LocalScopeDir(agentID, projectID, sessionID string) (string, bool)
 }
 
+// LocalStore reports whether the store's objects live on this host's
+// own filesystem — i.e. whether a docker bind-mount of the scope dir
+// exposes exactly what Store readers see. Sandbox-side writes need no
+// mirroring in that case (the mount IS the store); remote stores (S3,
+// R2) don't share the mount and need sandbox→store sync after writes.
+// Probes through LocalScopeDir rather than type-asserting so wrapped
+// stores (Metered) are judged by their inner backend.
+func LocalStore(ws Store) bool {
+	if ws == nil {
+		return false
+	}
+	ls, ok := ws.(LocalScoper)
+	if !ok {
+		return false // no local capability at all (plain S3/R2)
+	}
+	_, revealable := ls.LocalScopeDir("", "", "")
+	return revealable
+}
+
 // Compile-time check.
 var (
 	_ Store       = (*Metered)(nil)
