@@ -16,6 +16,33 @@ const chatErrorCodeLLMProviderNotConfigured = "llm_provider_not_configured"
 
 type chatEventsKey struct{}
 
+// subagentEnvelopeKey marks a turn as running on behalf of a
+// message_agent delegation. Events emitted inside such a turn are
+// re-typed "subagent_event" with the child event nested in data, so the
+// caller's session stream can show delegation progress (thinking, tool
+// calls) live and on replay without mistaking it for the caller's own
+// turn output.
+type subagentEnvelopeKey struct{}
+
+// SubagentEnvelope labels a delegation: the target's display name and
+// agent id, plus a per-call run id so the UI can group one
+// delegation's events together.
+type SubagentEnvelope struct {
+	Agent   string
+	AgentID string
+	Run     string
+}
+
+// WithSubagentEnvelope tags ctx so emitEvent envelopes this turn's events.
+func WithSubagentEnvelope(ctx context.Context, env SubagentEnvelope) context.Context {
+	return context.WithValue(ctx, subagentEnvelopeKey{}, env)
+}
+
+func subagentEnvelopeFromContext(ctx context.Context) (SubagentEnvelope, bool) {
+	env, ok := ctx.Value(subagentEnvelopeKey{}).(SubagentEnvelope)
+	return env, ok
+}
+
 // ChatEventsFromContext retrieves the events channel from context, if present.
 //
 // Deprecated: prefer ContextWithStream which carries the persistence
@@ -60,7 +87,31 @@ func emitEvent(ctx context.Context, evt ChatEvent) {
 	// stream_reset 同理：它是"上一轮尝试的增量作废"的瞬时信号，
 	// 只对正盯着流式气泡的客户端有意义，重连/回放场景下没有价值
 	// （重连后要么拿到重试后的正文，要么拿到 done）。
-	persist := evt.Type != "content_delta" && evt.Type != "stream_reset"
+	origType := evt.Type
+	persist := origType != "content_delta" && origType != "stream_reset"
+
+	// Subagent envelope: events emitted inside a message_agent delegation
+	// are re-typed "subagent_event" on the CALLER's stream (same
+	// user/agent/session triple), nesting the child event in data. The
+	// persistence decision above keeps using the original type, so the
+	// child's content_delta stays live-only and doesn't flood
+	// session_events.
+	if env, ok := subagentEnvelopeFromContext(ctx); ok {
+		inner, mErr := json.Marshal(evt.Data)
+		if mErr != nil {
+			inner = []byte("{}")
+		}
+		evt = ChatEvent{
+			Type: "subagent_event",
+			Data: map[string]any{
+				"agent":   env.Agent,
+				"agentId": env.AgentID,
+				"run":     env.Run,
+				"type":    origType,
+				"event":   json.RawMessage(inner),
+			},
+		}
+	}
 
 	if persist && stream != nil && stream.sink != nil && stream.userID != "" && stream.sessionKey != "" {
 		blob, _ := json.Marshal(evt.Data)

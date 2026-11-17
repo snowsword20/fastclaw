@@ -98,7 +98,25 @@ func (a *Agent) messageAgent(ctx context.Context, resolve AgentResolver, ownerUs
 	params := map[string]any{PrivateFromParamKey: map[string]any{
 		"kind": "agent", "id": a.agentID, "name": senderName, "content": message,
 	}}
-	reply := strings.TrimSpace(target.HandleWebChat(recipientTurnContext(ctx, depth+1), sessionID, "", a.messageAgentTurnUser(ownerUserID), prompt, nil, params))
+	// When the caller itself streams (web chat), put the delegation's
+	// events back on the caller's stream, re-typed "subagent_event"
+	// (WithSubagentEnvelope), so the web UI renders the child's live
+	// progress on the delegation card without mistaking it for the
+	// caller's own turn. recipientTurnContext nils the caller's stream —
+	// emitEvent gates persistence/hub/channel on stream != nil — so the
+	// parent's sink/hub/channel triple has to be re-attached for the
+	// child turn. IM/legacy callers keep the fully silent behavior.
+	childCtx := recipientTurnContext(ctx, depth+1)
+	if parent := streamFromContext(ctx); parent != nil {
+		runID := fmt.Sprintf("ma-%d-%s", time.Now().UnixMilli(),
+			strconv.FormatInt(rand.Int63n(36*36*36*36*36*36), 36))
+		childCtx = WithSubagentEnvelope(childCtx, SubagentEnvelope{
+			Agent: targetName, AgentID: target.agentID, Run: runID,
+		})
+		childCtx = ContextWithStream(childCtx, parent.channel, parent.sink,
+			parent.hub, parent.userID, parent.agentID, parent.sessionKey)
+	}
+	reply := strings.TrimSpace(target.HandleWebChat(childCtx, sessionID, "", a.messageAgentTurnUser(ownerUserID), prompt, nil, params))
 	if reply == "" {
 		return "", fmt.Errorf("%s received the message but returned no reply", targetName)
 	}
