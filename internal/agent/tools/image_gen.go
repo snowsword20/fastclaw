@@ -69,10 +69,20 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 		"Write \"prompt\" as a rich visual description: subject, style, composition, colors, mood, and any text that must appear in the picture.",
 		"It returns putInReply: put that exactly in your reply so the picture is shown, plus a short line of your own. Don't describe the image data or repeat the paths otherwise.",
 	}
+	// Capability matrix: what each provider in the chain supports, so the
+	// model asks for parameters that exist instead of discovering limits
+	// through provider errors.
+	if lines := capabilityLines(chain); len(lines) > 0 {
+		desc = append(desc, "Providers in order, with what each supports:")
+		desc = append(desc, lines...)
+		desc = append(desc, "When the person asks for something no provider lists (a ratio, a quality tier, reference-image editing), say what IS supported and offer the closest option — don't call with unsupported parameters.")
+	}
 	props := map[string]any{
 		"prompt": map[string]any{"type": "string", "description": "What the picture shows, in detail."},
-		"aspect": map[string]any{"type": "string", "enum": []string{"square", "portrait", "landscape"}, "description": "Shape of the picture; default square."},
-		"n":      map[string]any{"type": "integer", "description": "How many variations (default 1, max 4). Each one is charged."},
+		"aspect": map[string]any{"type": "string", "description": `Shape of the picture: "square", "portrait", "landscape", or an explicit ratio like "3:4"/"16:9" when the provider list above includes it. Default square.`},
+		"size":   map[string]any{"type": "string", "description": "Explicit pixel size like \"1024x1024\" — only when the provider list above names sizes; otherwise prefer aspect."},
+		"quality": map[string]any{"type": "string", "description": "Fidelity tier like \"low\"/\"medium\"/\"high\" — only when the provider list above names tiers; omit otherwise."},
+		"n":      map[string]any{"type": "integer", "description": "How many variations (default 1). Each one is charged; respect each provider's per-call limit above."},
 	}
 	if files != nil && files.Load != nil {
 		desc = append(desc, "To edit a photo the person sent or base a picture on it (a new style, an avatar, a sticker of them), list it in \"images\" by its /workspace path.")
@@ -90,6 +100,12 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 		turn := r.forContext(ctx)
 		if err := attachRefs(ctx, files, turn, args); err != nil {
 			return "", err
+		}
+		// Requirement gate: when every provider in the chain DECLARED it
+		// can't take something the call asks for, fail before any network
+		// round-trip with a message the model can relay verbatim.
+		if why := unionShortfall(chain, args); why != "" {
+			return "", &agl.ToolError{Msg: why}
 		}
 		resp, err := chain.Execute(ctx, args)
 		if err != nil {
@@ -236,4 +252,153 @@ func urlsOnly(images []toolproviders.Image) string {
 		return "The pictures were generated but can't be shown in this chat (no workspace to store them)."
 	}
 	return "putInReply:\n" + b.String()
+}
+
+// capabilityLines renders the chain's per-provider capability matrix for
+// the tool description: one line per "<provider>/<model>" in order.
+// Providers that don't declare capabilities are marked unknown rather
+// than omitted — the model should still know it can try.
+func capabilityLines(chain *toolproviders.Chain) []string {
+	var out []string
+	for i, ref := range chain.Order {
+		name, model := splitProviderRef(ref)
+		caps := toolproviders.CapabilitiesOf(chain.Registry, chain.Category, name, model, chain.GetConfig(name))
+		var b strings.Builder
+		fmt.Fprintf(&b, "%d. %s — ", i+1, ref)
+		if !caps.Declared {
+			b.WriteString("capabilities unknown; common options (1:1, square) usually work — otherwise explain and pick another provider")
+			out = append(out, b.String())
+			continue
+		}
+		var parts []string
+		if len(caps.Sizes) > 0 {
+			parts = append(parts, "sizes "+strings.Join(caps.Sizes, "|"))
+		} else if len(caps.AspectRatios) > 0 {
+			parts = append(parts, "ratios "+strings.Join(caps.AspectRatios, "|"))
+		}
+		if len(caps.Quality) > 0 {
+			parts = append(parts, "quality "+strings.Join(caps.Quality, "|"))
+		}
+		if caps.MaxImages > 0 {
+			parts = append(parts, fmt.Sprintf("up to %d per call", caps.MaxImages))
+		}
+		if caps.MaxRefImages > 0 {
+			parts = append(parts, fmt.Sprintf("up to %d reference images", caps.MaxRefImages))
+		} else {
+			parts = append(parts, "no reference images")
+		}
+		if len(parts) == 0 {
+			b.WriteString("no capability details")
+		} else {
+			b.WriteString(strings.Join(parts, ", "))
+		}
+		out = append(out, b.String())
+	}
+	return out
+}
+
+// unionShortfall checks the call's asks against the UNION of the chain's
+// declared capabilities and returns a relayable message when some ask is
+// impossible everywhere ("" when fine). Unknown capabilities (Declared
+// false) count as pass — fail-open, matching the magpie gateway's rule.
+func unionShortfall(chain *toolproviders.Chain, args map[string]any) string {
+	str := func(k string) string {
+		s, _ := args[k].(string)
+		return strings.TrimSpace(s)
+	}
+	aspect, size, quality := str("aspect"), str("size"), str("quality")
+	refs := 0
+	if raw, ok := args["image_urls"].([]string); ok {
+		refs = len(raw)
+	} else if raw, ok := args["image_urls"].([]any); ok {
+		refs = len(raw)
+	}
+	n := 1
+	switch v := args["n"].(type) {
+	case float64:
+		n = int(v)
+	case int:
+		n = v
+	}
+	if aspect == "" && size == "" && quality == "" && refs == 0 && n <= 1 {
+		return ""
+	}
+	meetsAspect, meetsQuality, meetsRefs, meetsN := false, false, refs == 0, n <= 1
+	var anyAspect, anyQuality []string
+	for _, ref := range chain.Order {
+		name, model := splitProviderRef(ref)
+		caps := toolproviders.CapabilitiesOf(chain.Registry, chain.Category, name, model, chain.GetConfig(name))
+		if caps.MeetsAspect(aspect, size) {
+			meetsAspect = true
+		}
+		if caps.MeetsQuality(quality) {
+			meetsQuality = true
+		}
+		if caps.MeetsRefs(refs) {
+			meetsRefs = true
+		}
+		if caps.MeetsN(n) {
+			meetsN = true
+		}
+		if caps.Declared {
+			anyAspect = append(anyAspect, caps.AspectRatios...)
+			anyAspect = append(anyAspect, caps.Sizes...)
+			anyQuality = append(anyQuality, caps.Quality...)
+		}
+	}
+	var missing []string
+	if !meetsAspect {
+		if seen := dedupe(anyAspect); len(seen) > 0 {
+			missing = append(missing, fmt.Sprintf("shape %q (supported: %s)", orDefault(aspect, size), strings.Join(seen, ", ")))
+		} else {
+			missing = append(missing, fmt.Sprintf("shape %q (only standard shapes are supported)", orDefault(aspect, size)))
+		}
+	}
+	if !meetsQuality {
+		if seen := dedupe(anyQuality); len(seen) > 0 {
+			missing = append(missing, fmt.Sprintf("quality %q (supported: %s)", quality, strings.Join(seen, ", ")))
+		} else {
+			missing = append(missing, fmt.Sprintf("quality %q (no fidelity tiers on any provider)", quality))
+		}
+	}
+	if !meetsRefs {
+		missing = append(missing, fmt.Sprintf("reference-image editing with %d image(s) (no provider in the chain can edit)", refs))
+	}
+	if !meetsN {
+		missing = append(missing, fmt.Sprintf("%d pictures in one call (fewer per call are supported)", n))
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return "image_gen can't take this request as asked: " + strings.Join(missing, "; ") +
+		". Tell the person what is supported and offer the closest option."
+}
+
+// splitProviderRef splits "fal/flux-dev" into ("fal", "flux-dev"); a
+// magpie model ref keeps its own slashes ("magpie", "pool/gpt-image-2").
+func splitProviderRef(ref string) (string, string) {
+	if i := strings.IndexByte(ref, '/'); i >= 0 {
+		return ref[:i], ref[i+1:]
+	}
+	return ref, ""
+}
+
+func dedupe(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func orDefault(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }

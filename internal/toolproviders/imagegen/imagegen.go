@@ -19,6 +19,7 @@ func RegisterAll(r *toolproviders.Registry) {
 	r.Register(&OpenAI{})
 	r.Register(&Fal{})
 	r.Register(&Replicate{})
+	r.Register(&Magpie{})
 	r.Register(&None{})
 }
 
@@ -26,10 +27,14 @@ type args struct {
 	Prompt string
 	Size   string
 	// Aspect is "square", "portrait" or "landscape" (the image_gen tool's
-	// shape); each provider maps it to its own size parameter. Size, when
-	// given, wins (provider-specific, for callers that know the provider).
+	// shape) — or an explicit "W:H" ratio the matrix layer passed through.
+	// Each provider maps it to its own size parameter. Size, when given,
+	// wins (provider-specific, for callers that know the provider).
 	Aspect string
-	N      int
+	// Quality is the fidelity tier ("low", "medium", "high", …) when the
+	// caller asks for one; providers that don't take tiers ignore it.
+	Quality string
+	N       int
 	// Refs are reference images (data: URLs) to edit or base the picture
 	// on. A provider that can't take them returns errNoRefs.
 	Refs []string
@@ -48,6 +53,9 @@ func parseArgs(raw map[string]any) (args, error) {
 	}
 	if s, ok := raw["aspect"].(string); ok {
 		a.Aspect = strings.TrimSpace(s)
+	}
+	if s, ok := raw["quality"].(string); ok {
+		a.Quality = strings.TrimSpace(s)
 	}
 	switch v := raw["image_urls"].(type) {
 	case []string:

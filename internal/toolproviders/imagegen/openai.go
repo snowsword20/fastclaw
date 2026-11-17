@@ -66,12 +66,18 @@ func (o *OpenAI) Execute(ctx context.Context, req toolproviders.Request) (toolpr
 		}
 		httpReq.Header.Set("Content-Type", contentType)
 	} else {
-		buf, _ := json.Marshal(map[string]any{
+		body := map[string]any{
 			"model":  model,
 			"prompt": a.Prompt,
 			"n":      a.N,
 			"size":   size,
-		})
+		}
+		if q := strings.TrimSpace(a.Quality); q != "" {
+			// gpt-image-1 takes low/medium/high/auto, dall-e-3
+			// standard/hd; the capability layer gates what reaches here.
+			body["quality"] = strings.ToLower(q)
+		}
+		buf, _ := json.Marshal(body)
 		var err error
 		httpReq, err = http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(buf))
 		if err != nil {
@@ -154,6 +160,9 @@ func openAIEditForm(model string, a args, size string) (io.Reader, string, error
 	_ = w.WriteField("prompt", a.Prompt)
 	_ = w.WriteField("n", strconv.Itoa(a.N))
 	_ = w.WriteField("size", size)
+	if q := strings.TrimSpace(a.Quality); q != "" {
+		_ = w.WriteField("quality", strings.ToLower(q))
+	}
 	for i, ref := range a.Refs {
 		data, ct, err := decodeDataURL(ref)
 		if err != nil {

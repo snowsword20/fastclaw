@@ -68,6 +68,11 @@ var builtinCatalog = []categoryCatalog{
 			// fal takes any model path too (fal-ai/…); option edit_model
 			// names the image-to-image model used with reference images.
 			{Name: "fal", Label: "Fal", NeedsKey: true, Models: []string{"flux-dev", "flux-schnell", "flux-pro", "fal-ai/bytedance/seedream/v4/text-to-image", "fal-ai/qwen-image"}},
+			// magpie routes through a magpie gateway's imgqueue plugin
+			// (sync proxy + capability matrix). endpoint is the plugin's
+			// service URL; "auto" picks per-request from the matrix, or
+			// pin a gateway model ref like "gptfree-pool/gpt-image-2.6".
+			{Name: "magpie", Label: "Magpie gateway (imgqueue)", NeedsKey: true, NeedsURL: true, Models: []string{"auto"}},
 			// "none" is a sentinel: when picked, image_gen is not exposed
 			// to the model at all. The model falls back to its own native
 			// image-generation capability if it has one.

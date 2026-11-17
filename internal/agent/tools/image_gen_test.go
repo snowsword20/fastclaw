@@ -135,3 +135,91 @@ func TestImageGenWithoutAWorkspaceNeverReturnsImageData(t *testing.T) {
 		t.Fatalf("out = %q", out)
 	}
 }
+
+// ---- capability matrix: description injection + requirement gate ----
+
+// capProvider is a fake provider with static declared capabilities.
+type capProvider struct {
+	fakeImageProvider
+	nameOverride string
+	caps         toolproviders.Capabilities
+}
+
+func (c *capProvider) Name() string { return c.nameOverride }
+
+func (c *capProvider) Capabilities(_ toolproviders.ProviderConfig, _ string) toolproviders.Capabilities {
+	return c.caps
+}
+
+func TestImageGenDescriptionCarriesCapabilityMatrix(t *testing.T) {
+	reg := toolproviders.NewRegistry()
+	reg.Register(&capProvider{
+		fakeImageProvider: fakeImageProvider{resp: toolproviders.Response{Text: "ok"}},
+		nameOverride:      "cap",
+		caps: toolproviders.Capabilities{
+			Sizes:        []string{"1024x1024", "1536x1024", "auto"},
+			Quality:      []string{"low", "high"},
+			MaxImages:    4,
+			MaxRefImages: 2,
+			Declared:     true,
+		},
+	})
+	r := NewRegistry(t.TempDir(), t.TempDir())
+	RegisterImageGenChain(r, &toolproviders.Chain{
+		Category: "image_gen", Order: []string{"cap/model-x"}, Registry: reg,
+		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
+	}, nil)
+	var spec *ToolInfo
+	for _, ti := range r.RegisteredTools() {
+		if ti.Name == "image_gen" {
+			info := ti
+			spec = &info
+		}
+	}
+	if spec == nil {
+		t.Fatal("image_gen not registered")
+	}
+	for _, want := range []string{"cap/model-x", "1024x1024", "low|high", "up to 2 reference images"} {
+		if !strings.Contains(spec.Description, want) {
+			t.Fatalf("description missing %q:\n%s", want, spec.Description)
+		}
+	}
+}
+
+func TestImageGenRequirementGateFailsFast(t *testing.T) {
+	reg := toolproviders.NewRegistry()
+	reg.Register(&capProvider{fakeImageProvider: fakeImageProvider{resp: toolproviders.Response{Text: "ok"}}, nameOverride: "cap", caps: toolproviders.Capabilities{
+		AspectRatios: []string{"1:1", "3:4"},
+		Quality:      []string{"low", "high"},
+		MaxImages:    1, MaxRefImages: 0, Declared: true,
+	}})
+	r := NewRegistry(t.TempDir(), t.TempDir())
+	r.SetSessionID("imc:acc_1:chat_9")
+	RegisterImageGenChain(r, &toolproviders.Chain{
+		Category: "image_gen", Order: []string{"cap/model-x"}, Registry: reg,
+		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
+	}, nil)
+	fn := r.GetFunc("image_gen")
+	if fn == nil {
+		t.Fatal("image_gen not registered")
+	}
+
+	// 9:21 nowhere in the declared ratios → ToolError before any provider call
+	_, err := fn(context.Background(), json.RawMessage(`{"prompt":"x","aspect":"9:21"}`))
+	var te *agl.ToolError
+	if !errors.As(err, &te) || !strings.Contains(te.Msg, "9:21") || !strings.Contains(te.Msg, "3:4") {
+		t.Fatalf("want shortfall error naming 9:21 and the supported ratios, got %v", err)
+	}
+
+	// quality tier nobody declares → rejected
+	_, err = fn(context.Background(), json.RawMessage(`{"prompt":"x","quality":"ultra"}`))
+	if !errors.As(err, &te) || !strings.Contains(te.Msg, "ultra") {
+		t.Fatalf("want quality shortfall, got %v", err)
+	}
+
+	// a supported ask passes the gate (provider still runs)
+	_, err = fn(context.Background(), json.RawMessage(`{"prompt":"x","aspect":"3:4"}`))
+	if err != nil {
+		t.Fatalf("supported ask should pass: %v", err)
+	}
+}
