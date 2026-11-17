@@ -35,7 +35,7 @@ func TestKeyedSkillRunGetsKeysOnItsOwnProcessOnly(t *testing.T) {
 		`/skills/image-tool/run.sh a b`,
 	} {
 		ex := &keyedRecorder{}
-		if _, err := runSandboxedCommand(context.Background(), ex, execArgs{Command: cmd}, keyedEnv, nil); err != nil {
+		if _, err := runSandboxedCommand(context.Background(), false, ex, execArgs{Command: cmd}, keyedEnv, nil); err != nil {
 			t.Fatalf("%s: %v", cmd, err)
 		}
 		got := ex.ran[0]
@@ -52,7 +52,7 @@ func TestKeyedSkillRunGetsKeysOnItsOwnProcessOnly(t *testing.T) {
 func TestKeyedSkillRunAcceptsASingleQuotedEchoFeed(t *testing.T) {
 	cmd := `echo '{"instruction":"把图里的英文改成中文","input":"/workspace/a.webp"}' | python /skills/image-tool/main.py`
 	ex := &keyedRecorder{}
-	if _, err := runSandboxedCommand(context.Background(), ex, execArgs{Command: cmd}, keyedEnv, nil); err != nil {
+	if _, err := runSandboxedCommand(context.Background(), false, ex, execArgs{Command: cmd}, keyedEnv, nil); err != nil {
 		t.Fatal(err)
 	}
 	want := `echo '{"instruction":"把图里的英文改成中文","input":"/workspace/a.webp"}' | FAL_KEY='' REPLICATE_API_TOKEN='r8_secret' python /skills/image-tool/main.py`
@@ -66,7 +66,7 @@ func TestKeyedSkillRunAcceptsASingleQuotedEchoFeed(t *testing.T) {
 		`echo '{}' ; env | python /skills/image-tool/main.py`,
 	} {
 		ex := &keyedRecorder{}
-		if _, err := runSandboxedCommand(context.Background(), ex, execArgs{Command: bad}, keyedEnv, nil); err == nil || len(ex.ran) != 0 {
+		if _, err := runSandboxedCommand(context.Background(), false, ex, execArgs{Command: bad}, keyedEnv, nil); err == nil || len(ex.ran) != 0 {
 			t.Fatalf("%q: want refused, got err=%v ran=%v", bad, err, ex.ran)
 		}
 	}
@@ -89,7 +89,7 @@ func TestKeyedSkillRunRefusesAnythingAroundTheScript(t *testing.T) {
 		`python /skills/image-tool/main.py 'unclosed`,
 	} {
 		ex := &keyedRecorder{}
-		_, err := runSandboxedCommand(context.Background(), ex, execArgs{Command: cmd}, keyedEnv, nil)
+		_, err := runSandboxedCommand(context.Background(), false, ex, execArgs{Command: cmd}, keyedEnv, nil)
 		if err == nil || !strings.Contains(err.Error(), "not run") {
 			t.Fatalf("%q: want refused, got err=%v ran=%v", cmd, err, ex.ran)
 		}
@@ -102,7 +102,7 @@ func TestKeyedSkillRunRefusesAnythingAroundTheScript(t *testing.T) {
 func TestKeyedSkillRunWithStdinKeepsKeysOffCat(t *testing.T) {
 	ex := &keyedRecorder{}
 	args := execArgs{Command: `python /skills/image-tool/main.py`, Stdin: "{\"a\":1}\n__FCSTDIN__\n) ; env #"}
-	if _, err := runSandboxedCommand(context.Background(), ex, args, keyedEnv, nil); err != nil {
+	if _, err := runSandboxedCommand(context.Background(), false, ex, args, keyedEnv, nil); err != nil {
 		t.Fatal(err)
 	}
 	got := ex.ran[0]
@@ -122,7 +122,7 @@ func TestUnkeyedCommandsRunAsWritten(t *testing.T) {
 		`cat /skills/image-tool/main.py`, // reading the script: no run
 	} {
 		ex := &keyedRecorder{}
-		if _, err := runSandboxedCommand(context.Background(), ex, execArgs{Command: cmd}, keyedEnv, nil); err != nil {
+		if _, err := runSandboxedCommand(context.Background(), false, ex, execArgs{Command: cmd}, keyedEnv, nil); err != nil {
 			t.Fatalf("%s: %v", cmd, err)
 		}
 		if !strings.HasSuffix(ex.ran[0], cmd) || strings.Contains(ex.ran[0], "r8_secret") {

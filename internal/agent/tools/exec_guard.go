@@ -323,6 +323,9 @@ func isHomeSubtreeTarget(t string) bool {
 // ---- 裸设备与文件系统 ----
 
 func classifyDiskSegment(seg execSegment) execVerdict {
+	if len(seg.tokens) == 0 {
+		return execAllowed // empty segment (tokenizer artifact) — nothing to classify
+	}
 	head := seg.tokens[0]
 	switch {
 	case head == "mkfs" || strings.HasPrefix(head, "mkfs."),
