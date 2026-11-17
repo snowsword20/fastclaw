@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/skills"
@@ -473,6 +474,92 @@ func looksBinary(data []byte) bool {
 		}
 	}
 	return false
+}
+
+// diffOldContentMaxBytes caps the old content attached to a write_file
+// result for the web diff view — keeps session_events rows bounded.
+const diffOldContentMaxBytes = 128 << 10
+
+// withOldContentMeta attaches the pre-write file content to the tool
+// result as UI-only metadata (extractToolMeta strips the envelope before
+// the model sees the text). A fresh file (nothing overwritten) carries
+// no old content — the UI renders it as "new file".
+func withOldContentMeta(text string, oldContent string, oldExisted bool) string {
+	if !oldExisted {
+		return text
+	}
+	truncated := false
+	if len(oldContent) > diffOldContentMaxBytes {
+		oldContent = oldContent[:diffOldContentMaxBytes]
+		truncated = true
+	}
+	return WithMeta(text, map[string]any{
+		"old": map[string]any{"content": oldContent, "truncated": truncated},
+	})
+}
+
+// diffOldContent best-effort reads the file that write_file is about to
+// overwrite, following the same routing the write itself will use
+// (workspace store → sandbox fallback for mid-turn writes not yet
+// mirrored; host FS for host-routed paths). Any failure just means no
+// diff.
+func (r *Registry) diffOldContent(ctx context.Context, ex sandbox.Executor, path string) (string, bool) {
+	route := r.routeFor(path, OpRead)
+	slog.Debug("diff old content: routing", "path", path, "route", route,
+		"hasStore", r.workspaceStore != nil)
+	switch route {
+	case RouteWorkspaceStore:
+		if r.workspaceStore != nil {
+			// 对象存储后端（S3/R2/OSS）在 Put 后立刻 Get 有短暂一致性
+			// 窗口（同回合内连写同一文件时旧版本可能还没可见）——未命中
+			// 且路由声明该走 store 时，短等一次重试再放弃。
+			readStored := func() (string, bool) {
+				rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(path))
+				if err != nil {
+					return "", false
+				}
+				defer rc.Close()
+				data, readErr := io.ReadAll(rc)
+				if readErr != nil || looksBinary(data) {
+					slog.Warn("diff old content: store read failed", "path", path,
+						"readErr", readErr != nil, "binary", readErr == nil)
+					return "", false
+				}
+				return string(data), true
+			}
+			if content, ok := readStored(); ok {
+				return content, true
+			}
+			time.Sleep(150 * time.Millisecond)
+			if content, ok := readStored(); ok {
+				return content, true
+			}
+		}
+		// store 未命中：文件可能只存在于沙箱（同回合早些时候写入、还没
+		// 镜像到 store）——回退读沙箱视图。
+		out, err := ex.ReadFile(ctx, path)
+		if err == nil {
+			return out, true
+		}
+		slog.Warn("diff old content: sandbox read failed", "path", path, "err", err)
+		return "", false
+	case RouteHostFS:
+		full, ok := hostHomePath(path)
+		if !ok {
+			full = path
+		}
+		data, err := os.ReadFile(full)
+		if err != nil || looksBinary(data) {
+			return "", false
+		}
+		return string(data), true
+	default: // RouteSandbox
+		out, err := ex.ReadFile(ctx, path)
+		if err != nil {
+			return "", false
+		}
+		return out, true
+	}
 }
 
 func binaryRefusal(path string, size int) string {
@@ -1055,6 +1142,17 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		if r.ownerManagedFileWriteBlocked(args.Path) {
 			return OwnerManagedFileWriteRefusal, nil
 		}
+		// UI diff: read the file we're about to overwrite so the result
+		// can carry the old version (metadata.old) for the web diff view.
+		// Only content routes; system/skill stores hold metadata, not
+		// workspace files. Best-effort — any read failure just means no
+		// diff for this write.
+		var oldContent string
+		var oldExisted bool
+		switch r.routeFor(args.Path, OpWrite) {
+		case RouteWorkspaceStore, RouteHostFS, RouteSandbox:
+			oldContent, oldExisted = r.diffOldContent(ctx, ex, args.Path)
+		}
 		switch r.routeFor(args.Path, OpWrite) {
 		case RouteSystemStore:
 			name := filepath.Clean(args.Path)
@@ -1071,7 +1169,7 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 				return "", fmt.Errorf("workspace put: %w", err)
 			}
 			r.mirrorCodingWriteToSandbox(ctx, args.Path, args.Content)
-			return fmt.Sprintf("Written %d bytes to %s", len(args.Content), args.Path), nil
+			return withOldContentMeta(fmt.Sprintf("Written %d bytes to %s", len(args.Content), args.Path), oldContent, oldExisted), nil
 		case RouteSkillStore:
 			// Skill scaffolding (skill-creator's `skills/<name>/...`) lands
 			// on host disk where SkillsLoader scans + mirrors to OSS, NOT
@@ -1092,12 +1190,15 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 			if err := os.WriteFile(full, []byte(args.Content), 0o644); err != nil {
 				return "", fmt.Errorf("host write %s: %w", full, err)
 			}
-			return fmt.Sprintf("Written %d bytes to %s", len(args.Content), full), nil
+			return withOldContentMeta(fmt.Sprintf("Written %d bytes to %s", len(args.Content), full), oldContent, oldExisted), nil
 		case RouteRefuseSuggestSandbox:
 			return "", fmt.Errorf("%s", errSandboxRequiredMessage)
 		default: // RouteSandbox
 			out, err := ex.WriteFile(ctx, args.Path, args.Content)
-			return MetaSandboxPrefix + out, err
+			if err != nil {
+				return MetaSandboxPrefix + out, err
+			}
+			return withOldContentMeta(MetaSandboxPrefix+out, oldContent, oldExisted), nil
 		}
 	})
 
