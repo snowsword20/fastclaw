@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -85,6 +86,7 @@ type Agent struct {
 	admins                  map[string][]string
 	skillsCfg               config.SkillsConfig
 	globalSkillsCfg         config.SkillsCfg
+
 	messageBus              *bus.MessageBus
 	subAgentSpawner         tools.SubAgentSpawner
 	ftsStore                *store.FTSStore
@@ -2799,8 +2801,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// Hook: BeforeSystemPrompt
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
 
+	_tSetupPrompt := time.Now()
 	chatterMem := a.memory.WithUserID(chatterUID)
 	systemPrompt := a.ctxBuilder.BuildTurnSystemPrompt(chatterUID, chatterMem, a.isTrustedTurn(msg), groupContextFromParams(msg.Params), a.registry.HostWorkDir())
+	slog.Info("turn setup timing",
+		"step", "build_prompt", "dur_ms", time.Since(_tSetupPrompt).Milliseconds(),
+		"chat_id", msg.ChatID, "user", chatterUID)
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 
@@ -3749,7 +3755,11 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	slog.Info("turn: refreshing skills",
 		"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID, "user", chatterUID)
 	a.refreshSkillsFromStore(chatterUID)
+	_tSetupSession := time.Now()
 	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
+	slog.Info("turn setup timing",
+		"step", "session_get", "dur_ms", time.Since(_tSetupSession).Milliseconds(),
+		"chat_id", msg.ChatID, "user", chatterUID)
 	ctx = withMeterSession(ctx, sess.Key())
 	// Bind chatter onto sess so its ctx() embeds WithChatterUserID
 	// for DBStore session writes — Session.ctx() rebuilds ctx from its
@@ -3779,8 +3789,12 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	defer padOrphanToolResults(sess)
 
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: BeforeSystemPrompt, UserID: a.ownerUserID})
+	_tSetupPrompt := time.Now()
 	chatterMem := a.memory.WithUserID(chatterUID)
 	systemPrompt := a.ctxBuilder.BuildTurnSystemPrompt(chatterUID, chatterMem, a.isTrustedTurn(msg), groupContextFromParams(msg.Params), a.registry.HostWorkDir())
+	slog.Info("turn setup timing",
+		"step", "build_prompt", "dur_ms", time.Since(_tSetupPrompt).Milliseconds(),
+		"chat_id", msg.ChatID, "user", chatterUID)
 	knowledgeMeta := knowledgeMetadata(extractKnowledgeCitationSources(systemPrompt))
 	a.logSystemPromptFingerprint(msg.Channel, msg.ChatID, chatterUID, systemPrompt)
 	a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterSystemPrompt, UserID: a.ownerUserID})
@@ -4639,6 +4653,22 @@ func (a *Agent) chatterUserID(msg bus.InboundMessage) string {
 // pass the chatter (not the agent owner) so a skill chatter A installs
 // is visible only to chatter A even when both chat the same agent. Empty
 // disables the per-user layer.
+// skillsRefreshTTL bounds how often a turn re-syncs skills from the
+// object store. The sync costs several remote List round-trips per turn
+// (measured 2.5~4s); within the TTL the turn loads from the
+// already-hydrated local dirs instead — identical prompt bytes, just no
+// remote round-trips. Installs still apply immediately on the replica
+// that did the install (its reload path is explicit); sibling replicas
+// pick them up within this TTL.
+const skillsRefreshTTL = 300 * time.Second
+
+// Per (agent, chatter) last-sync timestamps at package level: agents are
+// rebuilt per turn here, so an instance field would reset every turn.
+var (
+	skillsSyncMu   sync.Mutex
+	skillsSyncedAt = map[string]time.Time{}
+)
+
 func (a *Agent) refreshSkillsFromStore(userID string) {
 	if a.workspaceStore == nil {
 		// IM-vs-web "missing agent skills" diagnostic: when this fires
@@ -4650,12 +4680,33 @@ func (a *Agent) refreshSkillsFromStore(userID string) {
 			"agent", a.name, "agentID", a.agentID, "user", userID)
 		return
 	}
-	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.homePath, "", a.skillsCfg, a.globalSkillsCfg).
-		WithObjectStore(a.workspaceStore, a.agentID).
-		WithUserID(userID).
+	// TTL cache (see skillsRefreshTTL): skip the remote object-store sync
+	// when this (agent, chatter) synced recently; the local dirs already
+	// hold everything the last sync fetched.
+	syncKey := a.agentID + "|" + userID
+	skillsSyncMu.Lock()
+	lastSync, synced := skillsSyncedAt[syncKey]
+	skillsSyncMu.Unlock()
+	skipSync := synced && time.Since(lastSync) < skillsRefreshTTL
+	if !skipSync {
+		defer func() {
+			skillsSyncMu.Lock()
+			skillsSyncedAt[syncKey] = time.Now()
+			skillsSyncMu.Unlock()
+		}()
+	} else {
+		slog.Debug("skills store sync skipped: fresh",
+			"agent", a.name, "agentID", a.agentID, "user", userID,
+			"ttl", skillsRefreshTTL.String())
+	}
+	loader := NewSkillsLoaderWithGlobal(a.homeDir, a.homePath, "", a.skillsCfg, a.globalSkillsCfg)
+	if !skipSync {
+		loader = loader.WithObjectStore(a.workspaceStore, a.agentID)
+	}
+	skills := loader.WithUserID(userID).
 		WithOwnerID(a.agentOwnerID).
-		WithSandbox(buildinfo.IsSandboxEnforced())
-	skills := loader.LoadSkills()
+		WithSandbox(buildinfo.IsSandboxEnforced()).
+		LoadSkills()
 	summary := loader.BuildSkillsSummary(skills)
 	a.ctxBuilder.SetSkillsSummary(summary)
 	tools.RegisterLoadSkill(a.registry, loader.AllSkillDirs())
@@ -4670,7 +4721,8 @@ func (a *Agent) refreshSkillsFromStore(userID string) {
 	}
 	slog.Info("skills summary refreshed",
 		"agent", a.name, "agentID", a.agentID, "user", userID,
-		"count", len(skills), "summary_bytes", len(summary), "names", names)
+		"count", len(skills), "summary_bytes", len(summary),
+		"synced", !skipSync, "names", names)
 }
 
 // ReloadWorkspaceFiles re-reads workspace .md files (SOUL.md, AGENTS.md, etc.)
