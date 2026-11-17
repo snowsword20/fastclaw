@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -249,6 +250,16 @@ func ValidateHookURL(ctx context.Context, raw string) error {
 	return nil
 }
 
+// GuardedDial is guardedDial for other outbound calls to URLs an account
+// registered (its scheduler): the same public-addresses-only rule.
+func GuardedDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	return guardedDial(ctx, network, addr)
+}
+
+// CheckScheme is checkScheme for those calls: https only (http too with
+// EnvAllowPrivate).
+func CheckScheme(raw string) error { return checkScheme(raw) }
+
 // guardedDial resolves the host, refuses non-public addresses (unless
 // EnvAllowPrivate) and dials the address it checked, so DNS can't swap in
 // another between check and connect.
@@ -271,8 +282,24 @@ func guardedDial(ctx context.Context, network, addr string) (net.Conn, error) {
 			}
 		}
 	}
+	// Try every checked address, IPv4 first: a host behind Cloudflare also
+	// has IPv6 addresses, which a cluster without IPv6 can't reach.
+	sort.SliceStable(ips, func(i, j int) bool {
+		return ips[i].IP.To4() != nil && ips[j].IP.To4() == nil
+	})
 	d := &net.Dialer{Timeout: HookTimeout, KeepAlive: 30 * time.Second}
-	return d.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := d.DialContext(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, lastErr
 }
 
 // isBlockedAddr mirrors web_fetch's SSRF guard: loopback, private,

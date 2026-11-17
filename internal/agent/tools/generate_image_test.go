@@ -95,7 +95,7 @@ func TestGenerateImageMissingFileExplains(t *testing.T) {
 	f := &fakeImageMaker{runOut: "I drew it instead", fetchErr: &agl.ToolError{Msg: "no such file"}}
 	_, err := newImageTool(f).run(context.Background(), json.RawMessage(`{"prompt":"a cat"}`))
 	var te *agl.ToolError
-	if !errors.As(err, &te) || !strings.Contains(te.Msg, "isn't at") || !strings.Contains(te.Msg, "I drew it instead") {
+	if !errors.As(err, &te) || !strings.Contains(te.Msg, "could not be brought into the chat") || !strings.Contains(te.Msg, "I drew it instead") {
 		t.Fatalf("err: %v", err)
 	}
 }
@@ -150,7 +150,7 @@ func TestGenerateImageDefersToImageGen(t *testing.T) {
 		if withImageGen {
 			r.Register("image_gen", "cloud images", map[string]any{"type": "object"}, func(context.Context, json.RawMessage) (string, error) { return "", nil })
 		}
-		RegisterGenerateImage(r, &fakeImageMaker{}, nil, "u", agl.ToolChat{}, nil)
+		RegisterGenerateImage(r, &fakeImageMaker{}, nil, nil, "u", agl.ToolChat{}, nil)
 		for _, d := range r.Definitions() {
 			if d.Function.Name == GenerateImageToolName {
 				return d.Function.Description

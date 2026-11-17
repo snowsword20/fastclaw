@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/mcp"
 	"github.com/fastclaw-ai/fastclaw/internal/privacy"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
+	"github.com/fastclaw-ai/fastclaw/internal/redact"
 	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
@@ -1072,8 +1074,19 @@ func (a *Agent) RegisterWebSearchChain(chain *toolproviders.Chain) {
 }
 
 // RegisterImageGenChain exposes the image_gen tool to this agent.
+// The pictures are stored in the calling chat's workspace.
 func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain) {
-	tools.RegisterImageGenChain(a.registry, chain)
+	tools.RegisterImageGenChain(a.registry, chain, &tools.ImageFiles{
+		Save: func(ctx context.Context, sessionID, projectID, name string, data []byte, contentType string) (string, error) {
+			url := "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data)
+			names := a.WriteSessionAttachments(ctx, sessionID, projectID, []Attachment{{URL: url, Name: name}})
+			if len(names) == 0 {
+				return "", errors.New("workspace write failed")
+			}
+			return names[0], nil
+		},
+		Load: a.loadSessionFile,
+	})
 }
 
 // RegisterWebFetchChain swaps the agent's web_fetch backend for a
@@ -2534,7 +2547,7 @@ func maybeInjectSoftDeadlineWarning(ctx context.Context, turnStart time.Time, me
 const hardToolIterationCeiling = 200
 
 // toolIterationLimit is the turn's tool-round budget: the agent's
-// explicit maxToolIterations when set (chatbot mode defaults to 5),
+// explicit maxToolIterations when set (chatbot mode defaults to 20),
 // otherwise hardToolIterationCeiling.
 func (a *Agent) toolIterationLimit() int {
 	if a.maxToolIterations > 0 {
@@ -2623,7 +2636,16 @@ func (a *Agent) runToolsWithProgress(ctx context.Context, toolCalls []provider.T
 }
 
 // HandleMessage processes an inbound message through the ReAct loop.
+// A regular chatter's reply passes through redact.Text on the way out.
 func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) string {
+	reply := a.handleMessage(ctx, msg)
+	if !a.isTrustedTurn(msg) {
+		reply = redact.Text(reply)
+	}
+	return reply
+}
+
+func (a *Agent) handleMessage(ctx context.Context, msg bus.InboundMessage) string {
 	// A deploy waits for this turn before the process exits (drain).
 	defer drain.Track()()
 	// Check for slash commands first. Empty reply means "handled but
@@ -2647,6 +2669,21 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			emitEvent(ctx, ChatEvent{Type: "done"})
 		}
 		return result.reply
+	}
+
+	// One turn at a time per conversation: wait for the turn already
+	// running on it before loading the history (see session.LockTurn).
+	// Registered first, so it unlocks after every other defer of the
+	// turn has settled the history.
+	{
+		channel, accountID, chatID, _ := sessionTriple(msg, msg.ProjectID)
+		lockedCtx, unlock, err := a.sessions.LockTurn(ctx, channel, accountID, chatID)
+		if err != nil {
+			emitEvent(ctx, ChatEvent{Type: "done"})
+			return ""
+		}
+		ctx = lockedCtx
+		defer unlock()
 	}
 
 	a = a.forkTurn()
@@ -2928,8 +2965,12 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// 已作废，网页端收到该事件要清空流式气泡，否则重试文本会拼接在
 	// 废弃内容后面（重复/错乱）。
 	modelAttempt := 0
+	// emptyRetries counts consecutive empty (no text, no tool calls)
+	// replies; the turn asks again up to maxEmptyReplyRetries before
+	// failing (上游 1b8f9ca).
+	emptyRetries := 0
 
-	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit()}
+	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit(), zh: prefersChinese(msg.Text)}
 	loopWarned := false
 	totalFailedCalls := 0
 
@@ -3079,7 +3120,23 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			if len(continuedParts) > 0 {
 				content = strings.Join(append(continuedParts, resp.Content), "")
 			}
+			// A reply with neither text nor tool calls is usually a
+			// provider hiccup (seen in bursts on DeepSeek): ask again
+			// before failing the turn. 判空对象是本轮 resp.Content ——
+			// 续写轮次即使本轮为空，continuedParts 里已累积的内容也不该
+			// 丢弃，重试耗尽后落到下方拼接内容判空，仍能带已有部分收尾。
+			if strings.TrimSpace(resp.Content) == "" && !resp.Truncated && emptyRetries < maxEmptyReplyRetries {
+				emptyRetries++
+				slog.Warn("model returned an empty reply — retrying",
+					"agent", a.name, "model", a.model, "thinking_bytes", len(resp.Thinking),
+					"output_tokens", resp.Usage.OutputTokens, "retry", emptyRetries)
+				i-- // the empty reply doesn't use up a tool round
+				continue
+			}
 			if strings.TrimSpace(content) == "" {
+				slog.Error("model returned an empty reply after retries",
+					"agent", a.name, "model", a.model, "truncated", resp.Truncated,
+					"thinking_bytes", len(resp.Thinking))
 				emptyMsg := "model returned an empty response"
 				if resp.Truncated {
 					emptyMsg = "the model's reply was cut off at its output limit before it produced anything usable"
@@ -3150,10 +3207,18 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			})
 		}
 
-		// Emit assistant content before tool calls if present
+		// Emit assistant content before tool calls if present. On IM
+		// channels it goes out now (a plan, a progress line) instead of
+		// waiting in the final reply until the whole turn ends.
 		if resp.Content != "" {
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content, "metadata": knowledgeMeta}})
-			replyParts = append(replyParts, resp.Content)
+			interim := scrubLeakedToolCallContent(resp.Content)
+			if !a.registry.CallerIsAdmin() {
+				interim = redact.Text(interim)
+			}
+			if !sendInterim(ctx, interim) {
+				replyParts = append(replyParts, resp.Content)
+			}
 		}
 
 		// Emit tool_call events
@@ -3277,6 +3342,11 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			tc := resp.ToolCalls[idx]
 			resultContent, meta := extractToolMeta(r.result)
 			resultContent = capToolResult(resultContent, a.registry.HostWorkDir(), tc.ID)
+			if !a.registry.CallerIsAdmin() {
+				// A regular chatter's turn: secrets and our egress IP never
+				// reach the model, the session or the chatter's browser.
+				resultContent = redact.Text(resultContent)
+			}
 
 			// Hook: AfterToolCall
 			a.hooks.Run(ctx, &HookContext{
@@ -3356,6 +3426,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				"id":     tc.ID,
 				"name":   r.toolName,
 				"result": resultContent,
+			}
+			if !a.registry.CallerIsAdmin() {
+				evt["result"] = guestToolResultView(r.toolName, resultContent)
 			}
 			if meta != nil {
 				evt["metadata"] = meta
@@ -3866,7 +3939,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	softDeadlineFired := false
 	iterBudgetWarned := false
 
-	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit()}
+	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit(), zh: prefersChinese(msg.Text)}
 	loopWarned := false
 	totalFailedCalls := 0
 
@@ -4040,6 +4113,11 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			tc := resp.ToolCalls[idx]
 			resultContent, meta := extractToolMeta(r.result)
 			resultContent = capToolResult(resultContent, a.registry.HostWorkDir(), tc.ID)
+			if !a.registry.CallerIsAdmin() {
+				// A regular chatter's turn: secrets and our egress IP never
+				// reach the model, the session or the chatter's browser.
+				resultContent = redact.Text(resultContent)
+			}
 			a.hooks.Run(ctx, &HookContext{AgentName: a.name, Point: AfterToolCall, ToolName: r.toolName, ToolResult: resultContent, Error: r.err, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey(), IsPlanMode: isPlanMode(msg.Params), Source: msg.Source})
 
 			if r.err != nil {
@@ -4268,6 +4346,7 @@ const maxFailedToolCallsPerTurn = 10
 type turnStop struct {
 	reason string
 	limit  int
+	zh     bool // the person wrote in Chinese: say it in Chinese
 }
 
 func (t turnStop) nudge() provider.Message {
@@ -4285,11 +4364,17 @@ func (t turnStop) nudge() provider.Message {
 }
 
 func (t turnStop) notice(channel string) string {
+	if channel == "web" {
+		return ""
+	}
 	if t.reason == stopReasonLoop {
-		if channel == "web" {
-			return ""
+		if t.zh {
+			return "\n\n---\n⚠️ 同一步一直得到同样的结果，这一轮先停在这里，上面的内容可能不完整。回复「继续」我接着做。"
 		}
 		return "\n\n---\n⚠️ This turn was stopped because the same step kept returning the same result — the answer above may be incomplete. Reply to continue."
+	}
+	if t.zh {
+		return "\n\n---\n⚠️ 这件事步骤比较多，这一轮先做到这里，上面是目前的进度，标成完成的步骤也不一定都核实过。回复「继续」我接着做。"
 	}
 	return iterationCapNotice(channel, t.limit)
 }
@@ -4301,6 +4386,12 @@ func (t turnStop) metadata() map[string]any {
 }
 
 func (t turnStop) fallback() string {
+	if t.zh {
+		if t.reason == stopReasonLoop {
+			return "同一步一直得到同样的结果，我先停下来了，暂时没能整理出完整的答复。"
+		}
+		return "这件事步骤比较多，这一轮的步数用完了，我还没来得及整理出完整的结果。"
+	}
 	if t.reason == stopReasonLoop {
 		return "I stopped because the same step kept returning the same result and couldn't synthesize a final response. The work above is what I gathered so far."
 	}
@@ -4431,8 +4522,7 @@ func (a *Agent) RegisteredTools() []tools.ToolInfo {
 // (cron-triggered greetings, multi-recipient broadcasts) should fall
 // back to `agent` mode or write a plugin.
 //
-// Still absent: scheduling (create_cron_job), delegation (delegate_task),
-// start_app_preview — agent-loop machinery that doesn't belong in a
+// Still absent: delegation (delegate_task), start_app_preview — agent-loop machinery that doesn't belong in a
 // chat persona. Add new built-ins here only when they're universally
 // useful for chatbot products; everything else belongs in a plugin.
 var chatbotBuiltinAllowlist = []string{
@@ -4461,6 +4551,14 @@ var chatbotBuiltinAllowlist = []string{
 	// user, the agents the product marked for them), so a chatbot with
 	// nothing reachable just gets an error listing none.
 	"message_agent",
+	// Reminders and recurring messages ("2 分钟后提醒我", "每天 8 点…") are
+	// everyday chat. A fired job comes back as a turn in the same chat:
+	// FastClaw's own channels deliver it, and an API product with a
+	// scheduler (docs/scheduler.md) gets it from trig. Where neither can
+	// deliver, create_cron_job says so instead of saving a dead job.
+	"create_cron_job",
+	"list_cron_jobs",
+	"delete_cron_job",
 }
 
 // builtinAllowForMode returns the built-in tool name allowlist for the

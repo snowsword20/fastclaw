@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -19,9 +20,11 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/connectors"
 	"github.com/fastclaw-ai/fastclaw/internal/daemon"
 	"github.com/fastclaw-ai/fastclaw/internal/gateway"
+	"github.com/fastclaw-ai/fastclaw/internal/memwatch"
 	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/setup"
+	"github.com/fastclaw-ai/fastclaw/internal/share"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/usermcp"
 )
@@ -203,6 +206,9 @@ func runGateway(port int) error {
 
 	if home, err := config.HomeDir(); err == nil {
 		slog.Info("fastclaw instance", "home", home, "port", port)
+		// Heap profiles on memory spikes (and pprof when configured);
+		// the home dir is the persistent volume in the cloud pod.
+		memwatch.Start(context.Background(), filepath.Join(home, "debug"))
 	}
 
 	agent.InstallBundledSkills()
@@ -273,6 +279,12 @@ func runGateway(port int) error {
 	apiSrv.SetQuotaStore(gw.QuotaStore())
 	apiSrv.SetStore(gw.Store())
 	apiSrv.SetWorkspaceStore(gw.Workspace())
+	// Download links on our own domain (<FASTCLAW_PUBLIC_URL>/f/...): the
+	// fallback when an IM channel can't carry a file itself.
+	if sh := share.New(gw.Workspace(), os.Getenv("FASTCLAW_PUBLIC_URL")); sh != nil {
+		share.SetDefault(sh)
+		go sh.RunSweeper(context.Background())
+	}
 	// "Connect my computer": the agl hub at <FASTCLAW_PUBLIC_URL>/agl,
 	// /v1/machines, and runtime "agl" agents whose IM turns run on the
 	// owner's linked machine. FASTCLAW_PUBLIC_URL is the origin machines
