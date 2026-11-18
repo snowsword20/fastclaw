@@ -238,3 +238,39 @@ func TestAsyncMarkerIsFalseByDefault(t *testing.T) {
 		t.Fatal("marker roundtrip failed")
 	}
 }
+
+// Named shapes must reach the plugin as concrete declared ratios — its
+// validator matches aspect by exact membership.
+func TestMagpieNamedAspectBecomesConcreteRatio(t *testing.T) {
+	srv, rec := fakeImgQueueTasks(t, "")
+	ctx := toolproviders.WithAsyncImage(context.Background())
+	if _, err := magpieChain(srv, "pool/declared-editor").Execute(ctx, map[string]any{
+		"prompt": "a cat", "aspect": "square",
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	submits, _, _ := rec.snapshot()
+	if len(submits) != 1 || !strings.Contains(submits[0], `"aspect":"1:1"`) {
+		t.Fatalf("square should be sent as the declared 1:1 ratio: %v", submits)
+	}
+}
+
+func TestMagpieConcreteAspect(t *testing.T) {
+	declared := toolproviders.Capabilities{Declared: true, AspectRatios: []string{"3:2", "2:3", "1:1"}}
+	cases := map[string]string{
+		"square":    "1:1",
+		"portrait":  "2:3",
+		"landscape": "3:2",
+		"16:9":      "16:9", // explicit ratios pass through
+		"":          "",
+	}
+	for in, want := range cases {
+		if got := magpieConcreteAspect(in, declared); got != want {
+			t.Errorf("magpieConcreteAspect(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// Undeclared caps fall back to the common defaults.
+	if got := magpieConcreteAspect("portrait", toolproviders.Capabilities{}); got != "2:3" {
+		t.Errorf("undeclared fallback = %q, want 2:3", got)
+	}
+}

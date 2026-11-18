@@ -57,6 +57,9 @@ func CapabilitiesOf(reg *Registry, category, name, model string, cfg ProviderCon
 
 // MeetsAspect reports whether caps covers the aspect (or a size whose
 // ratio matches). Unknown caps (Declared=false) always pass: fail-open.
+// Named shapes ("square", "portrait", "landscape") match by orientation:
+// any declared ratio with that orientation satisfies the name — the
+// concrete pick stays the provider's job.
 func (c Capabilities) MeetsAspect(aspect, size string) bool {
 	if !c.Declared {
 		return true
@@ -66,6 +69,10 @@ func (c Capabilities) MeetsAspect(aspect, size string) bool {
 		return true // nothing declared about shape
 	}
 	if aspect != "" {
+		switch strings.ToLower(strings.TrimSpace(aspect)) {
+		case "square", "portrait", "landscape":
+			return namedShapeMeets(ratios, strings.ToLower(strings.TrimSpace(aspect)))
+		}
 		return ratios[normalizeRatio(aspect)]
 	}
 	if w, h, ok := parseSize(size); ok {
@@ -77,6 +84,32 @@ func (c Capabilities) MeetsAspect(aspect, size string) bool {
 		return false
 	}
 	return true
+}
+
+// namedShapeMeets reports whether the declared ratio set covers a named
+// shape: square needs 1:1, portrait any w<h, landscape any w>h.
+func namedShapeMeets(ratios map[string]bool, name string) bool {
+	for r := range ratios {
+		w, h, ok := parseRatio(r)
+		if !ok {
+			continue
+		}
+		switch name {
+		case "square":
+			if w == h {
+				return true
+			}
+		case "portrait":
+			if h > w {
+				return true
+			}
+		case "landscape":
+			if w > h {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // MeetsQuality reports whether quality is a declared tier. Unknown caps

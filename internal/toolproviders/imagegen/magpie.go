@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -218,6 +219,14 @@ func (g *Magpie) Execute(ctx context.Context, req toolproviders.Request) (toolpr
 	if err != nil {
 		return toolproviders.Response{}, err
 	}
+	// The plugin validates aspect by exact ratio membership, so a named
+	// shape ("square"/"portrait"/"landscape" — the tool schema's
+	// first-class values) must become a concrete declared ratio before
+	// it is sent. The gate (unionShortfall) already matched it by
+	// orientation; here we pick the actual ratio.
+	if a.Aspect != "" {
+		a.Aspect = magpieConcreteAspect(a.Aspect, g.Capabilities(req.Config, model))
+	}
 
 	// Background calls go through the plugin's task queue (fairness,
 	// retries, persistence) instead of holding the sync proxy open.
@@ -272,6 +281,59 @@ func magpieModel(cfg toolproviders.ProviderConfig, a args) (string, error) {
 		return "", toolproviders.Retry(fmt.Errorf("magpie auto-route: %w", err))
 	}
 	return routeFor(m, cfg.Model, a)
+}
+
+// magpieConcreteAspect maps a named shape to a ratio the model declares
+// (first declared ratio of that orientation); undeclared caps fall back
+// to the common defaults. Explicit ratios pass through untouched.
+func magpieConcreteAspect(aspect string, caps toolproviders.Capabilities) string {
+	name := strings.ToLower(strings.TrimSpace(aspect))
+	if name != "square" && name != "portrait" && name != "landscape" {
+		return aspect
+	}
+	fallback := map[string]string{"square": "1:1", "portrait": "2:3", "landscape": "3:2"}[name]
+	if !caps.Declared || len(caps.AspectRatios) == 0 {
+		return fallback
+	}
+	for _, r := range caps.AspectRatios {
+		w, h, ok := parseRatioLocal(r)
+		if !ok {
+			continue
+		}
+		switch name {
+		case "square":
+			if w == h {
+				return r
+			}
+		case "portrait":
+			if h > w {
+				return r
+			}
+		case "landscape":
+			if w > h {
+				return r
+			}
+		}
+	}
+	return fallback
+}
+
+// parseRatioLocal parses "W:H" without reaching into the capabilities
+// package's unexported helpers.
+func parseRatioLocal(r string) (int, int, bool) {
+	parts := strings.SplitN(strings.TrimSpace(r), ":", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	w, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || w <= 0 {
+		return 0, 0, false
+	}
+	h, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || h <= 0 {
+		return 0, 0, false
+	}
+	return w, h, true
 }
 
 // edit sends the reference-image form to the plugin's sync edits proxy.
