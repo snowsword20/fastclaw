@@ -35,6 +35,10 @@ const (
 	// goal_context, its text is runtime-authored and never shown as a
 	// user bubble.
 	SourceConnector = "connector"
+	// SourceToolTask wakes a chat when a background tool task finishes
+	// (image_gen background=true): the agent's image-task manager routes
+	// the notice back to the originating chat, same as a fired cron job.
+	SourceToolTask = "tool_task"
 )
 
 // InboundMessage represents a message received from a channel.
