@@ -44,7 +44,10 @@ var imageHTTP = &http.Client{
 // a tool it can't use. files stores the pictures in the chat's workspace
 // so the model gets a short path, never the image data; nil (no
 // workspace) returns the provider's URLs.
-func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *ImageFiles) {
+// notify, when given, receives a wake-up when a background task
+// (image_gen background=true) finishes, so the agent can route it back
+// into the originating chat; without it background tasks are poll-only.
+func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *ImageFiles, notify ...func(ImageTaskNotice)) {
 	if chain == nil {
 		return
 	}
@@ -64,10 +67,16 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 	if !chain.Available() {
 		return
 	}
+	tasks := newImgTaskManager(chain, files)
+	if len(notify) > 0 {
+		tasks.notify = notify[0]
+	}
+	registerImageTaskTools(r, tasks)
 	desc := []string{
 		"Generate pictures (photo, illustration, portrait, poster, sticker, logo, …) from a text description with an image model, ready to show in this chat. Use it for every request to draw, paint or make an image.",
 		"Write \"prompt\" as a rich visual description: subject, style, composition, colors, mood, and any text that must appear in the picture.",
 		"It returns putInReply: put that exactly in your reply so the picture is shown, plus a short line of your own. Don't describe the image data or repeat the paths otherwise.",
+		"Set background=true for batches (several pictures or variations) or whenever the person shouldn't have to wait: the call returns a task id at once, a notice arrives in this chat when the pictures are ready, and image_task_status delivers them. Keep the default (sync) for a single quick picture the reply depends on.",
 	}
 	// Capability matrix: what each provider in the chain supports, so the
 	// model asks for parameters that exist instead of discovering limits
@@ -83,6 +92,7 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 		"size":   map[string]any{"type": "string", "description": "Explicit pixel size like \"1024x1024\" — only when the provider list above names sizes; otherwise prefer aspect."},
 		"quality": map[string]any{"type": "string", "description": "Fidelity tier like \"low\"/\"medium\"/\"high\" — only when the provider list above names tiers; omit otherwise."},
 		"n":      map[string]any{"type": "integer", "description": "How many variations (default 1). Each one is charged; respect each provider's per-call limit above."},
+		"background": map[string]any{"type": "boolean", "description": "Run as a background task instead of waiting: returns a task id immediately (picture arrives later via a notice + image_task_status). Use for batches or long queues."},
 	}
 	if files != nil && files.Load != nil {
 		desc = append(desc, "To edit a photo the person sent or base a picture on it (a new style, an avatar, a sticker of them), list it in \"images\" by its /workspace path.")
@@ -106,6 +116,10 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 		// round-trip with a message the model can relay verbatim.
 		if why := unionShortfall(chain, args); why != "" {
 			return "", &agl.ToolError{Msg: why}
+		}
+		if bg, _ := args["background"].(bool); bg {
+			delete(args, "background")
+			return tasks.submit(ctx, turn, args)
 		}
 		resp, err := chain.Execute(ctx, args)
 		if err != nil {
@@ -155,6 +169,14 @@ func attachRefs(ctx context.Context, files *ImageFiles, turn *Registry, args map
 // storeImages saves each picture in the chat's workspace and returns the
 // paths for the reply.
 func storeImages(ctx context.Context, files *ImageFiles, turn *Registry, images []toolproviders.Image) (string, error) {
+	_, blob, err := storeImagesAt(ctx, files, turn.SessionID(), turn.ProjectID(), images)
+	return blob, err
+}
+
+// storeImagesAt is storeImages for an explicit session (the background
+// task runner calls it after the submitting turn is gone). It returns the
+// stored paths and the model-facing JSON blob.
+func storeImagesAt(ctx context.Context, files *ImageFiles, sessionID, projectID string, images []toolproviders.Image) ([]string, string, error) {
 	stamp := time.Now().Format("20060102-150405")
 	var paths []string
 	var failed []string
@@ -175,7 +197,7 @@ func storeImages(ctx context.Context, files *ImageFiles, turn *Registry, images 
 			ct = http.DetectContentType(data)
 		}
 		name := fmt.Sprintf("picture-%s-%d%s", stamp, i+1, imageExt(ct))
-		saved, err := files.Save(ctx, turn.SessionID(), turn.ProjectID(), name, data, ct)
+		saved, err := files.Save(ctx, sessionID, projectID, name, data, ct)
 		if err != nil {
 			failed = append(failed, err.Error())
 			continue
@@ -183,7 +205,7 @@ func storeImages(ctx context.Context, files *ImageFiles, turn *Registry, images 
 		paths = append(paths, "/workspace/"+saved)
 	}
 	if len(paths) == 0 {
-		return "", fmt.Errorf("image_gen: the pictures were generated but could not be stored: %s", strings.Join(failed, "; "))
+		return nil, "", fmt.Errorf("image_gen: the pictures were generated but could not be stored: %s", strings.Join(failed, "; "))
 	}
 	var reply strings.Builder
 	for _, p := range paths {
@@ -193,7 +215,7 @@ func storeImages(ctx context.Context, files *ImageFiles, turn *Registry, images 
 		"images":     paths,
 		"putInReply": strings.TrimSpace(reply.String()),
 	})
-	return string(blob), nil
+	return paths, string(blob), nil
 }
 
 func fetchImage(ctx context.Context, u string) ([]byte, string, error) {

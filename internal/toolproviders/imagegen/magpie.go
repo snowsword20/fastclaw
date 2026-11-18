@@ -219,6 +219,15 @@ func (g *Magpie) Execute(ctx context.Context, req toolproviders.Request) (toolpr
 		return toolproviders.Response{}, err
 	}
 
+	// Background calls go through the plugin's task queue (fairness,
+	// retries, persistence) instead of holding the sync proxy open.
+	// Falls back to the sync facade when the endpoint has no task API.
+	if toolproviders.AsyncImageFrom(ctx) && magpieTasksSupported(ctx, endpoint, req.Config.APIKey) {
+		ctx, cancel := context.WithTimeout(ctx, magpieTaskTimeout)
+		defer cancel()
+		return g.executeTasks(ctx, endpoint, req.Config.APIKey, model, a)
+	}
+
 	timeout := 10 * time.Minute
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

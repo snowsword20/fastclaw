@@ -1074,7 +1074,10 @@ func (a *Agent) RegisterWebSearchChain(chain *toolproviders.Chain) {
 }
 
 // RegisterImageGenChain exposes the image_gen tool to this agent.
-// The pictures are stored in the calling chat's workspace.
+// The pictures are stored in the calling chat's workspace. Background
+// tasks (background=true) finish after the turn may have ended, so their
+// completion notice is routed back into the originating chat through the
+// message bus — the same delivery a fired cron job uses.
 func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain) {
 	tools.RegisterImageGenChain(a.registry, chain, &tools.ImageFiles{
 		Save: func(ctx context.Context, sessionID, projectID, name string, data []byte, contentType string) (string, error) {
@@ -1086,7 +1089,27 @@ func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain) {
 			return names[0], nil
 		},
 		Load: a.loadSessionFile,
-	})
+	}, a.notifyImageTask)
+}
+
+// notifyImageTask delivers a background image-task notice into the chat
+// that submitted it. Without a bus (tests) it's a no-op and the task is
+// poll-only.
+func (a *Agent) notifyImageTask(n tools.ImageTaskNotice) {
+	if a.messageBus == nil || n.Channel == "" {
+		return
+	}
+	a.messageBus.Inbound <- bus.InboundMessage{
+		Channel:     n.Channel,
+		AccountID:   n.AccountID,
+		ChatID:      n.ChatID,
+		UserID:      "imgtask",
+		OwnerUserID: a.ownerUserID,
+		AgentID:     a.agentID,
+		Text:        n.Text,
+		PeerKind:    "dm",
+		Source:      bus.SourceToolTask,
+	}
 }
 
 // RegisterWebFetchChain swaps the agent's web_fetch backend for a
@@ -4527,6 +4550,11 @@ func (a *Agent) RegisteredTools() []tools.ToolInfo {
 // useful for chatbot products; everything else belongs in a plugin.
 var chatbotBuiltinAllowlist = []string{
 	"image_gen",
+	// image_task_status/cancel: the polling/cancel companions of
+	// image_gen(background=true) — async pictures are exactly a
+	// companion-product feature (long queues, batches, "画好发我").
+	"image_task_status",
+	"image_task_cancel",
 	"tts",
 	"write_file",
 	"edit_file",
