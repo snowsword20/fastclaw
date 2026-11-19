@@ -86,12 +86,15 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /v1/chat/completions",
 			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleChatCompletions)))
 	}
-	// Background image-task status lookup (image_gen background=true).
-	// Lives under the agents endpoint gate — same audience (apps that
-	// manage agents), same isolation model.
+	// Background media-task status lookup (image_gen / video_gen / tts /
+	// music_gen in background mode). Lives under the agents endpoint
+	// gate — same audience (apps that manage agents), same isolation
+	// model. /v1/image-tasks is the pre-media alias (same handler).
 	if s.gatewayCfg == nil || s.gatewayCfg.HTTP.Endpoints.Agents.Enabled {
+		mux.HandleFunc("GET /v1/media-tasks/{id}",
+			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetMediaTask)))
 		mux.HandleFunc("GET /v1/image-tasks/{id}",
-			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetImageTask)))
+			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetMediaTask)))
 	}
 	if s.gatewayCfg == nil || s.gatewayCfg.HTTP.Endpoints.Agents.Enabled {
 		// Agent management for integrating apps. Agents belong to the

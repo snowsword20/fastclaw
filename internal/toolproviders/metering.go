@@ -14,21 +14,30 @@ import (
 // out here because those packages import this one.
 const (
 	categoryImageGen  = "image_gen"
+	categoryVideoGen  = "video_gen"
 	categoryTTS       = "tts"
+	categoryMusicGen  = "music_gen"
 	categoryWebSearch = "web_search"
 	categoryWebFetch  = "web_fetch"
 )
 
 // authorizeCall asks the billing hook before a costly call (image_gen,
-// tts). A denial comes back as an error whose text is the hook's message.
+// video_gen, tts, music_gen). A denial comes back as an error whose text
+// is the hook's message.
 func authorizeCall(ctx context.Context, category, provider, model string, args map[string]any) error {
 	switch category {
 	case categoryImageGen:
 		return billing.AuthorizeTool(ctx, billing.KindImage, provider, model,
 			billing.Estimate{Units: float64(requestedImages(args)), Unit: "image"})
+	case categoryVideoGen:
+		return billing.AuthorizeTool(ctx, billing.KindVideo, provider, model,
+			billing.Estimate{Units: 1, Unit: "video"})
 	case categoryTTS:
 		return billing.AuthorizeTool(ctx, billing.KindTTS, provider, model,
 			billing.Estimate{Units: float64(ttsChars(args)), Unit: "char"})
+	case categoryMusicGen:
+		return billing.AuthorizeTool(ctx, billing.KindMusic, provider, model,
+			billing.Estimate{Units: 1, Unit: "track"})
 	}
 	return nil
 }
@@ -62,6 +71,20 @@ func meterCall(ctx context.Context, category, provider, model string, args map[s
 		ev.Detail = detail
 	case categoryTTS:
 		ev.Kind, ev.Units, ev.Unit = billing.KindTTS, float64(ttsChars(args)), "char"
+	case categoryVideoGen:
+		ev.Kind, ev.Units, ev.Unit = billing.KindVideo, 1, "video"
+		detail := map[string]any{}
+		if s, _ := args["seconds"].(string); strings.TrimSpace(s) != "" {
+			detail["seconds"] = strings.TrimSpace(s)
+		} else if v, ok := args["seconds"].(float64); ok {
+			detail["seconds"] = v
+		}
+		if s, _ := args["size"].(string); strings.TrimSpace(s) != "" {
+			detail["size"] = strings.TrimSpace(s)
+		}
+		ev.Detail = detail
+	case categoryMusicGen:
+		ev.Kind, ev.Units, ev.Unit = billing.KindMusic, 1, "track"
 	case categoryWebSearch:
 		ev.Kind, ev.Units, ev.Unit = billing.KindSearch, 1, "call"
 	case categoryWebFetch:

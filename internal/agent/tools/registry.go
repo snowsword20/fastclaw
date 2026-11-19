@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/fastclaw-ai/fastclaw/internal/agl"
 	"github.com/fastclaw-ai/fastclaw/internal/buildinfo"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
@@ -237,10 +238,11 @@ type Registry struct {
 	// image_gen_mode "background"/"sync". Set per-turn by the agent
 	// loop via SetTurnParams; nil when the caller supplied none.
 	turnParams map[string]any
-	// imgTasks is the agent's background image-task manager (registered
-	// with image_gen). Forks share the pointer; the exported lookup goes
-	// through it (Agent.ImageTaskLookup → the /v1/image-tasks API).
-	imgTasks *imgTaskManager
+	// imgTasks is replaced by mediaTasks (one manager per media
+	// category: image / video / tts / music). Forks share the pointers;
+	// the exported lookup goes through them (Agent.MediaTaskLookup →
+	// the /v1/media-tasks API).
+	mediaTasks map[string]*mediaTaskManager
 	// systemFileStore is the optional durable store for identity files
 	// (SOUL.md, IDENTITY.md, USER.md, MEMORY.md, ...). In cloud/K8s
 	// deployments Server.readIdentityFile / writeIdentityFile go through
@@ -726,25 +728,101 @@ func (r *Registry) TurnParamString(key string) string {
 	return strings.TrimSpace(s)
 }
 
-// SetImageTasks attaches the agent's background image-task manager.
-// Called once at image_gen registration.
-func (r *Registry) SetImageTasks(m *imgTaskManager) { r.imgTasks = m }
-
-// ImageTasks returns the attached manager, or nil.
-func (r *Registry) ImageTasks() *imgTaskManager { return r.imgTasks }
-
-// ImageTaskLookup returns the task snapshot by id — exported for the
-// /v1/image-tasks API; ok=false when this agent doesn't own the id.
-func (r *Registry) ImageTaskLookup(id string) (map[string]any, bool) {
-	if r.imgTasks == nil {
-		return nil, false
+// RegisterMediaTasks attaches one media category's background-task
+// manager (keyed by category name; the id prefix picks the manager at
+// lookup time). Called once per media tool registration; the first call
+// also registers the generic media_task_status / media_task_cancel
+// tools, which dispatch by id prefix to whichever category owns the id.
+func (r *Registry) RegisterMediaTasks(m *mediaTaskManager) {
+	if r.mediaTasks == nil {
+		r.mediaTasks = map[string]*mediaTaskManager{}
+		r.registerGenericMediaTaskTools()
 	}
-	return r.imgTasks.lookup(id)
+	r.mediaTasks[m.cat.name] = m
 }
 
-// ImageTasksOf resolves the manager for a registry (boot copy), for the
-// agent wiring.
-func ImageTasksOf(r *Registry) *imgTaskManager { return r.imgTasks }
+// registerGenericMediaTaskTools installs the prefix-dispatching status
+// and cancel tools. One pair serves all four categories, so the model
+// has fewer tools to keep straight; the per-category pairs
+// (image_task_status …) stay registered for continuity.
+func (r *Registry) registerGenericMediaTaskTools() {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"task": map[string]any{
+				"type":        "string",
+				"description": `Task id from a background media tool, e.g. "imgtask_1", "videotask_2", "ttstask_1", "mustask_1".`,
+			},
+		},
+		"required": []string{"task"},
+	}
+	r.Register("media_task_status", `Check a background media task (image, video, tts or music) by its task id — the id's prefix names the category.
+
+Returns JSON with:
+  - "status": "running" (with elapsed time — poll again later), "done", "failed" (with "error"), or "cancelled"
+  - when done: "files" (workspace paths or URLs) and "putInReply" — put that exactly in your reply so the result is shown, plus a short line of your own
+
+A done task can be fetched again at any time within a day. When a notice about a finished task arrives in this chat, call this tool (or the category-specific one it names) with the task id.`, schema, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		var args struct {
+			Task string `json:"task"`
+		}
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("media_task_status: parse args: %w", err)
+		}
+		if args.Task == "" {
+			return "", fmt.Errorf("media_task_status: task is required")
+		}
+		return r.MediaTaskStatus(args.Task)
+	})
+	r.Register("media_task_cancel", `Cancel a background media task (image, video, tts or music) by its task id. Idempotent — cancelling an already-finished task just reports its status.`, schema, func(ctx context.Context, raw json.RawMessage) (string, error) {
+		var args struct {
+			Task string `json:"task"`
+		}
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("media_task_cancel: parse args: %w", err)
+		}
+		if args.Task == "" {
+			return "", fmt.Errorf("media_task_cancel: task is required")
+		}
+		return r.MediaTaskCancel(args.Task)
+	})
+}
+
+// MediaTaskLookup returns the task snapshot by id — exported for the
+// /v1/media-tasks API; ok=false when this agent doesn't own the id.
+// The id's prefix (imgtask_/videotask_/ttstask_/mustask_) names the
+// category.
+func (r *Registry) MediaTaskLookup(id string) (map[string]any, bool) {
+	for _, m := range r.mediaTasks {
+		if strings.HasPrefix(id, m.cat.idPrefix+"_") {
+			return m.lookup(id)
+		}
+	}
+	return nil, false
+}
+
+// MediaTaskStatus runs the model-facing status snapshot for whichever
+// category owns the id; the generic media_task_status tool dispatches
+// through here.
+func (r *Registry) MediaTaskStatus(id string) (string, error) {
+	for _, m := range r.mediaTasks {
+		if strings.HasPrefix(id, m.cat.idPrefix+"_") {
+			return m.status(id)
+		}
+	}
+	return "", &agl.ToolError{Msg: fmt.Sprintf("no such media task %q (ids look like imgtask_1 / videotask_1 / ttstask_1 / mustask_1)", id)}
+}
+
+// MediaTaskCancel cancels whichever category owns the id; the generic
+// media_task_cancel tool dispatches through here.
+func (r *Registry) MediaTaskCancel(id string) (string, error) {
+	for _, m := range r.mediaTasks {
+		if strings.HasPrefix(id, m.cat.idPrefix+"_") {
+			return m.cancelTask(id)
+		}
+	}
+	return "", &agl.ToolError{Msg: fmt.Sprintf("no such media task %q", id)}
+}
 
 type registeredTool struct {
 	def    provider.Tool

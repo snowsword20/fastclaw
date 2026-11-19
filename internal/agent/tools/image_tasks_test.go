@@ -65,7 +65,7 @@ func (g *gatedImageProvider) asyncSeen() bool {
 	return g.sawAsync
 }
 
-func imageTaskRegistry(t *testing.T, p *gatedImageProvider, files *ImageFiles, notify func(ImageTaskNotice)) *Registry {
+func imageTaskRegistry(t *testing.T, p *gatedImageProvider, files *ImageFiles, notify func(MediaTaskNotice)) *Registry {
 	t.Helper()
 	reg := toolproviders.NewRegistry()
 	reg.Register(p)
@@ -79,20 +79,20 @@ func imageTaskRegistry(t *testing.T, p *gatedImageProvider, files *ImageFiles, n
 	return r
 }
 
-func waitNotice(t *testing.T, ch chan ImageTaskNotice) ImageTaskNotice {
+func waitNotice(t *testing.T, ch chan MediaTaskNotice) MediaTaskNotice {
 	t.Helper()
 	select {
 	case n := <-ch:
 		return n
 	case <-time.After(5 * time.Second):
 		t.Fatal("no completion notice arrived")
-		return ImageTaskNotice{}
+		return MediaTaskNotice{}
 	}
 }
 
 func TestImageGenBackgroundSubmitsStoresAndNotifies(t *testing.T) {
 	p := newGatedImageProvider()
-	notices := make(chan ImageTaskNotice, 4)
+	notices := make(chan MediaTaskNotice, 4)
 	var saved []string
 	files := &ImageFiles{
 		Save: func(_ context.Context, session, project, name string, _ []byte, _ string) (string, error) {
@@ -100,7 +100,7 @@ func TestImageGenBackgroundSubmitsStoresAndNotifies(t *testing.T) {
 			return name, nil
 		},
 	}
-	r := imageTaskRegistry(t, p, files, func(n ImageTaskNotice) { notices <- n })
+	r := imageTaskRegistry(t, p, files, func(n MediaTaskNotice) { notices <- n })
 
 	out, err := r.Execute(context.Background(), "image_gen", `{"prompt":"a cat poster","background":true}`)
 	if err != nil {
@@ -164,8 +164,8 @@ func TestImageGenBackgroundSubmitsStoresAndNotifies(t *testing.T) {
 
 func TestImageGenBackgroundFailureNotifies(t *testing.T) {
 	p := newGatedImageProvider()
-	notices := make(chan ImageTaskNotice, 4)
-	r := imageTaskRegistry(t, p, nil, func(n ImageTaskNotice) { notices <- n })
+	notices := make(chan MediaTaskNotice, 4)
+	r := imageTaskRegistry(t, p, nil, func(n MediaTaskNotice) { notices <- n })
 
 	out, err := r.Execute(context.Background(), "image_gen", `{"prompt":"doomed","background":true}`)
 	if err != nil {
@@ -190,8 +190,8 @@ func TestImageGenBackgroundFailureNotifies(t *testing.T) {
 
 func TestImageGenBackgroundCancel(t *testing.T) {
 	p := newGatedImageProvider()
-	notices := make(chan ImageTaskNotice, 4)
-	r := imageTaskRegistry(t, p, nil, func(n ImageTaskNotice) { notices <- n })
+	notices := make(chan MediaTaskNotice, 4)
+	r := imageTaskRegistry(t, p, nil, func(n MediaTaskNotice) { notices <- n })
 
 	out, err := r.Execute(context.Background(), "image_gen", `{"prompt":"never finishes","background":true}`)
 	if err != nil {
@@ -237,8 +237,8 @@ func (e errFail) Error() string { return string(e) }
 // when the model didn't pass background=true.
 func TestImageGenParamsForceBackground(t *testing.T) {
 	p := newGatedImageProvider()
-	notices := make(chan ImageTaskNotice, 4)
-	r := imageTaskRegistry(t, p, nil, func(n ImageTaskNotice) { notices <- n })
+	notices := make(chan MediaTaskNotice, 4)
+	r := imageTaskRegistry(t, p, nil, func(n MediaTaskNotice) { notices <- n })
 	r.SetTurnParams(map[string]any{"image_gen_mode": "background"})
 
 	out, err := r.Execute(context.Background(), "image_gen", `{"prompt":"a cat"}`)
@@ -256,7 +256,7 @@ func TestImageGenParamsForceBackground(t *testing.T) {
 	// "sync" must win over the model's background=true. The sync path
 	// blocks on the provider, so feed it from a goroutine.
 	p2 := newGatedImageProvider()
-	r2 := imageTaskRegistry(t, p2, nil, func(ImageTaskNotice) {})
+	r2 := imageTaskRegistry(t, p2, nil, func(MediaTaskNotice) {})
 	r2.SetTurnParams(map[string]any{"image_gen_mode": "sync"})
 	go func() {
 		<-p2.entered
@@ -331,7 +331,7 @@ func TestImageTaskRecoveryFromQueue(t *testing.T) {
 	]}`, now, meta("agtA", "chat_9", "web:chat_9"), meta("agtA", "chat_9", "web:chat_9"), meta("agtB", "chat_x", "web:chat_x"))
 	srv := newFakeRecoveryQueue(t, listJSON)
 
-	notices := make(chan ImageTaskNotice, 8)
+	notices := make(chan MediaTaskNotice, 8)
 	var saved []string
 	files := &ImageFiles{
 		Save: func(_ context.Context, session, _, name string, _ []byte, _ string) (string, error) {
@@ -347,10 +347,10 @@ func TestImageTaskRecoveryFromQueue(t *testing.T) {
 			return toolproviders.ProviderConfig{APIKey: "tok", Endpoint: srv.URL}
 		},
 	}
-	m := newImgTaskManager(chain, files)
+	m := newMediaTaskManager(imageTaskCategory, chain, files)
 	m.recoverAgentID = "agtA"
 	doneID := make(chan string, 1)
-	m.notify = func(n ImageTaskNotice) {
+	m.notify = func(n MediaTaskNotice) {
 		// Notice text carries the task id; remember the first one (the
 		// done-listed task). Non-blocking so later notices never wedge
 		// this callback.
@@ -413,8 +413,8 @@ func TestImageTaskCallback(t *testing.T) {
 	defer hooks.Close()
 
 	p := newGatedImageProvider()
-	notices := make(chan ImageTaskNotice, 4)
-	r := imageTaskRegistry(t, p, nil, func(n ImageTaskNotice) { notices <- n })
+	notices := make(chan MediaTaskNotice, 4)
+	r := imageTaskRegistry(t, p, nil, func(n MediaTaskNotice) { notices <- n })
 	r.SetTurnParams(map[string]any{
 		"image_task_callback":        hooks.URL,
 		"image_task_callback_secret": "sekret",
@@ -464,8 +464,8 @@ func TestImageTaskRecoveryLeaseGates(t *testing.T) {
 		}())
 	srv := newFakeRecoveryQueue(t, listJSON)
 
-	notices := make(chan ImageTaskNotice, 8)
-	mk := func() *imgTaskManager {
+	notices := make(chan MediaTaskNotice, 8)
+	mk := func() *mediaTaskManager {
 		reg := toolproviders.NewRegistry()
 		imagegen.RegisterAll(reg)
 		chain := &toolproviders.Chain{
@@ -474,11 +474,11 @@ func TestImageTaskRecoveryLeaseGates(t *testing.T) {
 				return toolproviders.ProviderConfig{APIKey: "tok", Endpoint: srv.URL}
 			},
 		}
-		m := newImgTaskManager(chain, nil)
+		m := newMediaTaskManager(imageTaskCategory, chain, nil)
 		m.recoverAgentID = "agtA"
-		m.notify = func(n ImageTaskNotice) { notices <- n }
+		m.notify = func(n MediaTaskNotice) { notices <- n }
 		m.st = fakeLeaser
-		m.holderID = fmt.Sprintf("replica-%d", imgTaskSeq.Add(100))
+		m.holderID = fmt.Sprintf("replica-%d", mediaTaskSeq.Add(100))
 		return m
 	}
 

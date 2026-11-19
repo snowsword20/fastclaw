@@ -85,9 +85,9 @@ type Agent struct {
 	// mode slash commands (/new /undo /retry /compact /model /personality).
 	// Keyed by channel name (e.g. "discord" → ["123...", "456..."]). Empty
 	// or absent → no gate, anyone can run the command (legacy default).
-	admins                  map[string][]string
-	skillsCfg               config.SkillsConfig
-	globalSkillsCfg         config.SkillsCfg
+	admins          map[string][]string
+	skillsCfg       config.SkillsConfig
+	globalSkillsCfg config.SkillsCfg
 
 	messageBus              *bus.MessageBus
 	subAgentSpawner         tools.SubAgentSpawner
@@ -1081,7 +1081,26 @@ func (a *Agent) RegisterWebSearchChain(chain *toolproviders.Chain) {
 // relational store) powers the multi-replica claim lease on restart
 // recovery; nil disables the lease (single-replica behavior).
 func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain, st store.Store) {
-	tools.RegisterImageGenChain(a.registry, chain, &tools.ImageFiles{
+	tools.RegisterImageGenChain(a.registry, chain, a.mediaFiles(), a.notifyMediaTask, st)
+}
+
+// RegisterVideoGenChain exposes the video_gen tool to this agent — the
+// video twin of RegisterImageGenChain (queue-native, background by
+// default).
+func (a *Agent) RegisterVideoGenChain(chain *toolproviders.Chain, st store.Store) {
+	tools.RegisterVideoGenChain(a.registry, chain, a.mediaFiles(), a.notifyMediaTask, st)
+}
+
+// RegisterMusicGenChain exposes the music_gen tool to this agent.
+func (a *Agent) RegisterMusicGenChain(chain *toolproviders.Chain, st store.Store) {
+	tools.RegisterMusicGenChain(a.registry, chain, a.mediaFiles(), a.notifyMediaTask, st)
+}
+
+// mediaFiles is the workspace bridge every media tool shares: results
+// are stored into the calling chat's workspace (the reply shows them as
+// /workspace/<name>), and reference images are read back from it.
+func (a *Agent) mediaFiles() *tools.ImageFiles {
+	return &tools.ImageFiles{
 		Save: func(ctx context.Context, sessionID, projectID, name string, data []byte, contentType string) (string, error) {
 			url := "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data)
 			names := a.WriteSessionAttachments(ctx, sessionID, projectID, []Attachment{{URL: url, Name: name}})
@@ -1091,13 +1110,13 @@ func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain, st store.Store
 			return names[0], nil
 		},
 		Load: a.loadSessionFile,
-	}, a.notifyImageTask, st)
+	}
 }
 
-// notifyImageTask delivers a background image-task notice into the chat
-// that submitted it. Without a bus (tests) it's a no-op and the task is
-// poll-only.
-func (a *Agent) notifyImageTask(n tools.ImageTaskNotice) {
+// notifyMediaTask delivers a background media-task notice (image /
+// video / tts / music) into the chat that submitted it. Without a bus
+// (tests) it's a no-op and the task is poll-only.
+func (a *Agent) notifyMediaTask(n tools.MediaTaskNotice) {
 	if a.messageBus == nil || n.Channel == "" {
 		return
 	}
@@ -1105,7 +1124,7 @@ func (a *Agent) notifyImageTask(n tools.ImageTaskNotice) {
 		Channel:     n.Channel,
 		AccountID:   n.AccountID,
 		ChatID:      n.ChatID,
-		UserID:      "imgtask",
+		UserID:      "mediatask",
 		OwnerUserID: a.ownerUserID,
 		AgentID:     a.agentID,
 		Text:        n.Text,
@@ -1114,11 +1133,11 @@ func (a *Agent) notifyImageTask(n tools.ImageTaskNotice) {
 	}
 }
 
-// ImageTaskLookup returns the snapshot of a background image task this
+// MediaTaskLookup returns the snapshot of a background media task this
 // agent owns (status, prompt, download links when done) — the backing
-// for GET /v1/image-tasks/{id}. ok=false when the id isn't ours.
-func (a *Agent) ImageTaskLookup(id string) (map[string]any, bool) {
-	return a.registry.ImageTaskLookup(id)
+// for GET /v1/media-tasks/{id}. ok=false when the id isn't ours.
+func (a *Agent) MediaTaskLookup(id string) (map[string]any, bool) {
+	return a.registry.MediaTaskLookup(id)
 }
 
 // RegisterWebFetchChain swaps the agent's web_fetch backend for a
@@ -1128,9 +1147,11 @@ func (a *Agent) RegisterWebFetchChain(chain *toolproviders.Chain) {
 	tools.RegisterWebFetchChain(a.registry, chain)
 }
 
-// RegisterTTSChain exposes the tts tool to this agent.
-func (a *Agent) RegisterTTSChain(chain *toolproviders.Chain) {
-	tools.RegisterTTSChain(a.registry, chain)
+// RegisterTTSChain exposes the tts tool to this agent. Background mode
+// (background=true) stores the clip in the chat's workspace and gets the
+// same lease-gated recovery as the other media categories.
+func (a *Agent) RegisterTTSChain(chain *toolproviders.Chain, st store.Store) {
+	tools.RegisterTTSChain(a.registry, chain, a.mediaFiles(), a.notifyMediaTask, st)
 }
 
 // Sessions returns the session manager for this agent.
@@ -3079,23 +3100,23 @@ func (a *Agent) handleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			callTools = nil
 			llmMessages = append(llmMessages, failedCallsBudgetMessage(totalFailedCalls))
 		}
-			dumpLLMRequest(a.name, a.model, llmMessages, callTools)
-			llmStart := time.Now()
-			// 每次新的模型调用从 1 数起：modelAttempt>1 才代表
-			// llmRetry 在"同一次调用"内部重试，需要 stream_reset；
-			// 不归零的话，下一轮迭代（工具结果回填后的正常续问）的
-			// 首次调用会被误判成重试，把正常累积的气泡内容清掉。
-			modelAttempt = 0
-			resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-				modelAttempt++
-				if modelAttempt > 1 {
-					// 前一次尝试已经流出的 content_delta 作废：网页端
-					// 收到 stream_reset 后清空流式气泡，重试从零拼接。
-					// IM 渠道结尾才发全文，忽略该事件即可。
-					emitEvent(ctx, ChatEvent{Type: "stream_reset"})
-				}
-				return a.streamChatToResponse(ctx, llmMessages, callTools)
-			})
+		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
+		llmStart := time.Now()
+		// 每次新的模型调用从 1 数起：modelAttempt>1 才代表
+		// llmRetry 在"同一次调用"内部重试，需要 stream_reset；
+		// 不归零的话，下一轮迭代（工具结果回填后的正常续问）的
+		// 首次调用会被误判成重试，把正常累积的气泡内容清掉。
+		modelAttempt = 0
+		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+			modelAttempt++
+			if modelAttempt > 1 {
+				// 前一次尝试已经流出的 content_delta 作废：网页端
+				// 收到 stream_reset 后清空流式气泡，重试从零拼接。
+				// IM 渠道结尾才发全文，忽略该事件即可。
+				emitEvent(ctx, ChatEvent{Type: "stream_reset"})
+			}
+			return a.streamChatToResponse(ctx, llmMessages, callTools)
+		})
 
 		// Hook: AfterModelCall
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
@@ -4009,11 +4030,11 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			messages = append(messages, failedCallsBudgetMessage(totalFailedCalls))
 		}
 
-			dumpLLMRequest(a.name, a.model, messages, callTools)
-			llmStart := time.Now()
-			resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
-				return a.provider.Chat(ctx, messages, callTools, a.model, a.maxTokens, a.temperature)
-			})
+		dumpLLMRequest(a.name, a.model, messages, callTools)
+		llmStart := time.Now()
+		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+			return a.provider.Chat(ctx, messages, callTools, a.model, a.maxTokens, a.temperature)
+		})
 
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
 		a.hooks.Run(ctx, hcAfter)

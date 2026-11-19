@@ -67,6 +67,11 @@ type Response struct {
 	// them in the chat's workspace and hand the model a short path
 	// instead of a URL or base64 data.
 	Images []Image
+	// Media (video_gen / music_gen / async tts): non-image result files
+	// (video, audio), same store-in-workspace treatment as Images. Kept
+	// separate so the image path stays untouched; the tools layer
+	// normalizes both through one sink.
+	Media []MediaFile
 	// TaskRefs (task-queue providers, e.g. magpie → imgqueue): the
 	// remote task IDs backing this response. The tool layer records them
 	// on the local task so image_task_status can surface the remote id
@@ -79,6 +84,22 @@ type Image struct {
 	URL         string
 	Data        []byte
 	ContentType string
+}
+
+// MediaFile is one non-image generated artifact (a video or audio clip).
+// Filename is a hint for storage naming; empty means derive from the
+// content type.
+type MediaFile struct {
+	URL         string
+	Data        []byte
+	ContentType string
+	Filename    string
+}
+
+// AsImages views the media files as Images — the tools layer's sink
+// (storeMediaAt) works on []Image regardless of the payload kind.
+func (m MediaFile) AsImages() []Image {
+	return []Image{{URL: m.URL, Data: m.Data, ContentType: m.ContentType}}
 }
 
 // Registry holds all registered Provider implementations, keyed by
@@ -236,7 +257,7 @@ func parseRef(ref string) (name, model string) {
 }
 
 func isEmpty(r Response) bool {
-	return strings.TrimSpace(r.Text) == "" && r.Raw == nil && len(r.Images) == 0
+	return strings.TrimSpace(r.Text) == "" && r.Raw == nil && len(r.Images) == 0 && len(r.Media) == 0
 }
 
 // ---------- Error classification ----------

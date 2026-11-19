@@ -27,10 +27,10 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
+	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/queueclient"
 )
 
 // magpieTaskTimeout bounds one background call end to end, including the
@@ -43,52 +43,10 @@ const magpieTaskTimeout = 30 * time.Minute
 // layer's download ceiling (internal/agent/tools maxImageBytes).
 const maxMagpieImageBytes = 25 << 20
 
-// Task-API availability probe, cached like the capability matrix: a
-// plugin without /v1/health answering {ok:true} (older version, or a
-// plain gateway in front) falls back to the synchronous facade.
-var (
-	magpieTasksMu   sync.Mutex
-	magpieTasksSink = map[string]*magpieTasksProbe{}
-)
-
-type magpieTasksProbe struct {
-	at time.Time
-	ok bool
-}
-
+// magpieTasksSupported reports whether the endpoint runs an imgqueue
+// service with the task API (probe cached by the shared client).
 func magpieTasksSupported(ctx context.Context, endpoint, key string) bool {
-	magpieTasksMu.Lock()
-	if p, ok := magpieTasksSink[endpoint]; ok && time.Since(p.at) < magpieCapabilityTTL {
-		magpieTasksMu.Unlock()
-		return p.ok
-	}
-	magpieTasksMu.Unlock()
-
-	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(pctx, http.MethodGet, strings.TrimRight(endpoint, "/")+"/v1/health", nil)
-	if err != nil {
-		return false
-	}
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	ok := err == nil && resp.StatusCode == http.StatusOK
-	if err == nil {
-		// Drain so the pooled connection goes back clean (see the note
-		// in magpieFetchMatrix).
-		var out struct {
-			OK bool `json:"ok"`
-		}
-		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out)
-		resp.Body.Close()
-		ok = out.OK
-	}
-	magpieTasksMu.Lock()
-	magpieTasksSink[endpoint] = &magpieTasksProbe{at: time.Now(), ok: ok}
-	magpieTasksMu.Unlock()
-	return ok
+	return queueclient.HealthSupported(ctx, endpoint, key)
 }
 
 // imgqueueTask is the poll-relevant slice of the plugin's public task.
@@ -116,6 +74,9 @@ type QueueTaskMeta struct {
 	AccountID string `json:"accountID"`
 	ChatID    string `json:"chatID"`
 	Prompt    string `json:"prompt"`
+	// Media is the category tag the queue dispatches on; a missing value
+	// means image (imgqueue v0.2 tasks predate the field).
+	Media string `json:"media,omitempty"`
 }
 
 // QueueTask is the exported view of one imgqueue task, for the tool
@@ -131,54 +92,62 @@ type QueueTask struct {
 // ListQueueTasks pulls the queue's task list, keeping only entries the
 // filter accepts (nil filter = all, up to the plugin's 400-task cap).
 func ListQueueTasks(ctx context.Context, endpoint, key string, accept func(QueueTask) bool) ([]QueueTask, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(endpoint, "/")+"/v1/tasks?limit=400", nil)
+	rows, err := queueclient.List(ctx, endpoint, key, func(t queueclient.Task) bool {
+		return accept == nil || accept(queueTaskOf(t))
+	})
 	if err != nil {
 		return nil, err
 	}
-	if key != "" {
-		req.Header.Set("Authorization", "Bearer "+key)
+	out := make([]QueueTask, 0, len(rows))
+	for _, t := range rows {
+		out = append(out, queueTaskOf(t))
 	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("list tasks: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return nil, fmt.Errorf("list tasks: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var out struct {
-		Tasks []QueueTask `json:"tasks"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&out); err != nil {
-		return nil, fmt.Errorf("list tasks: %w", err)
-	}
-	matched := make([]QueueTask, 0, len(out.Tasks))
-	for _, t := range out.Tasks {
-		if accept == nil || accept(t) {
-			matched = append(matched, t)
+	return out, nil
+}
+
+// queueTaskOf maps a queueclient task onto this package's view.
+func queueTaskOf(t queueclient.Task) QueueTask {
+	qt := QueueTask{ID: t.ID, Status: t.Status, Error: t.Error, FinishedAt: t.FinishedAt}
+	if m := t.Meta; m != nil {
+		qt.Meta = &QueueTaskMeta{
+			Origin: m.Origin, AgentID: m.AgentID, UserID: m.UserID,
+			SessionID: m.SessionID, ProjectID: m.ProjectID,
+			Channel: m.Channel, AccountID: m.AccountID, ChatID: m.ChatID,
+			Prompt: m.Prompt, Media: m.Media,
 		}
 	}
-	return matched, nil
+	return qt
 }
 
 // PollQueueTask fetches one task's current state.
 func PollQueueTask(ctx context.Context, endpoint, key, id string) (*QueueTask, error) {
-	t, err := magpiePollTask(ctx, strings.TrimRight(endpoint, "/"), key, id)
+	t, err := queueclient.Poll(ctx, endpoint, key, id)
 	if err != nil {
 		return nil, err
 	}
-	return &QueueTask{
-		ID:     t.ID,
-		Status: t.Status,
-		Error:  t.Error,
-		Meta:   t.Meta,
-	}, nil
+	qt := QueueTask{ID: t.ID, Status: t.Status, Error: t.Error}
+	if t.Meta != nil {
+		qt.Meta = &QueueTaskMeta{
+			Origin: t.Meta.Origin, AgentID: t.Meta.AgentID, UserID: t.Meta.UserID,
+			SessionID: t.Meta.SessionID, ProjectID: t.Meta.ProjectID,
+			Channel: t.Meta.Channel, AccountID: t.Meta.AccountID, ChatID: t.Meta.ChatID,
+			Prompt: t.Meta.Prompt, Media: t.Meta.Media,
+		}
+	}
+	return &qt, nil
 }
 
-// FetchQueueTaskImage downloads a finished task's picture.
+// FetchQueueTaskImage downloads a finished task's picture (first file,
+// /file with /image fallback for older plugin versions).
 func FetchQueueTaskImage(ctx context.Context, endpoint, key, id string) (toolproviders.Image, error) {
-	return magpieFetchTaskImage(ctx, strings.TrimRight(endpoint, "/"), key, &imgqueueTask{ID: id})
+	data, ct, err := queueclient.FetchFile(ctx, endpoint, key, id, 0)
+	if err != nil {
+		return toolproviders.Image{}, err
+	}
+	if ct == "" || !strings.HasPrefix(ct, "image/") {
+		ct = http.DetectContentType(data)
+	}
+	return toolproviders.Image{Data: data, ContentType: ct}, nil
 }
 
 // executeTasks runs the background path: submit a.N tasks (the plugin
@@ -277,9 +246,10 @@ func (g *Magpie) submitTasks(ctx context.Context, endpoint, key, model string, a
 			"accountID": m.AccountID,
 			"chatID":    m.ChatID,
 			"prompt":    a.Prompt,
+			"media":     toolproviders.AsyncMediaName(m.Media),
 		}
 	} else {
-		meta = map[string]any{"origin": "fastclaw"}
+		meta = map[string]any{"origin": "fastclaw", "media": "image"}
 	}
 	ids := make([]string, 0, a.N)
 	for i := 0; i < a.N; i++ {

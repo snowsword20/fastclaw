@@ -29,7 +29,9 @@ import (
 const (
 	KindLLM        = "llm"
 	KindImage      = "image"
+	KindVideo      = "video"
 	KindTTS        = "tts"
+	KindMusic      = "music"
 	KindSearch     = "search"
 	KindFetch      = "fetch"
 	KindSandbox    = "sandbox"

@@ -18,7 +18,8 @@ import "context"
 type asyncImageKey struct{}
 
 // AsyncImageMeta is the recovery/routing identity of one background
-// image call.
+// media call (image_gen, video_gen, tts background, music_gen — the
+// marker is category-agnostic; Media says which).
 type AsyncImageMeta struct {
 	AgentID   string
 	UserID    string // fastclaw owner user
@@ -28,6 +29,22 @@ type AsyncImageMeta struct {
 	// submitted the task — where the completion notice goes.
 	Channel, AccountID, ChatID string
 	Prompt                     string
+	// Media is the category tag stamped onto the remote task's meta
+	// ("image" | "video" | "tts" | "music"). A task-queue provider copies
+	// it through, and restart recovery filters on it so one category's
+	// recovery loop never reclaims another's tasks. Empty == "image"
+	// (the original callers predate the field).
+	Media string
+}
+
+// AsyncMediaName maps a Media tag to its canonical value ("" → "image").
+func AsyncMediaName(media string) string {
+	switch media {
+	case "video", "tts", "music":
+		return media
+	default:
+		return "image"
+	}
 }
 
 // WithAsyncImage marks ctx as a background (task-queue) image call and

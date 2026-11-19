@@ -21,6 +21,7 @@ func RegisterAll(r *toolproviders.Registry) {
 	r.Register(&MiniMax{})
 	r.Register(&ElevenLabs{})
 	r.Register(&Fish{})
+	r.Register(&Magpie{})
 	r.Register(&None{})
 }
 

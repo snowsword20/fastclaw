@@ -45,7 +45,9 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/taskqueue"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/imagegen"
+	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/musicgen"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/tts"
+	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/videogen"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/webfetch"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/websearch"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
@@ -60,6 +62,8 @@ var toolProviderRegistry = func() *toolproviders.Registry {
 	websearch.RegisterAll(r)
 	webfetch.RegisterAll(r)
 	imagegen.RegisterAll(r)
+	videogen.RegisterAll(r)
+	musicgen.RegisterAll(r)
 	tts.RegisterAll(r)
 	return r
 }()
@@ -104,8 +108,8 @@ func DiagnoseAgent(ctx context.Context, st store.Store, agentRef string) (string
 // as ready when its core tool was never wired.
 func agentToolAvailability(cfg *config.Config, agentID string) map[string]bool {
 	resolved := cfg.MergedAgentConfig(config.AgentEntry{ID: agentID})
-	out := make(map[string]bool, 4)
-	for _, category := range []string{"web_search", "image_gen", "tts", "web_fetch"} {
+	out := make(map[string]bool, 6)
+	for _, category := range []string{"web_search", "image_gen", "video_gen", "music_gen", "tts", "web_fetch"} {
 		out[category] = buildToolChainFromResolved(resolved, category) != nil
 	}
 	// web_fetch always exists — a direct built-in fetcher is registered
@@ -141,8 +145,14 @@ func registerAgentToolChains(cfg *config.Config, agents []*agent.Agent, st store
 		if chain := buildToolChainFromResolved(resolved, "image_gen"); chain != nil {
 			ag.RegisterImageGenChain(chain, st)
 		}
+		if chain := buildToolChainFromResolved(resolved, "video_gen"); chain != nil {
+			ag.RegisterVideoGenChain(chain, st)
+		}
+		if chain := buildToolChainFromResolved(resolved, "music_gen"); chain != nil {
+			ag.RegisterMusicGenChain(chain, st)
+		}
 		if chain := buildToolChainFromResolved(resolved, "tts"); chain != nil {
-			ag.RegisterTTSChain(chain)
+			ag.RegisterTTSChain(chain, st)
 		}
 		// web_fetch: chain-first, otherwise the agent keeps the
 		// built-in direct fetcher already registered at construction

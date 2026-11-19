@@ -15,17 +15,17 @@ import (
 // (once the new providers exist in the toolproviders package) makes them
 // appear in the UI automatically.
 type categoryCatalog struct {
-	Name      string           `json:"name"`  // e.g. "web_search"
-	Label     string           `json:"label"` // human-friendly name
+	Name      string            `json:"name"`  // e.g. "web_search"
+	Label     string            `json:"label"` // human-friendly name
 	Providers []providerCatalog `json:"providers"`
 }
 
 type providerCatalog struct {
-	Name      string   `json:"name"`         // "exa"
-	Label     string   `json:"label"`        // "Exa"
-	NeedsKey  bool     `json:"needsKey"`     // API key required?
-	NeedsURL  bool     `json:"needsUrl"`     // endpoint required (self-hosted)?
-	Models    []string `json:"models"`       // suggested "<provider>/<model>" suffixes
+	Name     string   `json:"name"`     // "exa"
+	Label    string   `json:"label"`    // "Exa"
+	NeedsKey bool     `json:"needsKey"` // API key required?
+	NeedsURL bool     `json:"needsUrl"` // endpoint required (self-hosted)?
+	Models   []string `json:"models"`   // suggested "<provider>/<model>" suffixes
 }
 
 // builtinCatalog lists every tool category + provider pair that the binary
@@ -80,6 +80,29 @@ var builtinCatalog = []categoryCatalog{
 		},
 	},
 	{
+		Name:  "video_gen",
+		Label: "Video Generation",
+		Providers: []providerCatalog{
+			// magpie routes through a magpie gateway's imgqueue plugin
+			// (media=video tasks → the gateway's native /v1/videos API,
+			// with its account pool). "auto" lets the gateway pick the
+			// videomaker, or pin a gateway model ref.
+			{Name: "magpie", Label: "Magpie gateway (imgqueue)", NeedsKey: true, NeedsURL: true, Models: []string{"auto"}},
+			{Name: "none", Label: "None (no video generation)", Models: []string{"default"}},
+		},
+	},
+	{
+		Name:  "music_gen",
+		Label: "Music Generation",
+		Providers: []providerCatalog{
+			// Placeholder until a music upstream lands on the queue side:
+			// configuring it surfaces the music_gen tool, which fails
+			// with a clear message until then.
+			{Name: "magpie", Label: "Magpie gateway (imgqueue; upstream pending)", NeedsKey: true, NeedsURL: true, Models: []string{"auto"}},
+			{Name: "none", Label: "None (no music generation)", Models: []string{"default"}},
+		},
+	},
+	{
 		Name:  "tts",
 		Label: "Text-to-Speech",
 		Providers: []providerCatalog{
@@ -87,6 +110,9 @@ var builtinCatalog = []categoryCatalog{
 			{Name: "elevenlabs", Label: "ElevenLabs", NeedsKey: true, Models: []string{"eleven_multilingual_v2", "eleven_turbo_v2_5", "eleven_flash_v2_5"}},
 			{Name: "fish", Label: "Fish Audio", NeedsKey: true, Models: []string{"s1", "speech-1.5", "speech-1.6"}},
 			{Name: "minimax", Label: "MiniMax", NeedsKey: true, Models: []string{"speech-02-hd", "speech-02-turbo"}},
+			// magpie turns a background tts call into an imgqueue
+			// media=tts task (queue retries + restart recovery).
+			{Name: "magpie", Label: "Magpie gateway (imgqueue; background mode)", NeedsKey: true, NeedsURL: true, Models: []string{"openai/gpt-4o-mini-tts"}},
 			// "none" is a sentinel: when picked, tts is not exposed to the
 			// model at all. The model falls back to its own native audio
 			// capability if it has one.

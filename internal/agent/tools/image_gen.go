@@ -50,7 +50,7 @@ var imageHTTP = &http.Client{
 // into the originating chat; without it background tasks are poll-only.
 // st (the relational store) powers the restart-recovery claim lease;
 // nil disables the lease (single-replica deployments).
-func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *ImageFiles, notify func(ImageTaskNotice), st store.Store) {
+func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *ImageFiles, notify func(MediaTaskNotice), st store.Store) {
 	if chain == nil {
 		return
 	}
@@ -70,14 +70,14 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 	if !chain.Available() {
 		return
 	}
-	tasks := newImgTaskManager(chain, files)
+	tasks := newMediaTaskManager(imageTaskCategory, chain, files)
 	if notify != nil {
 		tasks.notify = notify
 	}
 	tasks.recoverAgentID = r.AgentID()
 	tasks.st = st
-	r.SetImageTasks(tasks)
-	registerImageTaskTools(r, tasks)
+	r.RegisterMediaTasks(tasks)
+	registerMediaTaskTools(r, tasks)
 	// Reclaim in-flight imgqueue tasks a previous process submitted
 	// (restart recovery). Best-effort and asynchronous; a no-op unless
 	// a task-queue provider with surviving tasks is configured. When a
@@ -99,11 +99,11 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 		desc = append(desc, "When the person asks for something no provider lists (a ratio, a quality tier, reference-image editing), say what IS supported and offer the closest option — don't call with unsupported parameters.")
 	}
 	props := map[string]any{
-		"prompt": map[string]any{"type": "string", "description": "What the picture shows, in detail."},
-		"aspect": map[string]any{"type": "string", "description": `Shape of the picture: "square", "portrait", "landscape", or an explicit ratio like "3:4"/"16:9" when the provider list above includes it. Default square.`},
-		"size":   map[string]any{"type": "string", "description": "Explicit pixel size like \"1024x1024\" — only when the provider list above names sizes; otherwise prefer aspect."},
-		"quality": map[string]any{"type": "string", "description": "Fidelity tier like \"low\"/\"medium\"/\"high\" — only when the provider list above names tiers; omit otherwise."},
-		"n":      map[string]any{"type": "integer", "description": "How many variations (default 1). Each one is charged; respect each provider's per-call limit above."},
+		"prompt":     map[string]any{"type": "string", "description": "What the picture shows, in detail."},
+		"aspect":     map[string]any{"type": "string", "description": `Shape of the picture: "square", "portrait", "landscape", or an explicit ratio like "3:4"/"16:9" when the provider list above includes it. Default square.`},
+		"size":       map[string]any{"type": "string", "description": "Explicit pixel size like \"1024x1024\" — only when the provider list above names sizes; otherwise prefer aspect."},
+		"quality":    map[string]any{"type": "string", "description": "Fidelity tier like \"low\"/\"medium\"/\"high\" — only when the provider list above names tiers; omit otherwise."},
+		"n":          map[string]any{"type": "integer", "description": "How many variations (default 1). Each one is charged; respect each provider's per-call limit above."},
 		"background": map[string]any{"type": "boolean", "description": "Run as a background task instead of waiting: returns a task id immediately (picture arrives later via a notice + image_task_status). Use for batches or long queues."},
 	}
 	if files != nil && files.Load != nil {
