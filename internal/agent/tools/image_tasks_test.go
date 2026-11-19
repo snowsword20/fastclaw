@@ -7,11 +7,15 @@ package tools
 // poll/cancel.
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -71,7 +75,7 @@ func imageTaskRegistry(t *testing.T, p *gatedImageProvider, files *ImageFiles, n
 	RegisterImageGenChain(r, &toolproviders.Chain{
 		Category: "image_gen", Order: []string{"fal/seedream"}, Registry: reg,
 		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
-	}, files, notify)
+	}, files, notify, nil)
 	return r
 }
 
@@ -345,7 +349,18 @@ func TestImageTaskRecoveryFromQueue(t *testing.T) {
 	}
 	m := newImgTaskManager(chain, files)
 	m.recoverAgentID = "agtA"
-	m.notify = func(n ImageTaskNotice) { notices <- n }
+	doneID := make(chan string, 1)
+	m.notify = func(n ImageTaskNotice) {
+		// Notice text carries the task id; remember the first one (the
+		// done-listed task). Non-blocking so later notices never wedge
+		// this callback.
+		if len(doneID) == 0 {
+			if m := taskIDRe.FindString(n.Text); m != "" {
+				doneID <- m
+			}
+		}
+		notices <- n
+	}
 
 	m.recoverRemote() // synchronous; resumeTask goroutines keep polling
 
@@ -368,9 +383,149 @@ func TestImageTaskRecoveryFromQueue(t *testing.T) {
 	case <-time.After(400 * time.Millisecond):
 	}
 
-	// The recovered local task surfaces its remote id.
-	st, err := m.status("imgtask_1")
+	// The recovered local task surfaces its remote id. Task ids are
+	// process-global, so take the done task's id from its notice text
+	// instead of assuming a fixed number.
+	doneNotice := <-doneID
+	st, err := m.status(doneNotice)
 	if err != nil || !strings.Contains(st, `"queueTask":"t-done"`) {
 		t.Fatalf("status %q (%v)", st, err)
 	}
+}
+
+// taskIDRe extracts an imgtask id out of a notice text.
+var taskIDRe = regexp.MustCompile(`imgtask_\d+`)
+
+// A caller webhook (params image_task_callback + secret) receives the
+// terminal outcome with a matching HMAC signature.
+func TestImageTaskCallback(t *testing.T) {
+	var mu sync.Mutex
+	var gotBody string
+	var gotSig string
+	hooks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1<<16)
+		n, _ := r.Body.Read(buf)
+		mu.Lock()
+		gotBody, gotSig = string(buf[:n]), r.Header.Get("X-Fastclaw-Signature")
+		mu.Unlock()
+		w.WriteHeader(200)
+	}))
+	defer hooks.Close()
+
+	p := newGatedImageProvider()
+	notices := make(chan ImageTaskNotice, 4)
+	r := imageTaskRegistry(t, p, nil, func(n ImageTaskNotice) { notices <- n })
+	r.SetTurnParams(map[string]any{
+		"image_task_callback":        hooks.URL,
+		"image_task_callback_secret": "sekret",
+	})
+
+	out, err := r.Execute(context.Background(), "image_gen", `{"prompt":"a cat","background":true}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sub struct {
+		Task string `json:"task"`
+	}
+	json.Unmarshal([]byte(out), &sub)
+	p.release <- providerOutcome{err: errFail("boom")}
+
+	waitNotice(t, notices)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		body, sig := gotBody, gotSig
+		mu.Unlock()
+		if body != "" {
+			if !strings.Contains(body, `"event":"image_task.failed"`) || !strings.Contains(body, sub.Task) || !strings.Contains(body, "boom") {
+				t.Fatalf("callback body %q", body)
+			}
+			mac := hmac.New(sha256.New, []byte("sekret"))
+			mac.Write([]byte(body))
+			if sig != hex.EncodeToString(mac.Sum(nil)) {
+				t.Fatalf("signature mismatch: %q", sig)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("callback never arrived")
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+}
+
+// With a claim lease wired, a second replica's recovery is a no-op: the
+// first holder keeps the tasks (and the notices).
+func TestImageTaskRecoveryLeaseGates(t *testing.T) {
+	fakeLeaser := &fakeTaskLeaser{}
+	listJSON := fmt.Sprintf(`{"ok":true,"tasks":[{"id":"t-run","status":"running","finishedAt":0,"meta":%s}]}`,
+		func() string {
+			return fmt.Sprintf(`{"origin":"fastclaw","agentID":%q,"userID":"u","sessionID":"web:c1","projectID":"","channel":"web","accountID":"a","chatID":"c1","prompt":"p"}`, "agtA")
+		}())
+	srv := newFakeRecoveryQueue(t, listJSON)
+
+	notices := make(chan ImageTaskNotice, 8)
+	mk := func() *imgTaskManager {
+		reg := toolproviders.NewRegistry()
+		imagegen.RegisterAll(reg)
+		chain := &toolproviders.Chain{
+			Category: "image_gen", Order: []string{"magpie/auto"}, Registry: reg,
+			GetConfig: func(string) toolproviders.ProviderConfig {
+				return toolproviders.ProviderConfig{APIKey: "tok", Endpoint: srv.URL}
+			},
+		}
+		m := newImgTaskManager(chain, nil)
+		m.recoverAgentID = "agtA"
+		m.notify = func(n ImageTaskNotice) { notices <- n }
+		m.st = fakeLeaser
+		m.holderID = fmt.Sprintf("replica-%d", imgTaskSeq.Add(100))
+		return m
+	}
+
+	first := mk()
+	first.recoverRemote() // acquires
+	waitNotice(t, notices)
+
+	second := mk()
+	second.recoverRemote() // lease held by "another replica" → skip
+
+	select {
+	case n := <-notices:
+		t.Fatalf("second replica must not claim: %+v", n)
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
+// fakeTaskLeaser grants the first acquire only — the second replica
+// (different holder id) is refused, as channel_leases does.
+type fakeTaskLeaser struct {
+	mu        sync.Mutex
+	holder    string
+	lastRenew bool
+}
+
+func (f *fakeTaskLeaser) AcquireChannelLease(_ context.Context, _, accountID, holderID string, _ time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holder == "" || f.holder == holderID {
+		f.holder = holderID
+		return true, nil
+	}
+	return false, nil
+}
+
+func (f *fakeTaskLeaser) RenewChannelLease(_ context.Context, _, _, holderID string, _ time.Duration) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastRenew = f.holder == holderID
+	return f.lastRenew, nil
+}
+
+func (f *fakeTaskLeaser) ReleaseChannelLease(_ context.Context, _, _, holderID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holder == holderID {
+		f.holder = ""
+	}
+	return nil
 }

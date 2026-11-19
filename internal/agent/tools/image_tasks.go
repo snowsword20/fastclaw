@@ -13,17 +13,25 @@ package tools
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agl"
-	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/imagegen"
+	"github.com/fastclaw-ai/fastclaw/internal/share"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
+	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/imagegen"
 )
 
 // imageTaskLimit bounds a background task's whole life (queue wait +
@@ -33,6 +41,29 @@ const imageTaskLimit = 35 * time.Minute
 
 // imageTaskRetention is how long a finished task stays queryable.
 const imageTaskRetention = 24 * time.Hour
+
+// Claim-lease timing, copied from the channel lease constants
+// (internal/channels/lease.go): renew at 1/3 TTL so two missed renews
+// still leave a takeover window.
+const (
+	imageTaskLeaseTTL     = 30 * time.Second
+	imageTaskLeaseRenew   = 10 * time.Second
+	imageTaskLeaseChannel = "image_task"
+)
+
+// imgTaskHolderID names this process in claim leases — the tools-layer
+// twin of the gateway's boot UUID. Minted once per process.
+var imgTaskHolderID = func() string {
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return "imgtask-holder-unknown"
+	}
+	return hex.EncodeToString(b)
+}()
+
+// imgTaskSeq numbers tasks process-globally so ids never collide across
+// agents (an /v1/image-tasks/{id} lookup sweeps the user's agents).
+var imgTaskSeq atomic.Int64
 
 // ImageTaskNotice is the wake-up the manager sends into the originating
 // chat when a background task reaches a deliverable state (done/failed).
@@ -48,7 +79,6 @@ type ImageTaskNotice struct {
 // re-attaches them).
 type imgTaskManager struct {
 	mu     sync.Mutex
-	seq    int
 	tasks  map[string]*imgTask
 	chain  *toolproviders.Chain
 	files  *ImageFiles
@@ -56,6 +86,32 @@ type imgTaskManager struct {
 	// recoverAgentID is the owning agent's id, set at registration;
 	// recovery claims only queue tasks whose meta names it.
 	recoverAgentID string
+	// st, when set, gates recovery with a per-agent claim lease so two
+	// replicas don't reclaim (and double-notify) the same queue tasks.
+	// store.Store satisfies imageTaskLeaser; tests can fake just the
+	// three methods.
+	st         imageTaskLeaser
+	// holderID names this replica in the lease; defaults to the
+	// process-wide imgTaskHolderID (tests inject distinct values).
+	holderID   string
+	recoverMu  sync.Mutex
+	recoverCtx context.Context    // cancelled when the lease is lost
+	recoverCap context.CancelFunc // nil when the lease was never taken
+}
+
+// holder resolves the lease identity.
+func (m *imgTaskManager) holder() string {
+	if m.holderID != "" {
+		return m.holderID
+	}
+	return imgTaskHolderID
+}
+
+// imageTaskLeaser is the slice of store.Store the claim lease needs.
+type imageTaskLeaser interface {
+	AcquireChannelLease(ctx context.Context, channel, accountID, holderID string, ttl time.Duration) (bool, error)
+	RenewChannelLease(ctx context.Context, channel, accountID, holderID string, ttl time.Duration) (bool, error)
+	ReleaseChannelLease(ctx context.Context, channel, accountID, holderID string) error
 }
 
 type imgTask struct {
@@ -78,6 +134,11 @@ type imgTask struct {
 	// imgqueue) reported back in Response.TaskRefs; empty for providers
 	// without a native queue.
 	queueTask string
+
+	// Caller webhook (params image_task_callback / _secret), POSTed
+	// once on completion. In-memory like the id — a restart drops it.
+	callbackURL    string
+	callbackSecret string
 
 	cancel context.CancelFunc
 
@@ -103,9 +164,8 @@ func (m *imgTaskManager) submit(ctx context.Context, turn *Registry, args map[st
 
 	m.mu.Lock()
 	m.purgeLocked()
-	m.seq++
 	t := &imgTask{
-		id:        fmt.Sprintf("imgtask_%d", m.seq),
+		id:        fmt.Sprintf("imgtask_%d", imgTaskSeq.Add(1)),
 		status:    "running",
 		prompt:    prompt,
 		createdAt: time.Now(),
@@ -114,6 +174,8 @@ func (m *imgTaskManager) submit(ctx context.Context, turn *Registry, args map[st
 		channel:   turn.MessageChannel(),
 		accountID: turn.MessageAccountID(),
 		chatID:    turn.MessageChatID(),
+		callbackURL:    strings.TrimSpace(turn.TurnParamString("image_task_callback")),
+		callbackSecret: turn.TurnParamString("image_task_callback_secret"),
 	}
 	m.tasks[t.id] = t
 	m.mu.Unlock()
@@ -211,6 +273,129 @@ func (m *imgTaskManager) run(t *imgTask, ctx context.Context, cancel context.Can
 				Text: fmt.Sprintf("图片任务失败：%s「%s」：%s。把原因简要告诉用户；如需重试可再发起一次 image_gen。", id, brief, why)})
 		}
 	}
+	if t.callbackURL != "" {
+		go m.deliverCallback(t, done)
+	}
+}
+
+// deliverCallback POSTs the terminal outcome to the caller's webhook
+// (params image_task_callback). Links come from the share service when
+// configured; otherwise the workspace paths travel as-is. Single POST,
+// 10s timeout, no retry — delivery is best-effort.
+func (m *imgTaskManager) deliverCallback(t *imgTask, done bool) {
+	images := make([]string, 0, len(t.images))
+	for _, p := range t.images {
+		if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+			images = append(images, p)
+			continue
+		}
+		if link, ok := m.shareLink(t, p); ok {
+			images = append(images, link)
+		}
+	}
+	event := "image_task.failed"
+	if done {
+		event = "image_task.completed"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"event":      event,
+		"task":       t.id,
+		"status":     t.status,
+		"prompt":     t.prompt,
+		"images":     images,
+		"error":      t.err,
+		"finishedAt": t.finishedAt.UnixMilli(),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.callbackURL, strings.NewReader(string(payload)))
+	if err != nil {
+		slog.Warn("image task callback: bad url", "task", t.id, "error", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if t.callbackSecret != "" {
+		mac := hmac.New(sha256.New, []byte(t.callbackSecret))
+		mac.Write(payload)
+		req.Header.Set("X-Fastclaw-Signature", hex.EncodeToString(mac.Sum(nil)))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Warn("image task callback failed", "task", t.id, "url", t.callbackURL, "error", err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 2048))
+	if resp.StatusCode >= 300 {
+		slog.Warn("image task callback non-2xx", "task", t.id, "status", resp.StatusCode)
+	}
+}
+
+// shareLink turns a stored workspace picture into a 7-day download
+// link via the share service (no-op ok=false when sharing is off or
+// the picture can't be read back).
+func (m *imgTaskManager) shareLink(t *imgTask, path string) (string, bool) {
+	sh := share.Default()
+	if sh == nil || m.files == nil || m.files.Load == nil {
+		return "", false
+	}
+	f, err := m.files.Load(context.Background(), t.sessionID, t.projectID, path)
+	if err != nil {
+		return "", false
+	}
+	link, err := sh.Create(context.Background(), f.Bytes, f.Name)
+	if err != nil {
+		return "", false
+	}
+	return link, true
+}
+
+// lookup returns the API-facing snapshot of one task (the
+// /v1/image-tasks handler consumes this); ok=false when unknown.
+func (m *imgTaskManager) lookup(id string) (map[string]any, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.tasks[id]
+	if !ok {
+		return nil, false
+	}
+	out := map[string]any{
+		"task":      t.id,
+		"status":    t.status,
+		"prompt":    t.prompt,
+		"createdAt": t.createdAt.UnixMilli(),
+	}
+	if t.queueTask != "" {
+		out["queueTask"] = t.queueTask
+	}
+	if !t.finishedAt.IsZero() {
+		out["finishedAt"] = t.finishedAt.UnixMilli()
+	}
+	switch t.status {
+	case "running":
+		out["elapsed"] = time.Since(t.createdAt).Round(time.Second).String()
+	case "done":
+		// For API consumers the workspace paths are useless — hand out
+		// share download links when the service is configured, falling
+		// back to the raw paths (the caller can resolve them through
+		// the session-files API) when it isn't.
+		links := make([]string, 0, len(t.images))
+		allLinked := len(t.images) > 0
+		for _, p := range t.images {
+			if link, ok := m.shareLink(t, p); ok {
+				links = append(links, link)
+			} else {
+				links = append(links, p)
+				allLinked = false
+			}
+		}
+		out["images"] = links
+		out["imagesAreDownloadLinks"] = allLinked
+		out["putInReply"] = t.putInReply
+	case "failed":
+		out["error"] = t.err
+	}
+	return out, true
 }
 
 // status renders the model-facing snapshot; a done task can be fetched
@@ -290,17 +475,19 @@ func (m *imgTaskManager) purgeLocked() {
 //
 // Only magpie-backed tasks are recoverable; providers without a remote
 // queue cannot survive the process that ran them. Multi-replica
-// deployments would each claim the same tasks (duplicate notices) —
-// acceptable for the single-host deployment; a channel_leases-style
-// lock is the template if that ever changes.
+// deployments are gated by the per-agent claim lease (see recoverRemote):
+// one holder recovers, the others skip.
 
 // recoverRemote reclaims this agent's in-flight imgqueue tasks after a
 // restart. Called once, asynchronously, when the image tools register.
-// Network errors are logged and swallowed: the tasks stay on imgqueue
-// (its own retention cleans them up eventually) and nothing breaks.
+// With a store wired, a per-agent claim lease (channel_leases table)
+// first gates concurrent replicas: the loser boots without touching the
+// queue; the winner holds the lease for the process lifetime — losing
+// it later (stolen after a stall) cancels every recovery poll so the
+// new holder takes over without double delivery. Network errors are
+// logged and swallowed: the tasks stay on imgqueue (its own retention
+// cleans them up eventually) and nothing breaks.
 func (m *imgTaskManager) recoverRemote() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 	name := "magpie"
 	cfg := m.chain.GetConfig(name)
 	endpoint := strings.TrimRight(cfg.Endpoint, "/")
@@ -313,7 +500,29 @@ func (m *imgTaskManager) recoverRemote() {
 	if agentID == "" {
 		return
 	}
-	tasks, err := imagegen.ListQueueTasks(ctx, endpoint, cfg.APIKey, func(t imagegen.QueueTask) bool {
+
+	// Recovery work hangs off recoverCtx so a lost lease (another
+	// replica took over) cancels the polls before they could deliver a
+	// duplicate notice.
+	ctx, cancel := context.WithCancel(context.Background())
+	m.recoverMu.Lock()
+	m.recoverCtx, m.recoverCap = ctx, cancel
+	m.recoverMu.Unlock()
+	if m.st != nil {
+		ok, err := m.st.AcquireChannelLease(ctx, imageTaskLeaseChannel, agentID, m.holder(), imageTaskLeaseTTL)
+		if err != nil || !ok {
+			slog.Info("image task recovery: claim lease not taken, skipping",
+				"agent", agentID, "error", err)
+			cancel()
+			return
+		}
+		go m.renewLease(ctx, agentID)
+	}
+	slog.Info("image task recovery: claim lease held", "agent", agentID)
+
+	listCtx, cancelList := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancelList()
+	tasks, err := imagegen.ListQueueTasks(listCtx, endpoint, cfg.APIKey, func(t imagegen.QueueTask) bool {
 		return t.Meta != nil && t.Meta.Origin == "fastclaw" && t.Meta.AgentID == agentID
 	})
 	if err != nil {
@@ -336,14 +545,43 @@ func (m *imgTaskManager) recoverRemote() {
 	}
 }
 
+// renewLease keeps the claim lease alive for the process lifetime;
+// losing it cancels the recovery context so the polls stop and the new
+// holder takes over.
+func (m *imgTaskManager) renewLease(ctx context.Context, agentID string) {
+	ticker := time.NewTicker(imageTaskLeaseRenew)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		ok, err := m.st.RenewChannelLease(ctx, imageTaskLeaseChannel, agentID, m.holder(), imageTaskLeaseTTL)
+		if err != nil {
+			continue // transient store trouble — hold optimistically
+		}
+		if !ok {
+			slog.Warn("image task recovery: claim lease lost, cancelling recovery",
+				"agent", agentID)
+			m.recoverMu.Lock()
+			if m.recoverCap != nil {
+				m.recoverCap()
+			}
+			m.recoverMu.Unlock()
+			return
+		}
+	}
+}
+
 // resumeTask rebuilds a local imgTask for a queued/running remote task
 // and restarts the polling loop against it.
 func (m *imgTaskManager) resumeTask(rt imagegen.QueueTask) {
 	meta := rt.Meta
 	m.mu.Lock()
-	m.seq++
+	n := imgTaskSeq.Add(1)
 	t := &imgTask{
-		id:        fmt.Sprintf("imgtask_%d", m.seq),
+		id:        fmt.Sprintf("imgtask_%d", n),
 		status:    "running",
 		prompt:    meta.Prompt,
 		createdAt: time.Now(),
@@ -357,7 +595,16 @@ func (m *imgTaskManager) resumeTask(rt imagegen.QueueTask) {
 	m.tasks[t.id] = t
 	m.mu.Unlock()
 
-	taskCtx, cancel := context.WithTimeout(context.Background(), imageTaskLimit)
+	// Hang the recovered poll off the lease's context: losing the claim
+	// (another replica took over) cancels this poll before it could
+	// double-deliver.
+	recoverCtx := context.Background()
+	m.recoverMu.Lock()
+	if m.recoverCtx != nil {
+		recoverCtx = m.recoverCtx
+	}
+	m.recoverMu.Unlock()
+	taskCtx, cancel := context.WithTimeout(recoverCtx, imageTaskLimit)
 	t.cancel = cancel
 	go m.runRecovered(t, taskCtx, cancel, rt.ID)
 	slog.Info("image task recovery: resumed", "task", t.id, "queue", rt.ID, "chat", t.chatID)
@@ -369,9 +616,9 @@ func (m *imgTaskManager) resumeTask(rt imagegen.QueueTask) {
 func (m *imgTaskManager) finishRecovered(ctx context.Context, endpoint, key string, rt imagegen.QueueTask) {
 	meta := rt.Meta
 	m.mu.Lock()
-	m.seq++
+	n := imgTaskSeq.Add(1)
 	t := &imgTask{
-		id:        fmt.Sprintf("imgtask_%d", m.seq),
+		id:        fmt.Sprintf("imgtask_%d", n),
 		status:    "running",
 		prompt:    meta.Prompt,
 		createdAt: time.Now(),

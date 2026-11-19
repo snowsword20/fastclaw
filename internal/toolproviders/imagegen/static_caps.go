@@ -1,6 +1,7 @@
 package imagegen
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
@@ -11,8 +12,16 @@ import (
 // provider is the one that answers from a live manifest.
 
 // OpenAI: gpt-image-1 takes sizes/quality/edits; dall-e-3 is fixed-shape
-// and edit-less.
-func (OpenAI) Capabilities(_ toolproviders.ProviderConfig, model string) toolproviders.Capabilities {
+// and edit-less. The provider doubles as the escape hatch for any
+// OpenAI-compatible images endpoint (endpoint option points elsewhere,
+// model passes through) — for those, declare the real capabilities via
+// the `caps` option instead of inheriting gpt-image defaults:
+//
+//	options: {"caps": "aspectRatios=1:1,3:2,2:3; quality=low,high; maxImages=4; maxRefImages=2"}
+func (OpenAI) Capabilities(cfg toolproviders.ProviderConfig, model string) toolproviders.Capabilities {
+	if caps, ok := parseCapsOption(cfg.Options["caps"]); ok {
+		return caps
+	}
 	if strings.HasPrefix(model, "dall-e-3") {
 		return toolproviders.Capabilities{
 			Sizes:        []string{"1024x1024", "1792x1024", "1024x1792"},
@@ -91,4 +100,54 @@ func (Replicate) Capabilities(_ toolproviders.ProviderConfig, model string) tool
 		MaxRefImages: 0,
 		Declared:     true,
 	}
+}
+
+// parseCapsOption decodes the `caps` provider option — semicolon-
+// separated key=value lists (aspectRatios/sizes/quality are comma-
+// separated; maxImages/maxRefImages are ints). ok=false when the option
+// is empty or parses to nothing.
+func parseCapsOption(raw string) (toolproviders.Capabilities, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return toolproviders.Capabilities{}, false
+	}
+	var caps toolproviders.Capabilities
+	any := false
+	for _, part := range strings.Split(raw, ";") {
+		k, v, found := strings.Cut(part, "=")
+		if !found {
+			continue
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		list := func() []string {
+			out := make([]string, 0, 4)
+			for _, item := range strings.Split(v, ",") {
+				if item = strings.TrimSpace(item); item != "" {
+					out = append(out, item)
+				}
+			}
+			return out
+		}
+		switch strings.ToLower(k) {
+		case "aspectratios":
+			caps.AspectRatios, any = list(), true
+		case "sizes":
+			caps.Sizes, any = list(), true
+		case "quality":
+			caps.Quality, any = list(), true
+		case "maximages":
+			if n, err := strconv.Atoi(v); err == nil {
+				caps.MaxImages, any = n, true
+			}
+		case "maxrefimages":
+			if n, err := strconv.Atoi(v); err == nil {
+				caps.MaxRefImages, any = n, true
+			}
+		}
+	}
+	caps.Declared = any
+	return caps, any
 }

@@ -44,7 +44,7 @@ func imageGenRegistry(t *testing.T, p *fakeImageProvider, files *ImageFiles) *Re
 	RegisterImageGenChain(r, &toolproviders.Chain{
 		Category: "image_gen", Order: []string{"fal/seedream"}, Registry: reg,
 		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
-	}, files)
+	}, files, nil, nil)
 	return r
 }
 
@@ -168,7 +168,7 @@ func TestImageGenDescriptionCarriesCapabilityMatrix(t *testing.T) {
 	RegisterImageGenChain(r, &toolproviders.Chain{
 		Category: "image_gen", Order: []string{"cap/model-x"}, Registry: reg,
 		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
-	}, nil)
+	}, nil, nil, nil)
 	var spec *ToolInfo
 	for _, ti := range r.RegisteredTools() {
 		if ti.Name == "image_gen" {
@@ -198,7 +198,7 @@ func TestImageGenRequirementGateFailsFast(t *testing.T) {
 	RegisterImageGenChain(r, &toolproviders.Chain{
 		Category: "image_gen", Order: []string{"cap/model-x"}, Registry: reg,
 		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
-	}, nil)
+	}, nil, nil, nil)
 	fn := r.GetFunc("image_gen")
 	if fn == nil {
 		t.Fatal("image_gen not registered")

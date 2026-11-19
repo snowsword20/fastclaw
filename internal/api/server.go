@@ -86,6 +86,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST /v1/chat/completions",
 			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleChatCompletions)))
 	}
+	// Background image-task status lookup (image_gen background=true).
+	// Lives under the agents endpoint gate — same audience (apps that
+	// manage agents), same isolation model.
+	if s.gatewayCfg == nil || s.gatewayCfg.HTTP.Endpoints.Agents.Enabled {
+		mux.HandleFunc("GET /v1/image-tasks/{id}",
+			s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleGetImageTask)))
+	}
 	if s.gatewayCfg == nil || s.gatewayCfg.HTTP.Endpoints.Agents.Enabled {
 		// Agent management for integrating apps. Agents belong to the
 		// api key's account (platform agents) or, when created for an

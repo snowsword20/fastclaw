@@ -118,7 +118,7 @@ func agentToolAvailability(cfg *config.Config, agentID string) map[string]bool {
 // registerAgentToolChains wires every provider-backed tool category onto
 // the given agents using their merged config view (system + user + agent
 // scopes overlaid by the resolver).
-func registerAgentToolChains(cfg *config.Config, agents []*agent.Agent) {
+func registerAgentToolChains(cfg *config.Config, agents []*agent.Agent, st store.Store) {
 	envSearxNG := strings.TrimSpace(os.Getenv("FASTCLAW_SEARXNG_ENDPOINT"))
 	for _, ag := range agents {
 		resolved := cfg.MergedAgentConfig(config.AgentEntry{ID: ag.Name()})
@@ -139,7 +139,7 @@ func registerAgentToolChains(cfg *config.Config, agents []*agent.Agent) {
 			ag.RegisterWebSearchChain(chain)
 		}
 		if chain := buildToolChainFromResolved(resolved, "image_gen"); chain != nil {
-			ag.RegisterImageGenChain(chain)
+			ag.RegisterImageGenChain(chain, st)
 		}
 		if chain := buildToolChainFromResolved(resolved, "tts"); chain != nil {
 			ag.RegisterTTSChain(chain)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/fastclaw-ai/fastclaw/internal/agl"
 	"github.com/fastclaw-ai/fastclaw/internal/billing"
+	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
 )
 
@@ -47,7 +48,9 @@ var imageHTTP = &http.Client{
 // notify, when given, receives a wake-up when a background task
 // (image_gen background=true) finishes, so the agent can route it back
 // into the originating chat; without it background tasks are poll-only.
-func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *ImageFiles, notify ...func(ImageTaskNotice)) {
+// st (the relational store) powers the restart-recovery claim lease;
+// nil disables the lease (single-replica deployments).
+func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *ImageFiles, notify func(ImageTaskNotice), st store.Store) {
 	if chain == nil {
 		return
 	}
@@ -68,14 +71,18 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 		return
 	}
 	tasks := newImgTaskManager(chain, files)
-	if len(notify) > 0 {
-		tasks.notify = notify[0]
+	if notify != nil {
+		tasks.notify = notify
 	}
 	tasks.recoverAgentID = r.AgentID()
+	tasks.st = st
+	r.SetImageTasks(tasks)
 	registerImageTaskTools(r, tasks)
 	// Reclaim in-flight imgqueue tasks a previous process submitted
 	// (restart recovery). Best-effort and asynchronous; a no-op unless
-	// a task-queue provider with surviving tasks is configured.
+	// a task-queue provider with surviving tasks is configured. When a
+	// store is wired, a per-agent claim lease gates concurrent replicas
+	// (renewed for the process lifetime — see recoverRemote).
 	go tasks.recoverRemote()
 	desc := []string{
 		"Generate pictures (photo, illustration, portrait, poster, sticker, logo, …) from a text description with an image model, ready to show in this chat. Use it for every request to draw, paint or make an image.",

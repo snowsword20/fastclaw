@@ -685,7 +685,7 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 		if rec.UserID != sp.UserID && applyOwnerOverlays {
 			owner = rec.UserID
 		}
-		registerAgentToolChains(toolConfigFor(ctx, st, sp.Config, owner, rc.ID), []*agent.Agent{ag})
+		registerAgentToolChains(toolConfigFor(ctx, st, sp.Config, owner, rc.ID), []*agent.Agent{ag}, st)
 	}
 	if sp.SandboxPool != nil {
 		if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
@@ -1024,7 +1024,7 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	}
 
 	for _, ag := range agentMgr.All() {
-		registerAgentToolChains(toolConfigFor(ctx, st, cfg, "", ag.Name()), []*agent.Agent{ag})
+		registerAgentToolChains(toolConfigFor(ctx, st, cfg, "", ag.Name()), []*agent.Agent{ag}, st)
 	}
 
 	pool := attachSandboxToAgents(systemSandboxPool, userID, resolved, agentMgr)

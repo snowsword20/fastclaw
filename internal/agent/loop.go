@@ -1077,8 +1077,10 @@ func (a *Agent) RegisterWebSearchChain(chain *toolproviders.Chain) {
 // The pictures are stored in the calling chat's workspace. Background
 // tasks (background=true) finish after the turn may have ended, so their
 // completion notice is routed back into the originating chat through the
-// message bus — the same delivery a fired cron job uses.
-func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain) {
+// message bus — the same delivery a fired cron job uses. st (the
+// relational store) powers the multi-replica claim lease on restart
+// recovery; nil disables the lease (single-replica behavior).
+func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain, st store.Store) {
 	tools.RegisterImageGenChain(a.registry, chain, &tools.ImageFiles{
 		Save: func(ctx context.Context, sessionID, projectID, name string, data []byte, contentType string) (string, error) {
 			url := "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data)
@@ -1089,7 +1091,7 @@ func (a *Agent) RegisterImageGenChain(chain *toolproviders.Chain) {
 			return names[0], nil
 		},
 		Load: a.loadSessionFile,
-	}, a.notifyImageTask)
+	}, a.notifyImageTask, st)
 }
 
 // notifyImageTask delivers a background image-task notice into the chat
@@ -1110,6 +1112,13 @@ func (a *Agent) notifyImageTask(n tools.ImageTaskNotice) {
 		PeerKind:    "dm",
 		Source:      bus.SourceToolTask,
 	}
+}
+
+// ImageTaskLookup returns the snapshot of a background image task this
+// agent owns (status, prompt, download links when done) — the backing
+// for GET /v1/image-tasks/{id}. ok=false when the id isn't ours.
+func (a *Agent) ImageTaskLookup(id string) (map[string]any, bool) {
+	return a.registry.ImageTaskLookup(id)
 }
 
 // RegisterWebFetchChain swaps the agent's web_fetch backend for a

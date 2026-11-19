@@ -237,6 +237,10 @@ type Registry struct {
 	// image_gen_mode "background"/"sync". Set per-turn by the agent
 	// loop via SetTurnParams; nil when the caller supplied none.
 	turnParams map[string]any
+	// imgTasks is the agent's background image-task manager (registered
+	// with image_gen). Forks share the pointer; the exported lookup goes
+	// through it (Agent.ImageTaskLookup → the /v1/image-tasks API).
+	imgTasks *imgTaskManager
 	// systemFileStore is the optional durable store for identity files
 	// (SOUL.md, IDENTITY.md, USER.md, MEMORY.md, ...). In cloud/K8s
 	// deployments Server.readIdentityFile / writeIdentityFile go through
@@ -721,6 +725,26 @@ func (r *Registry) TurnParamString(key string) string {
 	s, _ := r.turnParams[key].(string)
 	return strings.TrimSpace(s)
 }
+
+// SetImageTasks attaches the agent's background image-task manager.
+// Called once at image_gen registration.
+func (r *Registry) SetImageTasks(m *imgTaskManager) { r.imgTasks = m }
+
+// ImageTasks returns the attached manager, or nil.
+func (r *Registry) ImageTasks() *imgTaskManager { return r.imgTasks }
+
+// ImageTaskLookup returns the task snapshot by id — exported for the
+// /v1/image-tasks API; ok=false when this agent doesn't own the id.
+func (r *Registry) ImageTaskLookup(id string) (map[string]any, bool) {
+	if r.imgTasks == nil {
+		return nil, false
+	}
+	return r.imgTasks.lookup(id)
+}
+
+// ImageTasksOf resolves the manager for a registry (boot copy), for the
+// agent wiring.
+func ImageTasksOf(r *Registry) *imgTaskManager { return r.imgTasks }
 
 type registeredTool struct {
 	def    provider.Tool

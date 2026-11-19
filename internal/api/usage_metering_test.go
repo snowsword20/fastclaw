@@ -391,7 +391,7 @@ func TestV1ImageGenDeniedByBillingHook(t *testing.T) {
 	h.rt.manager(h.appA).AgentByID(id).RegisterImageGenChain(&toolproviders.Chain{
 		Category: "image_gen", Order: []string{"fal/flux-pro"}, Registry: reg,
 		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
-	})
+	}, nil)
 	script := func() {
 		h.rt.prov.mu.Lock()
 		h.rt.prov.script = []provider.Response{

@@ -301,3 +301,23 @@ func TestMagpieTaskModeStampsRoutingMeta(t *testing.T) {
 		}
 	}
 }
+
+// The caps option lets an OpenAI-compatible custom endpoint declare its
+// real capability matrix instead of inheriting gpt-image defaults.
+func TestOpenAICapsOptionOverride(t *testing.T) {
+	cfg := toolproviders.ProviderConfig{
+		Options: map[string]string{"caps": "aspectRatios=1:1,16:9; quality=low,high; maxImages=2; maxRefImages=1"},
+	}
+	caps := OpenAI{}.Capabilities(cfg, "some-custom-model")
+	if !caps.Declared || !caps.MeetsAspect("16:9", "") || caps.MeetsAspect("2:3", "") {
+		t.Fatalf("declared caps wrong: %+v", caps)
+	}
+	if !caps.MeetsQuality("high") || caps.MeetsQuality("medium") || !caps.MeetsN(2) || caps.MeetsN(3) || !caps.MeetsRefs(1) || caps.MeetsRefs(2) {
+		t.Fatalf("quality/n/refs gates wrong: %+v", caps)
+	}
+	// No option → gpt-image family defaults (unchanged behavior).
+	def := OpenAI{}.Capabilities(toolproviders.ProviderConfig{}, "gpt-image-1")
+	if !def.Declared || !def.MeetsAspect("2:3", "") {
+		t.Fatalf("default caps broken: %+v", def)
+	}
+}

@@ -59,7 +59,7 @@ func TestV1ImageGenStoresPicturesInTheWorkspace(t *testing.T) {
 	h.rt.manager(h.appA).AgentByID(id).RegisterImageGenChain(&toolproviders.Chain{
 		Category: "image_gen", Order: []string{"fal/seedream"}, Registry: reg,
 		GetConfig: func(string) toolproviders.ProviderConfig { return toolproviders.ProviderConfig{} },
-	})
+	}, nil)
 	h.rt.prov.mu.Lock()
 	h.rt.prov.script = []provider.Response{
 		{ToolCalls: []provider.ToolCall{{ID: "call_1", Type: "function", Function: provider.FunctionCall{Name: "image_gen", Arguments: `{"prompt":"a cyberpunk cat","n":2,"aspect":"portrait"}`}}}},
