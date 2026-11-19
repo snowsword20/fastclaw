@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/share"
 )
 
 // Feishu (飞书) bot adapter. Webhook-driven: inbound messages arrive via
@@ -164,6 +165,19 @@ func (l *Feishu) SendMessage(msg bus.OutboundMessage) error {
 	}
 	for _, item := range msg.MediaItems {
 		if err := l.sendMediaItem(tok, msg.ChatID, item); err != nil {
+			// Upload failed (expired permission, transient API trouble):
+			// don't silently drop the attachment — fall back to a
+			// temporary download link when sharing is configured (same
+			// delivery the WeChat adapter gets from the gateway layer).
+			if link, lerr := share.Default().Create(context.Background(), item.Bytes, item.Filename); lerr == nil {
+				fallback := fmt.Sprintf("📎 附件 %q 未能直接发送到飞书，改用临时下载链接（7 天有效）：\n%s", item.Filename, link)
+				if err := l.sendMarkdownCard(tok, msg.ChatID, fallback); err != nil {
+					_ = l.sendPlainTextMessage(tok, msg.ChatID, fallback)
+				}
+				slog.Warn("feishu attachment upload failed; delivered download link instead",
+					"account", l.accountID, "chat", msg.ChatID, "filename", item.Filename, "error", err)
+				continue
+			}
 			return fmt.Errorf("feishu send attachment %q: %w", item.Filename, err)
 		}
 	}

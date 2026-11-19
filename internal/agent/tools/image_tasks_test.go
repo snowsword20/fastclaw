@@ -9,12 +9,16 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
+	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/imagegen"
 )
 
 // gatedImageProvider blocks in Execute until released (or the context
@@ -40,7 +44,7 @@ func (g *gatedImageProvider) Name() string         { return "fal" }
 func (g *gatedImageProvider) CredentialFree() bool { return true }
 func (g *gatedImageProvider) Execute(ctx context.Context, req toolproviders.Request) (toolproviders.Response, error) {
 	g.mu.Lock()
-	g.sawAsync = toolproviders.AsyncImageFrom(ctx)
+	_, g.sawAsync = toolproviders.AsyncImageFrom(ctx)
 	g.mu.Unlock()
 	close(g.entered)
 	select {
@@ -224,3 +228,149 @@ func TestImageTaskStatusUnknownId(t *testing.T) {
 type errFail string
 
 func (e errFail) Error() string { return string(e) }
+
+// params {"image_gen_mode":"background"} forces the background path even
+// when the model didn't pass background=true.
+func TestImageGenParamsForceBackground(t *testing.T) {
+	p := newGatedImageProvider()
+	notices := make(chan ImageTaskNotice, 4)
+	r := imageTaskRegistry(t, p, nil, func(n ImageTaskNotice) { notices <- n })
+	r.SetTurnParams(map[string]any{"image_gen_mode": "background"})
+
+	out, err := r.Execute(context.Background(), "image_gen", `{"prompt":"a cat"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `"status":"submitted"`) {
+		t.Fatalf("params must force background (got %q)", out)
+	}
+	select {
+	case <-p.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background chain never started")
+	}
+	// "sync" must win over the model's background=true. The sync path
+	// blocks on the provider, so feed it from a goroutine.
+	p2 := newGatedImageProvider()
+	r2 := imageTaskRegistry(t, p2, nil, func(ImageTaskNotice) {})
+	r2.SetTurnParams(map[string]any{"image_gen_mode": "sync"})
+	go func() {
+		<-p2.entered
+		p2.release <- providerOutcome{resp: toolproviders.Response{
+			Images: []toolproviders.Image{{URL: "https://cdn.example/x.png"}},
+		}}
+	}()
+	out2, err := r2.Execute(context.Background(), "image_gen", `{"prompt":"x","background":true}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out2, `"status":"submitted"`) {
+		t.Fatalf("mode=sync must override background=true (got %q)", out2)
+	}
+}
+
+// ---------- restart recovery ----------
+
+// fakeRecoveryQueue is a minimal imgqueue stand-in for recovery tests:
+// a task list plus per-task poll/image endpoints. Poll counts let a
+// test flip a task's state between polls (running → done).
+type fakeRecoveryQueue struct {
+	mu     sync.Mutex
+	polls  map[string]int
+	states map[string]string // id → status served for the NEXT poll
+}
+
+func newFakeRecoveryQueue(t *testing.T, listJSON string) *httptest.Server {
+	t.Helper()
+	q := &fakeRecoveryQueue{polls: map[string]int{}, states: map[string]string{
+		"t-done": "done", "t-run": "done", // list states; polls serve same
+	}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/tasks", func(w http.ResponseWriter, r *http.Request) {
+		q.mu.Lock()
+		defer q.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(listJSON))
+	})
+	mux.HandleFunc("GET /v1/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/image")
+		q.mu.Lock()
+		q.polls[id]++
+		status := q.states[id]
+		q.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/image") {
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write([]byte("\x89PNG recovered-image"))
+			return
+		}
+		if status == "done" {
+			fmt.Fprintf(w, `{"ok":true,"task":{"id":%q,"status":"done","result":{"file":%q,"mime":"image/png"}}}`, id, id+".png")
+			return
+		}
+		fmt.Fprintf(w, `{"ok":true,"task":{"id":%q,"status":"running"}}`, id)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestImageTaskRecoveryFromQueue(t *testing.T) {
+	now := time.Now().UnixMilli()
+	meta := func(agent, chat, session string) string {
+		return fmt.Sprintf(`{"origin":"fastclaw","agentID":%q,"userID":"u_1","sessionID":%q,"projectID":"","channel":"web","accountID":"acc_1","chatID":%q,"prompt":"p"}`, agent, session, chat)
+	}
+	listJSON := fmt.Sprintf(`{"ok":true,"tasks":[
+		{"id":"t-done","status":"done","finishedAt":%d,"meta":%s},
+		{"id":"t-run","status":"running","finishedAt":0,"meta":%s},
+		{"id":"t-other","status":"running","finishedAt":0,"meta":%s}
+	]}`, now, meta("agtA", "chat_9", "web:chat_9"), meta("agtA", "chat_9", "web:chat_9"), meta("agtB", "chat_x", "web:chat_x"))
+	srv := newFakeRecoveryQueue(t, listJSON)
+
+	notices := make(chan ImageTaskNotice, 8)
+	var saved []string
+	files := &ImageFiles{
+		Save: func(_ context.Context, session, _, name string, _ []byte, _ string) (string, error) {
+			saved = append(saved, session+"/"+name)
+			return name, nil
+		},
+	}
+	reg := toolproviders.NewRegistry()
+	imagegen.RegisterAll(reg)
+	chain := &toolproviders.Chain{
+		Category: "image_gen", Order: []string{"magpie/auto"}, Registry: reg,
+		GetConfig: func(string) toolproviders.ProviderConfig {
+			return toolproviders.ProviderConfig{APIKey: "tok", Endpoint: srv.URL}
+		},
+	}
+	m := newImgTaskManager(chain, files)
+	m.recoverAgentID = "agtA"
+	m.notify = func(n ImageTaskNotice) { notices <- n }
+
+	m.recoverRemote() // synchronous; resumeTask goroutines keep polling
+
+	// t-done was delivered immediately (1 save + 1 notice).
+	waitNotice(t, notices)
+	if len(saved) != 1 || !strings.HasPrefix(saved[0], "web:chat_9/picture-") {
+		t.Fatalf("recovered picture save = %v", saved)
+	}
+
+	// t-run resumed polling and completed (its poll serves done).
+	waitNotice(t, notices)
+	if len(saved) != 2 {
+		t.Fatalf("resumed task save count = %d", len(saved))
+	}
+
+	// t-other (different agent) must not be claimed: exactly 2 notices.
+	select {
+	case n := <-notices:
+		t.Fatalf("unexpected extra notice: %+v", n)
+	case <-time.After(400 * time.Millisecond):
+	}
+
+	// The recovered local task surfaces its remote id.
+	st, err := m.status("imgtask_1")
+	if err != nil || !strings.Contains(st, `"queueTask":"t-done"`) {
+		t.Fatalf("status %q (%v)", st, err)
+	}
+}

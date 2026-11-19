@@ -30,6 +30,7 @@ func (r *Registry) Fork() *Registry {
 		messageAccountID: r.messageAccountID,
 		messageChatID:    r.messageChatID,
 		goalSessionKey:   r.goalSessionKey,
+		turnParams:       r.turnParams,
 		systemFileStore:  r.systemFileStore,
 		userID:           r.userID,
 		chatterUserID:    r.chatterUserID,

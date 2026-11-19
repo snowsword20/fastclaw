@@ -71,7 +71,12 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 	if len(notify) > 0 {
 		tasks.notify = notify[0]
 	}
+	tasks.recoverAgentID = r.AgentID()
 	registerImageTaskTools(r, tasks)
+	// Reclaim in-flight imgqueue tasks a previous process submitted
+	// (restart recovery). Best-effort and asynchronous; a no-op unless
+	// a task-queue provider with surviving tasks is configured.
+	go tasks.recoverRemote()
 	desc := []string{
 		"Generate pictures (photo, illustration, portrait, poster, sticker, logo, …) from a text description with an image model, ready to show in this chat. Use it for every request to draw, paint or make an image.",
 		"Write \"prompt\" as a rich visual description: subject, style, composition, colors, mood, and any text that must appear in the picture.",
@@ -117,7 +122,17 @@ func RegisterImageGenChain(r *Registry, chain *toolproviders.Chain, files *Image
 		if why := unionShortfall(chain, args); why != "" {
 			return "", &agl.ToolError{Msg: why}
 		}
-		if bg, _ := args["background"].(bool); bg {
+		// Sync/async: the model's "background" argument decides, and the
+		// caller can force either way via turn params (chat API `params`:
+		// {"image_gen_mode": "background"} or "sync" — caller wins).
+		bg, _ := args["background"].(bool)
+		switch turn.TurnParamString("image_gen_mode") {
+		case "background", "async":
+			bg = true
+		case "sync":
+			bg = false
+		}
+		if bg {
 			delete(args, "background")
 			return tasks.submit(ctx, turn, args)
 		}

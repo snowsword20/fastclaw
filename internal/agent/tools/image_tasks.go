@@ -16,11 +16,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agl"
+	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/imagegen"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
 )
 
@@ -42,7 +44,8 @@ type ImageTaskNotice struct {
 
 // imgTaskManager owns every background image_gen task of one agent.
 // Like the shell manager it lives as long as the agent process — ids do
-// not survive a restart.
+// not survive a restart (remote imgqueue tasks do, and recoverRemote
+// re-attaches them).
 type imgTaskManager struct {
 	mu     sync.Mutex
 	seq    int
@@ -50,6 +53,9 @@ type imgTaskManager struct {
 	chain  *toolproviders.Chain
 	files  *ImageFiles
 	notify func(ImageTaskNotice)
+	// recoverAgentID is the owning agent's id, set at registration;
+	// recovery claims only queue tasks whose meta names it.
+	recoverAgentID string
 }
 
 type imgTask struct {
@@ -67,6 +73,11 @@ type imgTask struct {
 	channel,
 	accountID,
 	chatID string
+
+	// queueTask is the remote task id a task-queue provider (magpie →
+	// imgqueue) reported back in Response.TaskRefs; empty for providers
+	// without a native queue.
+	queueTask string
 
 	cancel context.CancelFunc
 
@@ -107,8 +118,22 @@ func (m *imgTaskManager) submit(ctx context.Context, turn *Registry, args map[st
 	m.tasks[t.id] = t
 	m.mu.Unlock()
 
+	// Routing identity rides on the context: task-queue providers stamp
+	// it into the remote task's meta, which is what lets a restarted
+	// process recognize and reclaim its own in-flight tasks (see
+	// recoverRemote).
+	meta := toolproviders.AsyncImageMeta{
+		AgentID:   turn.AgentID(),
+		UserID:    turn.OwnerUserID(),
+		SessionID: t.sessionID,
+		ProjectID: t.projectID,
+		Channel:   t.channel,
+		AccountID: t.accountID,
+		ChatID:    t.chatID,
+		Prompt:    prompt,
+	}
 	taskCtx, cancel := context.WithTimeout(
-		toolproviders.WithAsyncImage(context.WithoutCancel(ctx)), imageTaskLimit)
+		toolproviders.WithAsyncImage(context.WithoutCancel(ctx), meta), imageTaskLimit)
 	t.cancel = cancel
 	go m.run(t, taskCtx, cancel, args)
 
@@ -168,6 +193,7 @@ func (m *imgTaskManager) run(t *imgTask, ctx context.Context, cancel context.Can
 		t.images = paths
 		t.putInReply = reply
 	}
+	t.queueTask = strings.Join(resp.TaskRefs, ",")
 	done := t.status == "done"
 	failed := t.status == "failed"
 	brief := taskBrief(t.prompt)
@@ -197,6 +223,9 @@ func (m *imgTaskManager) status(id string) (string, error) {
 		return "", &agl.ToolError{Msg: fmt.Sprintf("no such image task %q (call image_gen with background=true first; ids are valid only within the same agent process)", id)}
 	}
 	out := map[string]any{"task": t.id, "status": t.status, "prompt": t.prompt}
+	if t.queueTask != "" {
+		out["queueTask"] = t.queueTask
+	}
 	switch t.status {
 	case "running":
 		out["elapsed"] = time.Since(t.createdAt).Round(time.Second).String()
@@ -243,6 +272,238 @@ func (m *imgTaskManager) purgeLocked() {
 		if t.status != "running" && t.finishedAt.Before(cutoff) {
 			delete(m.tasks, id)
 		}
+	}
+}
+
+// ---------- restart recovery ----------
+//
+// fastclaw's task ids live in memory, but a magpie/imgqueue task lives
+// on the plugin side (tasks.json + image files, days of retention).
+// Every submitted task's meta therefore carries the submitting chat's
+// routing identity, and after a restart recoverRemote sweeps the queue
+// for tasks stamped with this agent's id and re-attaches them:
+//
+//	queued/running → rebuild a local imgTask and resume polling
+//	done           → fetch the picture, store it, notify the chat
+//	failed/cancelled → dropped silently (a restart must not storm
+//	                   the chat with old failures)
+//
+// Only magpie-backed tasks are recoverable; providers without a remote
+// queue cannot survive the process that ran them. Multi-replica
+// deployments would each claim the same tasks (duplicate notices) —
+// acceptable for the single-host deployment; a channel_leases-style
+// lock is the template if that ever changes.
+
+// recoverRemote reclaims this agent's in-flight imgqueue tasks after a
+// restart. Called once, asynchronously, when the image tools register.
+// Network errors are logged and swallowed: the tasks stay on imgqueue
+// (its own retention cleans them up eventually) and nothing breaks.
+func (m *imgTaskManager) recoverRemote() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	name := "magpie"
+	cfg := m.chain.GetConfig(name)
+	endpoint := strings.TrimRight(cfg.Endpoint, "/")
+	if endpoint == "" || m.chain.Registry == nil || m.chain.Registry.Get(m.chain.Category, name) == nil {
+		return
+	}
+	m.mu.Lock()
+	agentID := m.recoverAgentID
+	m.mu.Unlock()
+	if agentID == "" {
+		return
+	}
+	tasks, err := imagegen.ListQueueTasks(ctx, endpoint, cfg.APIKey, func(t imagegen.QueueTask) bool {
+		return t.Meta != nil && t.Meta.Origin == "fastclaw" && t.Meta.AgentID == agentID
+	})
+	if err != nil {
+		slog.Warn("image task recovery: queue unreachable", "error", err)
+		return
+	}
+	for _, rt := range tasks {
+		switch rt.Status {
+		case "queued", "running":
+			m.resumeTask(rt)
+		case "done":
+			// Only fetch recent completions; a picture whose imgqueue
+			// retention already swept it is beyond recovery.
+			if rt.FinishedAt > 0 && time.Since(time.UnixMilli(rt.FinishedAt)) < imageTaskRetention {
+				m.finishRecovered(ctx, endpoint, cfg.APIKey, rt)
+			}
+		default:
+			// failed/cancelled while we were down — drop silently.
+		}
+	}
+}
+
+// resumeTask rebuilds a local imgTask for a queued/running remote task
+// and restarts the polling loop against it.
+func (m *imgTaskManager) resumeTask(rt imagegen.QueueTask) {
+	meta := rt.Meta
+	m.mu.Lock()
+	m.seq++
+	t := &imgTask{
+		id:        fmt.Sprintf("imgtask_%d", m.seq),
+		status:    "running",
+		prompt:    meta.Prompt,
+		createdAt: time.Now(),
+		sessionID: meta.SessionID,
+		projectID: meta.ProjectID,
+		channel:   meta.Channel,
+		accountID: meta.AccountID,
+		chatID:    meta.ChatID,
+		queueTask: rt.ID,
+	}
+	m.tasks[t.id] = t
+	m.mu.Unlock()
+
+	taskCtx, cancel := context.WithTimeout(context.Background(), imageTaskLimit)
+	t.cancel = cancel
+	go m.runRecovered(t, taskCtx, cancel, rt.ID)
+	slog.Info("image task recovery: resumed", "task", t.id, "queue", rt.ID, "chat", t.chatID)
+}
+
+// finishRecovered handles a task that finished while fastclaw was down:
+// fetch the picture, store it into the submitting chat's workspace, and
+// deliver the completion notice.
+func (m *imgTaskManager) finishRecovered(ctx context.Context, endpoint, key string, rt imagegen.QueueTask) {
+	meta := rt.Meta
+	m.mu.Lock()
+	m.seq++
+	t := &imgTask{
+		id:        fmt.Sprintf("imgtask_%d", m.seq),
+		status:    "running",
+		prompt:    meta.Prompt,
+		createdAt: time.Now(),
+		sessionID: meta.SessionID,
+		projectID: meta.ProjectID,
+		channel:   meta.Channel,
+		accountID: meta.AccountID,
+		chatID:    meta.ChatID,
+		queueTask: rt.ID,
+	}
+	m.tasks[t.id] = t
+	m.mu.Unlock()
+
+	img, err := imagegen.FetchQueueTaskImage(ctx, endpoint, key, rt.ID)
+	m.mu.Lock()
+	if t.status != "running" {
+		m.mu.Unlock()
+		return
+	}
+	t.finishedAt = time.Now()
+	switch {
+	case err != nil:
+		t.status = "failed"
+		t.err = fmt.Sprintf("recovered task %s: picture not retrievable: %v", rt.ID, err)
+	case m.files == nil || m.files.Save == nil:
+		t.status = "done"
+		t.images = []string{fmt.Sprintf("queue task %s (picture stays on the imgqueue side; no workspace to store it)", rt.ID)}
+		t.putInReply = ""
+	default:
+		if paths, reply, serr := storeImagesAt(ctx, m.files, t.sessionID, t.projectID, []toolproviders.Image{img}); serr != nil {
+			t.status = "failed"
+			t.err = serr.Error()
+		} else {
+			t.status = "done"
+			t.images = paths
+			t.putInReply = reply
+		}
+	}
+	id, count := t.id, len(t.images)
+	notify := m.notify
+	channel := t.channel
+	m.mu.Unlock()
+
+	if notify != nil && channel != "" && t.status == "done" {
+		notify(ImageTaskNotice{Channel: channel, AccountID: t.accountID, ChatID: t.chatID,
+			Text: fmt.Sprintf("图片任务已完成（fastclaw 重启前提交）：%s「%s」生成 %d 张。调用 image_task_status 查询 task %q，把返回 JSON 里的 putInReply 原样放进你的回复，让用户看到图片。", id, taskBrief(t.prompt), count, id)})
+	}
+	slog.Info("image task recovery: finished", "task", t.id, "queue", rt.ID, "status", t.status)
+}
+
+// runRecovered polls one recovered remote task to a terminal state and
+// files the outcome — the recovery twin of run(), speaking to imgqueue
+// directly instead of the provider chain (the chain would resubmit).
+func (m *imgTaskManager) runRecovered(t *imgTask, ctx context.Context, cancel context.CancelFunc, remoteID string) {
+	defer cancel()
+	name := "magpie"
+	cfg := m.chain.GetConfig(name)
+	endpoint := strings.TrimRight(cfg.Endpoint, "/")
+
+	var doneImage toolproviders.Image
+	var failure string
+	interval := 2 * time.Second
+	consecutive := 0
+	for {
+		if ctx.Err() != nil {
+			failure = "recovery wait cancelled"
+			break
+		}
+		task, err := imagegen.PollQueueTask(ctx, endpoint, cfg.APIKey, remoteID)
+		if err != nil {
+			if consecutive++; consecutive >= 5 {
+				failure = fmt.Sprintf("queue unreachable: %v", err)
+				break
+			}
+		} else {
+			consecutive = 0
+			switch task.Status {
+			case "done":
+				img, ferr := imagegen.FetchQueueTaskImage(ctx, endpoint, cfg.APIKey, task.ID)
+				if ferr != nil {
+					failure = ferr.Error()
+				} else {
+					doneImage = img
+				}
+			case "failed", "cancelled":
+				failure = fmt.Sprintf("%s: %s", task.Status, strings.TrimSpace(task.Error))
+			}
+			if task.Status == "done" || task.Status == "failed" || task.Status == "cancelled" {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(interval):
+		}
+		if next := interval * 2; next > 5*time.Second {
+			interval = 5 * time.Second
+		}
+	}
+
+	m.mu.Lock()
+	if t.status != "running" {
+		m.mu.Unlock()
+		return
+	}
+	t.finishedAt = time.Now()
+	switch {
+	case failure != "":
+		t.status = "failed"
+		t.err = failure
+	case m.files == nil || m.files.Save == nil:
+		t.status = "done"
+		t.images = []string{fmt.Sprintf("queue task %s (picture stays on the imgqueue side; no workspace to store it)", remoteID)}
+		t.putInReply = ""
+	default:
+		if paths, reply, serr := storeImagesAt(ctx, m.files, t.sessionID, t.projectID, []toolproviders.Image{doneImage}); serr != nil {
+			t.status = "failed"
+			t.err = serr.Error()
+		} else {
+			t.status = "done"
+			t.images = paths
+			t.putInReply = reply
+		}
+	}
+	id, count := t.id, len(t.images)
+	notify := m.notify
+	channel := t.channel
+	m.mu.Unlock()
+
+	if notify != nil && channel != "" && t.status == "done" {
+		notify(ImageTaskNotice{Channel: channel, AccountID: t.accountID, ChatID: t.chatID,
+			Text: fmt.Sprintf("图片任务已完成（fastclaw 重启前提交）：%s「%s」生成 %d 张。调用 image_task_status 查询 task %q，把返回 JSON 里的 putInReply 原样放进你的回复，让用户看到图片。", id, taskBrief(t.prompt), count, id)})
 	}
 }
 

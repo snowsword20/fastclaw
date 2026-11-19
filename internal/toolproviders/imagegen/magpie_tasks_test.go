@@ -125,7 +125,7 @@ func (rec *taskRecorder) snapshot() (submits, deletes []string, syncGens int) {
 
 func TestMagpieTaskModeSubmitsAndPolls(t *testing.T) {
 	srv, rec := fakeImgQueueTasks(t, "")
-	ctx := toolproviders.WithAsyncImage(context.Background())
+	ctx := toolproviders.WithAsyncImage(context.Background(), toolproviders.AsyncImageMeta{})
 	resp, err := magpieChain(srv, "pool/declared-editor").Execute(ctx, map[string]any{
 		"prompt": "a cat", "aspect": "3:4", "quality": "high",
 	})
@@ -134,6 +134,9 @@ func TestMagpieTaskModeSubmitsAndPolls(t *testing.T) {
 	}
 	if len(resp.Images) != 1 || string(resp.Images[0].Data) != "\x89PNG fake-task-image" {
 		t.Fatalf("want the task image back, got %+v", resp.Images)
+	}
+	if len(resp.TaskRefs) != 1 || resp.TaskRefs[0] != "t1" {
+		t.Fatalf("remote task id must travel back in TaskRefs, got %v", resp.TaskRefs)
 	}
 	submits, deletes, syncGens := rec.snapshot()
 	if len(submits) != 1 || !strings.Contains(submits[0], `"aspect":"3:4"`) || !strings.Contains(submits[0], "fastclaw") {
@@ -149,7 +152,7 @@ func TestMagpieTaskModeSubmitsAndPolls(t *testing.T) {
 
 func TestMagpieTaskModeNSubmitsOneTaskPerPicture(t *testing.T) {
 	srv, rec := fakeImgQueueTasks(t, "")
-	ctx := toolproviders.WithAsyncImage(context.Background())
+	ctx := toolproviders.WithAsyncImage(context.Background(), toolproviders.AsyncImageMeta{})
 	resp, err := magpieChain(srv, "pool/declared-editor").Execute(ctx, map[string]any{
 		"prompt": "two cats", "n": 2,
 	})
@@ -167,7 +170,7 @@ func TestMagpieTaskModeNSubmitsOneTaskPerPicture(t *testing.T) {
 
 func TestMagpieTaskModeFailureIsRetriable(t *testing.T) {
 	srv, _ := fakeImgQueueTasks(t, "fail")
-	ctx := toolproviders.WithAsyncImage(context.Background())
+	ctx := toolproviders.WithAsyncImage(context.Background(), toolproviders.AsyncImageMeta{})
 	_, err := magpieChain(srv, "pool/declared-editor").Execute(ctx, map[string]any{
 		"prompt": "doomed",
 	})
@@ -182,7 +185,7 @@ func TestMagpieTaskModeFailureIsRetriable(t *testing.T) {
 
 func TestMagpieTaskModeCancelDeletesRemoteTasks(t *testing.T) {
 	srv, rec := fakeImgQueueTasks(t, "stuck")
-	ctx, cancel := context.WithCancel(toolproviders.WithAsyncImage(context.Background()))
+	ctx, cancel := context.WithCancel(toolproviders.WithAsyncImage(context.Background(), toolproviders.AsyncImageMeta{}))
 	go func() {
 		time.Sleep(300 * time.Millisecond)
 		cancel()
@@ -211,7 +214,7 @@ func TestMagpieAsyncFallsBackToSyncWhenNoTaskAPI(t *testing.T) {
 	// No /v1/health on this server: the probe fails and the async call
 	// degrades to the synchronous facade (today's behavior).
 	srv, rec := fakeImgQueue(t, testMatrix)
-	ctx := toolproviders.WithAsyncImage(context.Background())
+	ctx := toolproviders.WithAsyncImage(context.Background(), toolproviders.AsyncImageMeta{})
 	resp, err := magpieChain(srv, "pool/declared-editor").Execute(ctx, map[string]any{
 		"prompt": "a cat",
 	})
@@ -231,10 +234,10 @@ func TestMagpieAsyncFallsBackToSyncWhenNoTaskAPI(t *testing.T) {
 // The tool layer (image_gen background mode) relies on the marker being
 // invisible to providers that don't implement task mode.
 func TestAsyncMarkerIsFalseByDefault(t *testing.T) {
-	if toolproviders.AsyncImageFrom(context.Background()) {
+	if toolproviders.AsyncImageRequested(context.Background()) {
 		t.Fatal("plain context must not read as async")
 	}
-	if !toolproviders.AsyncImageFrom(toolproviders.WithAsyncImage(context.Background())) {
+	if !toolproviders.AsyncImageRequested(toolproviders.WithAsyncImage(context.Background(), toolproviders.AsyncImageMeta{})) {
 		t.Fatal("marker roundtrip failed")
 	}
 }
@@ -243,7 +246,7 @@ func TestAsyncMarkerIsFalseByDefault(t *testing.T) {
 // validator matches aspect by exact membership.
 func TestMagpieNamedAspectBecomesConcreteRatio(t *testing.T) {
 	srv, rec := fakeImgQueueTasks(t, "")
-	ctx := toolproviders.WithAsyncImage(context.Background())
+	ctx := toolproviders.WithAsyncImage(context.Background(), toolproviders.AsyncImageMeta{})
 	if _, err := magpieChain(srv, "pool/declared-editor").Execute(ctx, map[string]any{
 		"prompt": "a cat", "aspect": "square",
 	}); err != nil {
@@ -272,5 +275,29 @@ func TestMagpieConcreteAspect(t *testing.T) {
 	// Undeclared caps fall back to the common defaults.
 	if got := magpieConcreteAspect("portrait", toolproviders.Capabilities{}); got != "2:3" {
 		t.Errorf("undeclared fallback = %q, want 2:3", got)
+	}
+}
+
+// The submit body must carry the submitting chat's routing identity —
+// that meta is what restart recovery matches against.
+func TestMagpieTaskModeStampsRoutingMeta(t *testing.T) {
+	srv, rec := fakeImgQueueTasks(t, "")
+	meta := toolproviders.AsyncImageMeta{
+		AgentID: "agt_1", UserID: "u_1",
+		SessionID: "web:chat_7", ProjectID: "",
+		Channel: "web", AccountID: "acc_1", ChatID: "chat_7",
+		Prompt: "a cat",
+	}
+	ctx := toolproviders.WithAsyncImage(context.Background(), meta)
+	if _, err := magpieChain(srv, "pool/declared-editor").Execute(ctx, map[string]any{
+		"prompt": "a cat",
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	submits, _, _ := rec.snapshot()
+	for _, want := range []string{`"origin":"fastclaw"`, `"agentID":"agt_1"`, `"chatID":"chat_7"`, `"sessionID":"web:chat_7"`} {
+		if !strings.Contains(submits[0], want) {
+			t.Fatalf("submit meta missing %s: %v", want, submits[0])
+		}
 	}
 }

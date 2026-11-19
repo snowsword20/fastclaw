@@ -231,6 +231,12 @@ type Registry struct {
 	// empty value means "no goal context plumbed; tools error out".
 	// Set per-turn by the agent loop via SetGoalSessionKey.
 	goalSessionKey string
+	// turnParams is the caller's structured params for the in-flight
+	// turn (chat API `params` body field, web chat params). Tools read
+	// caller-level directives from it — e.g. image_gen honors
+	// image_gen_mode "background"/"sync". Set per-turn by the agent
+	// loop via SetTurnParams; nil when the caller supplied none.
+	turnParams map[string]any
 	// systemFileStore is the optional durable store for identity files
 	// (SOUL.md, IDENTITY.md, USER.md, MEMORY.md, ...). In cloud/K8s
 	// deployments Server.readIdentityFile / writeIdentityFile go through
@@ -697,6 +703,24 @@ func (r *Registry) SetGoalSessionKey(key string) { r.goalSessionKey = key }
 // turn. Empty when the turn happened outside a chat context (e.g.
 // agent boot) — goal tools treat that as "no goal can exist here".
 func (r *Registry) GoalSessionKey() string { return r.goalSessionKey }
+
+// SetTurnParams records the caller's structured params (chat API
+// `params` body field, web chat params) for the in-flight turn, so a
+// tool can honor caller-level directives programmatically — e.g.
+// image_gen reads image_gen_mode "background"/"sync" to override the
+// model's sync/async choice. Called by the agent loop right after
+// bindSession; nil (the default) means the caller supplied none.
+func (r *Registry) SetTurnParams(params map[string]any) { r.turnParams = params }
+
+// TurnParams returns the in-flight turn's caller params, or nil.
+func (r *Registry) TurnParams() map[string]any { return r.turnParams }
+
+// TurnParamString reads params[key] as a trimmed string; "" when absent
+// or not a string.
+func (r *Registry) TurnParamString(key string) string {
+	s, _ := r.turnParams[key].(string)
+	return strings.TrimSpace(s)
+}
 
 type registeredTool struct {
 	def    provider.Tool

@@ -67,6 +67,11 @@ type Response struct {
 	// them in the chat's workspace and hand the model a short path
 	// instead of a URL or base64 data.
 	Images []Image
+	// TaskRefs (task-queue providers, e.g. magpie → imgqueue): the
+	// remote task IDs backing this response. The tool layer records them
+	// on the local task so image_task_status can surface the remote id
+	// and recovery can reconcile against the queue.
+	TaskRefs []string
 }
 
 // Image is one generated picture: its bytes, or a URL to fetch them from.

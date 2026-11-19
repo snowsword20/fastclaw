@@ -101,13 +101,93 @@ type imgqueueTask struct {
 		Mime          string `json:"mime"`
 		RevisedPrompt string `json:"revisedPrompt"`
 	} `json:"result"`
+	Meta *QueueTaskMeta `json:"meta"`
+}
+
+// QueueTaskMeta mirrors the meta fastclaw stamps onto submitted tasks
+// (routing identity for restart recovery).
+type QueueTaskMeta struct {
+	Origin    string `json:"origin"`
+	AgentID   string `json:"agentID"`
+	UserID    string `json:"userID"`
+	SessionID string `json:"sessionID"`
+	ProjectID string `json:"projectID"`
+	Channel   string `json:"channel"`
+	AccountID string `json:"accountID"`
+	ChatID    string `json:"chatID"`
+	Prompt    string `json:"prompt"`
+}
+
+// QueueTask is the exported view of one imgqueue task, for the tool
+// layer's restart recovery.
+type QueueTask struct {
+	ID         string
+	Status     string // queued | running | done | failed | cancelled
+	Error      string
+	FinishedAt int64 // ms epoch; 0 unless terminal
+	Meta       *QueueTaskMeta
+}
+
+// ListQueueTasks pulls the queue's task list, keeping only entries the
+// filter accepts (nil filter = all, up to the plugin's 400-task cap).
+func ListQueueTasks(ctx context.Context, endpoint, key string, accept func(QueueTask) bool) ([]QueueTask, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(endpoint, "/")+"/v1/tasks?limit=400", nil)
+	if err != nil {
+		return nil, err
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list tasks: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("list tasks: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out struct {
+		Tasks []QueueTask `json:"tasks"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("list tasks: %w", err)
+	}
+	matched := make([]QueueTask, 0, len(out.Tasks))
+	for _, t := range out.Tasks {
+		if accept == nil || accept(t) {
+			matched = append(matched, t)
+		}
+	}
+	return matched, nil
+}
+
+// PollQueueTask fetches one task's current state.
+func PollQueueTask(ctx context.Context, endpoint, key, id string) (*QueueTask, error) {
+	t, err := magpiePollTask(ctx, strings.TrimRight(endpoint, "/"), key, id)
+	if err != nil {
+		return nil, err
+	}
+	return &QueueTask{
+		ID:     t.ID,
+		Status: t.Status,
+		Error:  t.Error,
+		Meta:   t.Meta,
+	}, nil
+}
+
+// FetchQueueTaskImage downloads a finished task's picture.
+func FetchQueueTaskImage(ctx context.Context, endpoint, key, id string) (toolproviders.Image, error) {
+	return magpieFetchTaskImage(ctx, strings.TrimRight(endpoint, "/"), key, &imgqueueTask{ID: id})
 }
 
 // executeTasks runs the background path: submit a.N tasks (the plugin
 // produces one picture per task), poll them to a terminal state, then
 // fetch the finished pictures. A partial success (some tasks done) is
 // still a success; only an empty result falls through to the chain's
-// next provider.
+// next provider. The remote task ids travel back in Response.TaskRefs
+// so the tool layer can reconcile against the queue (status display,
+// restart recovery).
 func (g *Magpie) executeTasks(ctx context.Context, endpoint, key, model string, a args) (toolproviders.Response, error) {
 	ids, err := g.submitTasks(ctx, endpoint, key, model, a)
 	if err != nil {
@@ -176,12 +256,31 @@ func (g *Magpie) executeTasks(ctx context.Context, endpoint, key, model string, 
 	if len(images) == 0 {
 		return toolproviders.Response{}, toolproviders.Retry(fmt.Errorf("magpie: all %d image task(s) failed: %s", len(ids), strings.Join(failures, "; ")))
 	}
-	return toolproviders.Response{Text: renderB64(a.Prompt, b64s), Images: images}, nil
+	return toolproviders.Response{Text: renderB64(a.Prompt, b64s), Images: images, TaskRefs: ids}, nil
 }
 
 // submitTasks posts one imgqueue task per requested picture (generation
 // as JSON, reference-image edits as multipart, matching the sync path).
+// Every task's meta carries the submitting chat's routing identity —
+// imgqueue persists it, and that is what lets a restarted fastclaw
+// recognize its own in-flight tasks and reclaim them.
 func (g *Magpie) submitTasks(ctx context.Context, endpoint, key, model string, a args) ([]string, error) {
+	var meta map[string]any
+	if m, ok := toolproviders.AsyncImageFrom(ctx); ok {
+		meta = map[string]any{
+			"origin":    "fastclaw",
+			"agentID":   m.AgentID,
+			"userID":    m.UserID,
+			"sessionID": m.SessionID,
+			"projectID": m.ProjectID,
+			"channel":   m.Channel,
+			"accountID": m.AccountID,
+			"chatID":    m.ChatID,
+			"prompt":    a.Prompt,
+		}
+	} else {
+		meta = map[string]any{"origin": "fastclaw"}
+	}
 	ids := make([]string, 0, a.N)
 	for i := 0; i < a.N; i++ {
 		var (
@@ -230,7 +329,7 @@ func (g *Magpie) submitTasks(ctx context.Context, endpoint, key, model string, a
 				"model":  model,
 				"prompt": a.Prompt,
 				// One picture per task — n belongs to the sync facade only.
-				"meta": map[string]any{"origin": "fastclaw"},
+				"meta": meta,
 			}
 			if a.Size != "" {
 				body["size"] = a.Size
@@ -354,6 +453,7 @@ func magpieFetchTaskImage(ctx context.Context, endpoint, key string, t *imgqueue
 	}
 	return toolproviders.Image{Data: data, ContentType: ct}, nil
 }
+
 
 func magpieDeleteTask(ctx context.Context, endpoint, key, id string) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
