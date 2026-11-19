@@ -179,7 +179,7 @@ func (m *imgTaskManager) run(t *imgTask, ctx context.Context, cancel context.Can
 	if notify != nil && channel != "" {
 		if done {
 			notify(ImageTaskNotice{Channel: channel, AccountID: t.accountID, ChatID: t.chatID,
-				Text: fmt.Sprintf("图片任务已完成：%s「%s」生成 %d 张。调用 image_task_status 查询 task %q，把返回 JSON 里的 putInReply 原样放进你的回复，让用户看到图片。", id, brief, count, id)})
+				Text: fmt.Sprintf("图片任务已完成：%s「%s」生成 %d 张。调用 image_task_status 查询 task %q，把返回 JSON 里的 putInReply 原样放进你的回复，让用户看到图片。若你已在之前的回复里把这张图发给用户，简短确认即可，不要重复发图。", id, brief, count, id)})
 		} else if failed {
 			notify(ImageTaskNotice{Channel: channel, AccountID: t.accountID, ChatID: t.chatID,
 				Text: fmt.Sprintf("图片任务失败：%s「%s」：%s。把原因简要告诉用户；如需重试可再发起一次 image_gen。", id, brief, why)})
@@ -200,6 +200,7 @@ func (m *imgTaskManager) status(id string) (string, error) {
 	switch t.status {
 	case "running":
 		out["elapsed"] = time.Since(t.createdAt).Round(time.Second).String()
+		out["advice"] = "Still generating. End your turn now (tell the person the picture is on its way) — a notice arrives in this chat when it's done; don't keep polling in this turn."
 	case "done":
 		out["images"] = t.images
 		out["putInReply"] = t.putInReply
